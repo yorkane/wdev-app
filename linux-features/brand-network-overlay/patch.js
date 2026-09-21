@@ -1,6 +1,6 @@
 // brand-network-overlay ASAR patch descriptors.
 //
-// Five descriptors, mirroring the OpenCodex codex/brand-network-overlay
+// Six descriptors, mirroring the OpenCodex codex/brand-network-overlay
 // branch (see doc/ in this directory for the mapping):
 //
 //   main-bundle  net-fetch-overlay      wraps electron net.fetch (local 200
@@ -21,6 +21,9 @@
 //   webview-asset menu-item-hider          (appended IIFE): multilingual
 //                                       official menu hiding (hide, not
 //                                       remove).
+//   webview-asset pets-surface-hider       (appended IIFE): settings Pets
+//                                       tab + Pets panel + on-screen pet
+//                                       avatar elements (hide, not remove).
 //
 // All webview descriptors target the same unique bundle: the one referenced
 // by webview/index.html (the app-initial entry chunk, which contains the
@@ -46,6 +49,7 @@ const WEBVIEW_IDEMPOTENT_MARKERS = {
   network: "__bnovNetworkInstalled",
   brand: "__bnovBrandInstalled",
   menu: "__bnovMenuInstalled",
+  pets: "__bnovPetsInstalled",
 };
 
 const MAIN_IDEMPOTENT_MARKER = "__bnovMainRuntimeInstalled";
@@ -149,6 +153,17 @@ const descriptors = [
     missingDescription: "webview app-initial entry bundle",
     skipDescription: "brand-network-overlay menu item hider",
     apply: webviewApplyFactory("menu"),
+  },
+  {
+    id: "pets-surface-hider",
+    phase: "webview-asset",
+    order: 20855,
+    ciPolicy: "optional",
+    pattern: /^app-initial-[^.]+\.js$/,
+    assetMatch: webviewAssetMatch,
+    missingDescription: "webview app-initial entry bundle",
+    skipDescription: "brand-network-overlay pets surface hider",
+    apply: webviewApplyFactory("pets"),
   },
 ];
 

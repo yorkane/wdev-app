@@ -122,6 +122,26 @@ test("brand name from the environment wins over config.yaml", () => {
   }
 });
 
+test("CODEX_DESKTOP_BRAND_NAME takes precedence over the legacy env and config.yaml", () => {
+  const previousEnv = process.env.CODEX_DESKTOP_BRAND_NAME;
+  const previousLegacy = process.env.OPENCODEX_BRAND_NAME;
+  process.env.CODEX_DESKTOP_BRAND_NAME = "desktoptop";
+  process.env.OPENCODEX_BRAND_NAME = "envbrand";
+  try {
+    const config = loadSiteConfig({ configPath: configFile('brand:\n  name: "wdev"\n') });
+    assert.equal(config.brand.name, "desktoptop");
+    assert.equal(config.brand.source, "env");
+    delete process.env.CODEX_DESKTOP_BRAND_NAME;
+    const fallback = loadSiteConfig({ configPath: configFile('brand:\n  name: "wdev"\n') });
+    assert.equal(fallback.brand.name, "envbrand");
+  } finally {
+    if (previousEnv === undefined) delete process.env.CODEX_DESKTOP_BRAND_NAME;
+    else process.env.CODEX_DESKTOP_BRAND_NAME = previousEnv;
+    if (previousLegacy === undefined) delete process.env.OPENCODEX_BRAND_NAME;
+    else process.env.OPENCODEX_BRAND_NAME = previousLegacy;
+  }
+});
+
 test("site config tolerates a malformed config file instead of failing startup", () => {
   const config = loadSiteConfig({
     configPath: configFile('network:\n  block: ["unterminated\nbrand: name\n:::\n\t- bad\n'),

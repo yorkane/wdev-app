@@ -1,4 +1,4 @@
-// Builds the four appended webview runtime sources (each an IIFE, each
+// Builds the five appended webview runtime sources (each an IIFE, each
 // appended to the main webview bundle once). They follow the OpenCodex
 // provider install order, which matters for the XHR/fetch wrapping chain:
 //   1. statsig   (webview-statsig.template.js)  - innermost fetch wrapper,
@@ -6,7 +6,9 @@
 //   2. network   (webview-network.template.js)  - block-list guard over the
 //     three channels; reuses __bnovStatsig* when present;
 //   3. brand     (webview-brand.template.js)    - DOM brand text rewrite;
-//   4. menu      (webview-menu.template.js)     - official menu hiding.
+//   4. menu      (webview-menu.template.js)     - official menu hiding;
+//   5. pets      (webview-pets.template.js)     - settings Pets tab + panel
+//     + on-screen pet avatar elements (hide, never remove).
 //
 // Placeholders are filled from the shared lib modules (so test.js and the
 // injected code run the same functions) plus the baked config JSON and the
@@ -124,13 +126,14 @@ function fillTemplate(name, replacements) {
 }
 
 /**
- * Build all four runtime sources. Returns an object keyed by runtime name,
+ * Build all five runtime sources. Returns an object keyed by runtime name,
  * each value a complete IIFE string safe to append to the webview bundle.
  */
-function buildWebviewRuntimes({ manifest = {}, settings = {}, menuLabels = null } = {}) {
+function buildWebviewRuntimes({ manifest = {}, settings = {}, menuLabels = null, petsLabels = null } = {}) {
   const baked = normalizeConfig(manifest.brandNetworkOverlay, settings);
   const bakedJson = JSON.stringify(baked);
   const labels = Array.isArray(menuLabels) && menuLabels.length ? menuLabels : defaultMenuLabels();
+  const pets = Array.isArray(petsLabels) && petsLabels.length ? petsLabels : defaultPetsLabels();
   return {
     statsig: fillTemplate("webview-statsig.template.js", {
       "__STATSIG_FUNCTIONS__": inlinedStatsig(),
@@ -145,13 +148,16 @@ function buildWebviewRuntimes({ manifest = {}, settings = {}, menuLabels = null 
     menu: fillTemplate("webview-menu.template.js", {
       "__HIDDEN_MENU_LABELS_JSON__": JSON.stringify(labels),
     }),
+    pets: fillTemplate("webview-pets.template.js", {
+      "__PETS_LABELS_JSON__": JSON.stringify(pets),
+    }),
   };
 }
 
 /** Backwards-compatible single-source builder (concatenated, order preserved). */
 function buildWebviewRuntime(options) {
   const runtimes = buildWebviewRuntimes(options);
-  return [runtimes.statsig, runtimes.network, runtimes.brand, runtimes.menu].join("\n");
+  return [runtimes.statsig, runtimes.network, runtimes.brand, runtimes.menu, runtimes.pets].join("\n");
 }
 
 function defaultMenuLabels() {
@@ -268,10 +274,25 @@ function defaultMenuLabels() {
   ];
 }
 
+/**
+ * Multilingual label set for the settings "Pets" tab / panel heading.
+ * Exact-match only (trimmed + lower-cased), so "Pet care", "Pets tracker",
+ * "Keyboard shortcuts" and friends are never touched.
+ */
+function defaultPetsLabels() {
+  return [
+    "Pet",
+    "Pets",
+    "宠物",
+    "虚拟宠物",
+  ];
+}
+
 module.exports = {
   buildWebviewRuntime,
   buildWebviewRuntimes,
   defaultMenuLabels,
+  defaultPetsLabels,
   extractDeclaration,
 };
 

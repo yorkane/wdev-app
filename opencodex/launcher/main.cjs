@@ -27,6 +27,8 @@ const {
   hiddenRuntimeGcmCommandLineArgs,
   headlessRuntimeCommandLineArgs,
   isolateHiddenRuntimeGcmStoresForUserData,
+  desktopLocaleCommandLineArgs,
+  resolveDesktopLocale,
 } = require("../gateway/runtime/electron/hidden-runtime-command-line.cjs");
 const packageMetadata = require("../package.json");
 
@@ -811,6 +813,14 @@ function preferredLanguagesEnvValue() {
   return JSON.stringify(currentPreferredLanguages());
 }
 
+function preferredLanguagesEnvValueForGateway() {
+  // 系统没有首选语言时（部分 Linux 环境 getPreferredSystemLanguages 返回空），
+  // 回落桌面运行时语言（CODEX_DESKTOP_LOCALE，默认 zh-CN），让网关自有 i18n 与界面语言一致。
+  const languages = currentPreferredLanguages();
+  if (languages.length > 0) return JSON.stringify(languages);
+  return JSON.stringify([resolveDesktopLocale(process.env)]);
+}
+
 function broadcastState() {
   updateTrayMenu();
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -963,13 +973,16 @@ async function startGatewayOnce() {
     ...hiddenRuntimeGcmCommandLineArgs({ PORT: String(gatewayState.port) }),
     // 无头服务器（无 GPU/无 X）通过环境变量开关追加 Electron 参数，桌面端默认不受影响。
     ...headlessRuntimeCommandLineArgs(process.env),
+    // 界面语言：CODEX_DESKTOP_LOCALE（默认 zh-CN）随初始 argv 进入官方 Electron 进程，
+    // 保证 Electron 侧语言协商链与 web 页面声明一致。
+    ...desktopLocaleCommandLineArgs(process.env),
   ];
   const childEnv = {
     ...process.env,
     OPENCODEX_GATEWAY_ENTRY: paths.gatewayScriptPath,
     // Runner 在 Gateway 启动前已经完成构建，把适用点和平台关闭点的完整 Kernel 快照交给 Gateway。
     OPENCODEX_RUNNER_MODIFICATION_POINTS: JSON.stringify(officialRuntime.modificationPoints || []),
-    [PREFERRED_LANGUAGES_ENV]: preferredLanguagesEnvValue(),
+    [PREFERRED_LANGUAGES_ENV]: preferredLanguagesEnvValueForGateway(),
     // runner 的 Info.plist 已经用 LSBackgroundOnly 隐藏；该标记让业务入口不要再调用 Dock API。
     OPENCODEX_GATEWAY_AGENT_MODE: "1",
     // 第 4 个 stdio fd 是生命周期 pipe；gateway 会监听它判断 launcher 是否已退出。

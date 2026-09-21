@@ -100,10 +100,19 @@ test("network block list short-circuits matching hosts and lets the rest reach t
   assert.equal(hook.installed, true);
   const hookedNet = hook.net;
 
-  const blockedResponse = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  const blockedResponse = await hookedNet.fetch("https://static.chatgpt.com/assets/app.js");
   assert.equal(blockedResponse.status, 200);
   assert.equal(await blockedResponse.text(), "{}");
-  assert.deepEqual(blocked, ["https://ab.chatgpt.com/v1/initialize?k=x"]);
+  assert.deepEqual(blocked, ["https://static.chatgpt.com/assets/app.js"]);
+  assert.equal(passthrough.length, 0);
+
+  // initialize also hits the block family (*.chatgpt.com) but must get the full Statsig gate payload.
+  const initializeResponse = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  assert.equal(initializeResponse.status, 200);
+  const initializePayload = JSON.parse(await initializeResponse.text());
+  assert.equal(initializePayload.has_updates, true);
+  assert.equal(initializePayload.layer_configs["72216192"].value.enable_i18n, true);
+  assert.deepEqual(blocked, ["https://static.chatgpt.com/assets/app.js"]);
   assert.equal(passthrough.length, 0);
 
   // allow 名单里的主机即使落在 block 域族内也必须透传。

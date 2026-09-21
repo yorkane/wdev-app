@@ -6,6 +6,8 @@ auth:
   password: ""
 
 # 界面上显示的 Codex / ChatGPT / OpenAI 文案与标识统一换成这个名字。
+# 也可以不改这里、只在 /etc/codex-desktop/gateway.env 里设 CODEX_DESKTOP_BRAND_NAME
+# （环境变量优先于本文件）；界面语言则用 CODEX_DESKTOP_LOCALE（默认 zh-CN）。
 brand:
   name: "wdev"
 

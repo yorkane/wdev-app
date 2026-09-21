@@ -2,7 +2,7 @@
 
 Local overlay for the official ChatGPT desktop app on Linux, ported from the
 OpenCodex `codex/brand-network-overlay` branch into the wdev-app ASAR patch
-pipeline. It ships five patch descriptors:
+pipeline. It ships six patch descriptors:
 
 - `main-bundle`: wraps Electron `net.fetch` and the main session
   `webRequest.onBeforeRequest` so blocked outbound hosts get a local 200
@@ -20,6 +20,15 @@ pipeline. It ships five patch descriptors:
 - `webview-asset` (menu hiding): hides the official help "What's new / Help"
   and account "Show/Hide pet" menu items by multilingual label match (hide,
   never remove).
+- `webview-asset` (pets surface hiding): hides every remaining pet surface -
+  the settings-sidebar "Pets" tab, the Pets settings panel (heading +
+  content container, so the "Pick a pet" list, size slider and custom-pet
+  controls disappear even while the user sits on the Pets tab), and
+  on-screen pet avatar elements (`data-codex-pet-id` / `data-codex-pet-state`
+  sprite divs, e.g. the panel previews). Hiding is exact per-text-node label
+  match (multilingual: Pets / Pet / 宠物 / 虚拟宠物, trimmed + lower-cased) so
+  "Pet care" lookalikes are never touched; avatars match by the official
+  `data-codex-pet-*` attributes.
 
 ## Configuration
 
@@ -46,9 +55,9 @@ only, allow wins over block, only http(s) URLs are ever blocked.
 - `lib/statsig.js` - Statsig URL classification + synthetic payload builders
   (numeric contract, pure).
 - `runtime/webview-*.template.js` - the four appended webview IIFE templates
-  (statsig / network / brand / menu), placeholders filled by
+  (statsig / network / brand / menu / pets), placeholders filled by
   `webview-runtime.js`.
-- `runtime/webview-runtime.js` - assembles the four templates into the final
+- `runtime/webview-runtime.js` - assembles the five templates into the final
   webview runtime sources.
 - `runtime/main-runtime.js` - builds the main-process runtime source appended
   to `.vite/build/main*.js`.
@@ -56,17 +65,18 @@ only, allow wins over block, only http(s) URLs are ever blocked.
 
 ## Verification (upstream `chatgpt_26.908.40834_amd64.deb`)
 
-- `node --test linux-features/brand-network-overlay/test.js` — 26/26 pass
+- `node --test linux-features/brand-network-overlay/test.js` — 32/32 pass
   (host matching, YAML config parsing, Statsig numeric contract, webview
-  runtimes in a vm sandbox with read-only-IDL FakeXHR, patch idempotency,
-  and all five descriptors applied against the real 26.908 asar extract).
+  runtimes in a vm sandbox with read-only-IDL FakeXHR, pets surface hiding
+  incl. sidebar tab / panel / avatar / idempotency, patch idempotency, and
+  all six descriptors applied against the real 26.908 asar extract).
 - `UPSTREAM_DEB=/nas2/tmp/chatgpt_26.908.40834_amd64.deb
   CODEX_LINUX_FEATURES_CONFIG=<features.json enabling this feature>
   ./install.sh --inspect --report-dir /data/tmp/overlay-inspect/report <deb>`
   — patch-report: `applied=5`, all five descriptors `applied`:
   `net-fetch-overlay` (main-bundle), `statsig-local-responder`,
-  `network-block-guard`, `brand-text-overlay`, `menu-item-hider`
-  (webview-asset, bundle `app-initial-74b69e67976a.js`).
+  `network-block-guard`, `brand-text-overlay`, `menu-item-hider`,
+  `pets-surface-hider` (webview-asset, bundle `app-initial-74b69e67976a.js`).
 
 Anchors: webview descriptors gate on the three unique markers
 (`ab.chatgpt.com`, `/ces/v1/rgstr`, `sidebarProjectRow`) plus the

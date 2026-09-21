@@ -210,10 +210,14 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
         fetch: function (input, init) {
           const args = Array.prototype.slice.call(arguments);
           const url = urlFromFetchArgs(args);
-          if (config.network.blockedHosts.length && isBlockedUrl(url, config.network)) {
-            console.warn("[brand-network-overlay] net.fetch blocked by config: " + String(url).split("?")[0]);
-            return Promise.resolve(buildLocalResponse("{}", url, ResponseCtor));
-          }
+          // Order matters: the Statsig control plane must be answered with its
+          // legal payload BEFORE the generic block list. The default block list
+          // contains *.chatgpt.com, and ab.chatgpt.com/v1/initialize matches it;
+          // answering that with a bare {} makes the official Statsig SDK fail to
+          // parse the response, which drops the i18n layer (72216192
+          // enable_i18n) to NoValues and leaves the whole UI in English even
+          // though the locale resolves to zh-CN. Statsig-first mirrors the
+          // gateway's IPC relay and browser guard ordering.
           const statsigBody = localStatsigBodyForUrl(url);
           if (statsigBody) {
             const deliver = function () {
@@ -228,6 +232,10 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
               });
             }
             return Promise.resolve(deliver());
+          }
+          if (config.network.blockedHosts.length && isBlockedUrl(url, config.network)) {
+            console.warn("[brand-network-overlay] net.fetch blocked by config: " + String(url).split("?")[0]);
+            return Promise.resolve(buildLocalResponse("{}", url, ResponseCtor));
           }
           return nativeFetch.apply(null, args);
         },

@@ -288,6 +288,7 @@ function createFakeDom() {
   }
 
   function matchTerm(node, term) {
+    if (term === "*") return node.nodeType === ELEMENT_NODE;
     const attrMatch = term.match(/^\[([a-zA-Z-]+)(?:=\"?([^\"\]]*)\"?)?\]$/);
     if (attrMatch) {
       if (node.nodeType !== ELEMENT_NODE) return false;
@@ -698,7 +699,7 @@ test("webview: official menu items are hidden (all a11y effects), others untouch
     items[label] = button;
   }
   dom.body.appendChild(menu);
-  const menuObserver = env.dom.mutations.filter((mo) => mo && mo.observations > 0).at(-1);
+  const menuObserver = env.dom.mutations.find((mo) => mo && mo.observations > 0 && mo.__bnovMenuObserver === true);
   assert.ok(menuObserver, "menu runtime installed a MutationObserver");
   menuObserver.fire([{ type: "childList", addedNodes: [menu] }]);
   env.flushTimers();
@@ -722,7 +723,7 @@ test("webview: identical text outside a menu context is untouched", () => {
   const button = dom.makeElement("button");
   button.appendChild(dom.makeText("Help"));
   dom.body.appendChild(button);
-  const menuObserver = env.dom.mutations.filter((mo) => mo && mo.observations > 0).at(-1);
+  const menuObserver = env.dom.mutations.find((mo) => mo && mo.observations > 0 && mo.__bnovMenuObserver === true);
   menuObserver.fire([{ type: "childList", addedNodes: [button] }]);
   env.flushTimers();
   assert.equal(button.hidden, false);
@@ -738,10 +739,179 @@ test("webview: split label + shortcut text nodes still match (per-node equality)
   button.appendChild(dom.makeText("Alt+Super+P"));
   menu.appendChild(button);
   dom.body.appendChild(menu);
-  const menuObserver = env.dom.mutations.filter((mo) => mo && mo.observations > 0).at(-1);
+  const menuObserver = env.dom.mutations.find((mo) => mo && mo.observations > 0 && mo.__bnovMenuObserver === true);
   menuObserver.fire([{ type: "childList", addedNodes: [menu] }]);
   env.flushTimers();
   assert.equal(button.hidden, true);
+});
+
+// ---------------------------------------------------------------------------
+// webview runtime: pets surface hiding
+// ---------------------------------------------------------------------------
+
+function makePetsDom(env) {
+  const dom = env.dom;
+  const nav = dom.makeElement("nav");
+  nav.setAttribute("aria-label", "Settings");
+  nav._attrs.class = "sidebar-navigation flex min-h-0 flex-1 flex-col";
+  const scroll = dom.makeElement("div");
+  scroll._attrs.class = "min-h-0 flex-1 overflow-y-auto";
+  const list = dom.makeElement("div");
+  scroll.appendChild(list);
+  nav.appendChild(scroll);
+  dom.body.appendChild(nav);
+  const items = {};
+  for (const label of ["General", "Pets", "Keyboard shortcuts", "Pet care", "Account"]) {
+    const button = dom.makeElement("button");
+    button._attrs.class = "sidebar-item relative";
+    if (label !== "Pet care") button.setAttribute("aria-label", label);
+    button.appendChild(dom.makeText(label));
+    list.appendChild(button);
+    items[label] = button;
+  }
+  return { dom, nav, list, items };
+}
+
+function firePetsObserver(env, addedNodes) {
+  const petsObserver = env.dom.mutations.find((mo) => mo && mo.observations > 0 && mo.__bnovPetsObserver === true);
+  assert.ok(petsObserver, "pets runtime installed a MutationObserver");
+  petsObserver.fire([{ type: "childList", addedNodes }]);
+  env.flushTimers();
+}
+
+test("webview: settings sidebar Pets tab is hidden; ordinary items untouched", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const { items } = makePetsDom(env);
+  firePetsObserver(env, [env.dom.body]);
+  const pets = items["Pets"];
+  assert.equal(pets.hidden, true, "Pets tab hidden attr");
+  assert.equal(pets.getAttribute("aria-hidden"), "true");
+  assert.equal(pets.getAttribute("tabindex"), "-1");
+  assert.ok(String(pets.style.display).includes("none"), "Pets tab display none");
+  assert.equal(pets.disabled, true);
+  assert.equal(pets.dataset.bnovPetsHidden, "true");
+  for (const label of ["General", "Keyboard shortcuts", "Pet care", "Account"]) {
+    assert.equal(items[label].hidden, false, `${label} untouched`);
+    assert.equal(items[label].getAttribute("aria-hidden"), null);
+  }
+});
+
+test("webview: Pets settings panel (heading + content container) is hidden", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const dom = env.dom;
+  // Replicates the real panel: a scroll container holding the panel root
+  // (mx-auto flex w-full flex-col max-w-3xl) with the H1 "Pets" heading and
+  // the pet-size slider inside.
+  const scroll = dom.makeElement("div");
+  scroll._attrs.class = "flex-1 scrollbar-stable overflow-y-auto p-panel";
+  const panel = dom.makeElement("div");
+  panel._attrs.class = "mx-auto flex w-full flex-col max-w-3xl";
+  const heading = dom.makeElement("h1");
+  heading.appendChild(dom.makeText("Pets"));
+  const slider = dom.makeElement("input");
+  slider.setAttribute("id", "pet-size");
+  panel.appendChild(heading);
+  panel.appendChild(slider);
+  scroll.appendChild(panel);
+  dom.body.appendChild(scroll);
+  firePetsObserver(env, [scroll]);
+  assert.equal(heading.getAttribute("aria-hidden"), "true");
+  assert.ok(String(heading.style.display).includes("none"));
+  assert.equal(panel.getAttribute("aria-hidden"), "true", "panel container hidden");
+  assert.ok(String(panel.style.display).includes("none"), "panel container display none");
+  // The slider stays in the DOM (hidden with its container) - never removed.
+  assert.equal(slider.parentNode, panel);
+});
+
+test("webview: pet avatar elements (data-codex-pet-id) are hidden wherever mounted", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const dom = env.dom;
+  const pet = dom.makeElement("div");
+  pet._attrs.class = "_Root_1hrnv_1 scale-75";
+  pet.setAttribute("data-codex-pet-id", "codex");
+  pet.setAttribute("data-codex-pet-state", "idle");
+  const wrap = dom.makeElement("div");
+  wrap.appendChild(pet);
+  dom.body.appendChild(wrap);
+  firePetsObserver(env, [wrap]);
+  assert.equal(pet.getAttribute("aria-hidden"), "true");
+  assert.equal(pet.getAttribute("tabindex"), "-1");
+  assert.ok(String(pet.style.display).includes("none"));
+  assert.equal(pet.dataset.bnovPetsHidden, "true");
+  // The wrapper is NOT touched (hide the sprite itself, not its layout slot).
+  assert.equal(wrap.getAttribute("aria-hidden"), null);
+});
+
+test("webview: non-exact pet text outside the settings sidebar is untouched", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const dom = env.dom;
+  // A bare span "Pets" in a normal (non-sidebar) context and a longer
+  // heading must both be left alone (exact per-text-node equality).
+  const wrapper = dom.makeElement("div");
+  const span = dom.makeElement("span");
+  span.appendChild(dom.makeText("Pets"));
+  wrapper.appendChild(span);
+  const otherHeading = dom.makeElement("h2");
+  otherHeading.appendChild(dom.makeText("Pet care tracker"));
+  wrapper.appendChild(otherHeading);
+  dom.body.appendChild(wrapper);
+  firePetsObserver(env, [wrapper]);
+  assert.equal(span.getAttribute("aria-hidden"), null);
+  assert.equal(otherHeading.getAttribute("aria-hidden"), null);
+});
+
+test("webview: pets runtime is idempotent (second install is a no-op)", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const { items } = makePetsDom(env);
+  firePetsObserver(env, [env.dom.body]);
+  assert.equal(items["Pets"].hidden, true);
+  // Re-run the compiled pets runtime: the window marker must short-circuit
+  // without throwing.
+  const source = buildWebviewRuntimes({ manifest: MANIFEST, settings: {} }).pets;
+  vm.runInNewContext(source, env.sandbox, { filename: "wv-pets-second.js" });
+  assert.equal(env.sandbox.__bnovPetsInstalled, true);
+  assert.equal(items["Pets"].dataset.bnovPetsHidden, "true");
+});
+
+test("webview: added node that IS the pet element gets hidden (self + descendants)", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const dom = env.dom;
+  // React commits the H1 itself and the sprite div as their own addedNodes
+  // (not wrapped in a fresh parent) - scanRoot must check the node itself.
+  const heading = dom.makeElement("h1");
+  heading.appendChild(dom.makeText("Pets"));
+  const sprite = dom.makeElement("div");
+  sprite.setAttribute("data-codex-pet-id", "dewey");
+  sprite.setAttribute("data-codex-pet-state", "idle");
+  const sibling = dom.makeElement("span");
+  sibling.appendChild(dom.makeText("unrelated"));
+  sprite.appendChild(sibling);
+  firePetsObserver(env, [heading, sprite]);
+  assert.equal(heading.getAttribute("aria-hidden"), "true");
+  assert.ok(String(heading.style.display).includes("none"));
+  assert.equal(sprite.getAttribute("aria-hidden"), "true");
+  assert.ok(String(sprite.style.display).includes("none"));
+  // a non-pet descendant of the sprite stays untouched
+  assert.equal(sibling.getAttribute("aria-hidden"), null);
+});
+
+test("webview: records arriving while a scan is queued are accumulated, not dropped", () => {
+  const env = runWebviewRuntimesInSandbox();
+  const dom = env.dom;
+  const petsObserver = env.dom.mutations.find((mo) => mo && mo.observations > 0 && mo.__bnovPetsObserver === true);
+  assert.ok(petsObserver);
+  const a = dom.makeElement("div");
+  a.setAttribute("data-codex-pet-id", "a");
+  const b = dom.makeElement("div");
+  b.setAttribute("data-codex-pet-id", "b");
+  dom.body.appendChild(a);
+  dom.body.appendChild(b);
+  // Two batches: the first queues a scan, the second arrives while pending.
+  petsObserver.fire([{ type: "childList", addedNodes: [a] }]);
+  petsObserver.fire([{ type: "childList", addedNodes: [b] }]);
+  env.flushTimers();
+  assert.equal(a.getAttribute("aria-hidden"), "true");
+  assert.equal(b.getAttribute("aria-hidden"), "true");
 });
 
 // ---------------------------------------------------------------------------
@@ -771,11 +941,18 @@ test("patch: main bundle patch appends the runtime once (idempotent) and fails s
 
 test("patch: webview descriptors append each runtime exactly once; non-target untouched", () => {
   const { webviewSrc } = sampleSources();
+  const idToMarker = {
+    "statsig-local-responder": patch.WEBVIEW_IDEMPOTENT_MARKERS.statsig,
+    "network-block-guard": patch.WEBVIEW_IDEMPOTENT_MARKERS.network,
+    "brand-text-overlay": patch.WEBVIEW_IDEMPOTENT_MARKERS.brand,
+    "menu-item-hider": patch.WEBVIEW_IDEMPOTENT_MARKERS.menu,
+    "pets-surface-hider": patch.WEBVIEW_IDEMPOTENT_MARKERS.pets,
+  };
   let source = webviewSrc;
   for (const descriptor of patch.descriptors.filter((d) => d.phase === "webview-asset")) {
     const next = descriptor.apply(source, patchContext());
     assert.notEqual(next, source, `${descriptor.id} applied`);
-    assert.ok(next.includes(patch.WEBVIEW_IDEMPOTENT_MARKERS[descriptor.id.replace("-local-responder", "").replace("-block-guard", "").replace("-text-overlay", "").replace("-item-hider", "")]), descriptor.id);
+    assert.ok(next.includes(idToMarker[descriptor.id]), descriptor.id);
     // second application is a no-op
     assert.equal(descriptor.apply(next, patchContext()), next, `${descriptor.id} idempotent`);
     source = next;
@@ -787,14 +964,16 @@ test("patch: webview descriptors append each runtime exactly once; non-target un
   assert.equal(menuDescriptor.assetMatch(webviewSrc), true);
 });
 
-test("patch: all five descriptors exist with distinct ids and expected phases/orders", () => {
-  assert.equal(patch.descriptors.length, 5);
+test("patch: all six descriptors exist with distinct ids and expected phases/orders", () => {
+  assert.equal(patch.descriptors.length, 6);
   const ids = patch.descriptors.map((d) => d.id);
   assert.deepEqual(new Set(ids).size, ids.length);
   assert.deepEqual(
     patch.descriptors.map((d) => d.phase),
-    ["main-bundle", "webview-asset", "webview-asset", "webview-asset", "webview-asset"],
+    ["main-bundle", "webview-asset", "webview-asset", "webview-asset", "webview-asset", "webview-asset"],
   );
+  assert.deepEqual(patch.descriptors.map((d) => d.id).at(-1), "pets-surface-hider");
+  assert.equal(patch.descriptors.at(-1).order, 20855);
   const orders = patch.descriptors.map((d) => d.order);
   assert.deepEqual(orders, [...orders].sort((a, b) => a - b));
   assert.ok(patch.descriptors.every((d) => d.ciPolicy === "optional"));
@@ -854,6 +1033,64 @@ test("main runtime: installs in a sandbox and blocks net.fetch per config", asyn
 
   const open = await electronStub.net.fetch("https://example.org/");
   assert.equal(open.marker, "native");
+});
+
+// Regression: the Statsig control plane must be answered BEFORE the generic
+// block list. The default block list contains *.chatgpt.com, so
+// ab.chatgpt.com/v1/initialize also matches the block list; if the block check
+// ran first it would answer a bare "{}", the official Statsig SDK would fail to
+// parse it, the i18n layer (72216192 enable_i18n) would fall back to false, and
+// the whole UI would stay in English even though the locale resolves to zh-CN.
+test("main runtime: Statsig initialize is served its legal payload even when the host is in the block list", async () => {
+  const { buildMainRuntime } = require("./runtime/main-runtime.js");
+  const manifest = {
+    brandNetworkOverlay: {
+      brand: { name: "wdev" },
+      // *.chatgpt.com is the shipping default, so ab.chatgpt.com is blocked.
+      network: { block: ["chatgpt.com", "*.chatgpt.com", "*.openai.com"], allow: [] },
+      statsig: { initializeDelayMs: 0 },
+    },
+  };
+  const source = buildMainRuntime({ manifest, settings: {} });
+
+  const warns = [];
+  const electronStub = {
+    net: { fetch: async () => ({ ok: true, status: 200, marker: "native" }) },
+    session: {},
+    app: { on() {}, getAllWindows() { return []; } },
+  };
+  const req = (n) => {
+    if (n === "electron") return electronStub;
+    if (n === "node:fs") return fs;
+    if (n === "node:path") return path;
+    if (n === "node:url") return require("node:url");
+    throw new Error("unexpected require: " + n);
+  };
+  const sandbox = {
+    console: { warn: (m) => warns.push(String(m)), log() {}, error() {} },
+    process: { env: { CODEX_DESKTOP_CONFIG: "/nonexistent/config.yaml" } },
+    Buffer,
+    setTimeout,
+    clearTimeout,
+    URL,
+    require: req,
+  };
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(source, sandbox, { filename: "bnov-main-runtime.js" });
+
+  // ab.chatgpt.com matches *.chatgpt.com (blocked) yet must get the gate payload.
+  const init = await electronStub.net.fetch("https://ab.chatgpt.com/v1/initialize");
+  assert.equal(init.status, 200);
+  const initBody = JSON.parse(await init.text());
+  assert.equal(initBody.has_updates, true);
+  assert.equal(initBody.layer_configs["72216192"].value.enable_i18n, true, "i18n layer must stay enabled");
+  assert.equal(initBody.feature_gates["505458"].value, true);
+  assert.notEqual(JSON.stringify(initBody), "{}", "initialize must never be answered with a bare {}");
+
+  // A plain blocked host still gets the bare "{}" short-circuit.
+  const blocked = await electronStub.net.fetch("https://chatgpt.com/ces/v1/rgstr");
+  assert.equal(blocked.status, 200);
+  assert.equal(await blocked.text(), "{}");
 });
 
 test("patch: real upstream bundles (26.908.40834) accept all five descriptors", (t, done) => {

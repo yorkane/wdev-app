@@ -12,7 +12,11 @@ const {
   hiddenRuntimeGcmCommandLineArgs,
   headlessRuntimeCommandLineArgs,
   isolateHiddenRuntimeGcmStoresForUserData,
+  desktopLocaleCommandLineArgs,
+  resolveDesktopLocale,
 } = require("../runtime/electron/hidden-runtime-command-line.cjs");
+// 网关自有 i18n 的语言环境变量名（与 shared/i18n 保持一致；launcher 路径会显式注入，这里只兜底）。
+const PREFERRED_LANGUAGES_ENV = "OPENCODEX_PREFERRED_LANGUAGES";
 
 // dev runner 位于 gateway/dev 下，项目根目录需要回退两级。
 const APP_ROOT = path.resolve(__dirname, "..", "..");
@@ -59,6 +63,9 @@ function spawnGateway(officialRuntime, officialRuntimeArgs) {
       CODEX_WEB_OFFICIAL_BUNDLE_DIR: officialBundleDir,
       CODEX_WEB_OFFICIAL_USER_DATA_DIR: officialUserDataDir,
       CODEX_ELECTRON_USER_DATA_PATH: officialUserDataDir,
+      // 未显式指定网关 i18n 语言时，跟随桌面运行时语言（默认 zh-CN），避免中文界面配英文网关文案。
+      [PREFERRED_LANGUAGES_ENV]:
+        process.env[PREFERRED_LANGUAGES_ENV] || resolveDesktopLocale(process.env),
     },
     // 继承终端输出，同时保留生命周期 pipe，便于 gateway 在父进程退出后主动结束。
     stdio: ["inherit", "inherit", "inherit", "pipe"],
@@ -122,6 +129,8 @@ async function main() {
     ...hiddenRuntimeGcmCommandLineArgs(process.env),
     // 无头服务器适配走环境变量开关，保持仓库默认行为与桌面端一致（见 docs/LINUX_GUIDE.md）。
     ...headlessRuntimeCommandLineArgs(process.env),
+    // 界面语言：CODEX_DESKTOP_LOCALE（默认 zh-CN）随初始 argv 进入官方 Electron 进程。
+    ...desktopLocaleCommandLineArgs(process.env),
   ];
   spawnGateway(officialRuntime, officialRuntimeArgs);
 

@@ -10,7 +10,31 @@ GATEWAY_UNIT=codex-desktop-gateway.service
 XVFB_UNIT=codex-desktop-xvfb.service
 
 if [ -f "$GATEWAY_DIR/VERSION" ]; then
+    # 服务账户可在 conffile 里覆盖（例如与系统上其它服务共用 aigc）。
+    # 默认保持包内单元定义的 codex-desktop。
+    gateway_service_user() {
+        user=""
+        if [ -f /etc/codex-desktop/gateway.env ]; then
+            user=$(sed -n 's/^[[:space:]]*GATEWAY_SERVICE_USER=//p' /etc/codex-desktop/gateway.env |
+                tail -1 | tr -d '"'"'"' ')
+        fi
+        [ -n "$user" ] || user=codex-desktop
+        printf '%s' "$user"
+    }
+
+    gateway_service_group() {
+        group=""
+        if [ -f /etc/codex-desktop/gateway.env ]; then
+            group=$(sed -n 's/^[[:space:]]*GATEWAY_SERVICE_GROUP=//p' /etc/codex-desktop/gateway.env |
+                tail -1 | tr -d '"'"'"' ')
+        fi
+        [ -n "$group" ] || group="$(gateway_service_user)"
+        printf '%s' "$group"
+    }
+
     create_gateway_service_account() {
+        # 只在默认账户下创建系统账户；自定义账户由管理员负责（可能是既有账户）。
+        [ "$(gateway_service_user)" = "codex-desktop" ] || return 0
         if ! getent passwd codex-desktop >/dev/null 2>&1; then
             adduser --system --group --disabled-password --home "$STATE_DIR" \
                 --no-create-home --gecos "codex-desktop gateway" codex-desktop >/dev/null 2>&1 || true
@@ -20,19 +44,33 @@ if [ -f "$GATEWAY_DIR/VERSION" ]; then
         fi
     }
 
+    # 目录已存在时只修正权限位，**不改属主**：否则升级会把管理员/服务切过的
+    # 运行目录夺回 codex-desktop 属主，服务随即因 SingletonLock 等文件不可写而
+    # 反复重启（241.t 生产实例曾因此 NRestarts 飙升）。
+    ensure_gateway_dir() {
+        dir="$1"
+        mode="$2"
+        if [ -d "$dir" ]; then
+            chmod "$mode" "$dir" 2>/dev/null || true
+        else
+            install -d -o "$(gateway_service_user)" -g "$(gateway_service_group)" -m "$mode" "$dir"
+        fi
+    }
+
     create_gateway_runtime_dirs() {
-        install -d -o codex-desktop -g codex-desktop -m 0755 "$STATE_DIR"
-        install -d -o codex-desktop -g codex-desktop -m 0755 \
-            "$STATE_DIR/codexhome" \
-            "$STATE_DIR/runtime" \
-            "$STATE_DIR/reports" \
-            "$STATE_DIR/official-bundle" \
-            "$STATE_DIR/official-user-data"
+        ensure_gateway_dir "$STATE_DIR" 0755
+        ensure_gateway_dir "$STATE_DIR/codexhome" 0755
+        ensure_gateway_dir "$STATE_DIR/runtime" 0755
+        ensure_gateway_dir "$STATE_DIR/reports" 0755
+        ensure_gateway_dir "$STATE_DIR/official-bundle" 0755
+        ensure_gateway_dir "$STATE_DIR/official-user-data" 0755
         # 网关把官方 Electron 子进程日志写到 StandardOutput 指定的文件，目录必须可写。
-        install -d -o codex-desktop -g codex-desktop -m 0750 "$LOG_DIR"
-        touch "$LOG_DIR/gateway.log"
-        chown codex-desktop:codex-desktop "$LOG_DIR/gateway.log" 2>/dev/null || true
-        chmod 0640 "$LOG_DIR/gateway.log"
+        ensure_gateway_dir "$LOG_DIR" 0750
+        if [ ! -e "$LOG_DIR/gateway.log" ]; then
+            touch "$LOG_DIR/gateway.log"
+            chown "$(gateway_service_user):$(gateway_service_group)" "$LOG_DIR/gateway.log" 2>/dev/null || true
+        fi
+        chmod 0640 "$LOG_DIR/gateway.log" 2>/dev/null || true
     }
 
     gateway_reload_systemd() {
@@ -40,10 +78,31 @@ if [ -f "$GATEWAY_DIR/VERSION" ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
     }
 
+    # 服务账户声明在 conffile 里时，同步一个 systemd drop-in 覆盖单元的 User/Group，
+    # 让「改 gateway.env 一处」就同时决定目录属主与进程身份，避免两者漂移。
+    sync_gateway_service_user_dropin() {
+        dropin_dir="/etc/systemd/system/${GATEWAY_UNIT}.d"
+        dropin="$dropin_dir/10-service-user.conf"
+        user="$(gateway_service_user)"
+        group="$(gateway_service_group)"
+        if [ "$user" = "codex-desktop" ] && [ "$group" = "codex-desktop" ]; then
+            rm -f "$dropin" 2>/dev/null || true
+            return 0
+        fi
+        mkdir -p "$dropin_dir"
+        cat >"$dropin" <<EOF
+[Service]
+User=$user
+Group=$group
+EOF
+        chmod 0644 "$dropin"
+    }
+
     case "$1" in
         configure)
             create_gateway_service_account
             create_gateway_runtime_dirs
+            sync_gateway_service_user_dropin
             gateway_reload_systemd
             systemctl enable "$XVFB_UNIT" >/dev/null 2>&1 || true
             systemctl enable "$GATEWAY_UNIT" >/dev/null 2>&1 || true

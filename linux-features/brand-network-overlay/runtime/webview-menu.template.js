@@ -108,6 +108,9 @@
         } catch (err) {}
       }, 100);
     });
+    // Test hook: lets the vm-sandbox suite distinguish this observer from
+    // the other bnov runtimes' observers (no-op on a real DOM).
+    try { observer.__bnovMenuObserver = true; } catch (err) {}
     observer.observe(document.documentElement, { subtree: true, childList: true });
   } catch (err) {}
 

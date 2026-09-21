@@ -6,6 +6,10 @@ const UNUSED_HIDDEN_RUNTIME_BLINK_FEATURES = ["PushMessaging"];
 const HIDDEN_RUNTIME_GCM_HOLD_PATH = "/__opencodex-internal/gcm-checkin-hold";
 const HIDDEN_RUNTIME_GCM_STORE_BACKUP = "GCM Store.opencodex-disabled";
 const HEADLESS_RUNTIME_ARGS_ENV = "OPENCODEX_HEADLESS_ELECTRON";
+// 桌面运行时界面语言：CODEX_DESKTOP_LOCALE 优先，OPENCODEX_LOCALE 作为兼容别名；未设置时默认简体中文。
+const DESKTOP_LOCALE_ENV = "CODEX_DESKTOP_LOCALE";
+const DESKTOP_LOCALE_ENV_ALIAS = "OPENCODEX_LOCALE";
+const DEFAULT_DESKTOP_LOCALE = "zh-CN";
 
 function appendMergedSwitch(commandLine, name, additions) {
   const existing =
@@ -112,6 +116,24 @@ function headlessRuntimeCommandLineArgs(env = process.env) {
   return ["--no-sandbox", "--headless", "--disable-gpu"];
 }
 
+/**
+ * 解析桌面运行时界面语言：CODEX_DESKTOP_LOCALE（或兼容别名 OPENCODEX_LOCALE）非空时用其值，
+ * 否则回落到默认简体中文。空字符串按未设置处理，行为与默认一致（向后兼容）。
+ */
+function resolveDesktopLocale(env = process.env) {
+  const value = String(env?.[DESKTOP_LOCALE_ENV] ?? env?.[DESKTOP_LOCALE_ENV_ALIAS] ?? "").trim();
+  return value || DEFAULT_DESKTOP_LOCALE;
+}
+
+/**
+ * 官方 Electron 运行时的语言参数：必须随初始 argv 进入进程（main 阶段 appendSwitch 对
+ * --lang 已经太晚，Chromium 在浏览器进程启动前就读取了语言设置）。
+ */
+function desktopLocaleCommandLineArgs(env = process.env) {
+  const locale = resolveDesktopLocale(env);
+  return [`--lang=${locale}`, `--accept-lang=${locale}`];
+}
+
 function hiddenRuntimeGcmCommandLineArgs(env = process.env) {
   const holdUrl = hiddenRuntimeGcmHoldUrl(env);
   /**
@@ -167,6 +189,11 @@ module.exports = {
   hiddenRuntimeGcmHoldUrl,
   HEADLESS_RUNTIME_ARGS_ENV,
   headlessRuntimeCommandLineArgs,
+  DESKTOP_LOCALE_ENV,
+  DESKTOP_LOCALE_ENV_ALIAS,
+  DEFAULT_DESKTOP_LOCALE,
+  resolveDesktopLocale,
+  desktopLocaleCommandLineArgs,
   isolateHiddenRuntimeGcmStore,
   isolateHiddenRuntimeGcmStoresForUserData,
 };

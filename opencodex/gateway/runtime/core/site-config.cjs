@@ -12,7 +12,10 @@ const { AUTH_CONFIG_PATH, exists, readText } = require("./config.cjs");
 // 品牌名兜底值必须与历史默认一致：未配置时不能改变现有行为。
 const DEFAULT_BRAND_NAME = "OpenCodex";
 // 环境变量优先级高于 config.yaml，便于 launcher 或无配置文件部署临时覆盖。
-const BRAND_NAME_ENV = "OPENCODEX_BRAND_NAME";
+// CODEX_DESKTOP_BRAND_NAME 与桌面端覆盖层（linux-features/brand-network-overlay）使用同名变量，
+// 保证「桌面 + 网关」同一份 brand 来源；OPENCODEX_BRAND_NAME 作为兼容别名保留。
+const BRAND_NAME_ENV = "CODEX_DESKTOP_BRAND_NAME";
+const BRAND_NAME_ENV_ALIAS = "OPENCODEX_BRAND_NAME";
 const BRAND_NAME_MAX_LENGTH = 64;
 
 function stripYamlComment(value) {
@@ -257,7 +260,7 @@ function loadSiteConfig(options = {}) {
   }
   const parsed = parseBlockSubset(rawConfig, EXPECTED_BLOCKS);
 
-  const envBrandName = normalizeBrandName(process.env[BRAND_NAME_ENV] || "");
+  const envBrandName = normalizeBrandName(process.env[BRAND_NAME_ENV] || process.env[BRAND_NAME_ENV_ALIAS] || "");
   const fileBrandName = normalizeBrandName(parsed.brand && parsed.brand.name);
   const brandName = envBrandName || fileBrandName || DEFAULT_BRAND_NAME;
 
@@ -316,6 +319,7 @@ function isBlockedUrl(rawUrl, network) {
 
 module.exports = {
   BRAND_NAME_ENV,
+  BRAND_NAME_ENV_ALIAS,
   DEFAULT_BRAND_NAME,
   clearSiteConfigCache,
   getSiteConfig,

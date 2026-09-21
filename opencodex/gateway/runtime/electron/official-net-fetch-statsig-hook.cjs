@@ -133,23 +133,28 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
   const hookedNet = Object.assign(Object.create(Object.getPrototypeOf(nativeNet)), nativeNet, {
     fetch(...args) {
       const url = extractUrlFromNetFetchArgs(args);
-      // 先按配置清单判定：被拦截的域名回 200 空对象，等价于「请求已完成」，
+      const bodyJson = statsigLocalResponseBodyForUrl(url);
+      if (bodyJson) {
+        // Statsig 控制面必须优先于配置 block 清单：config.yaml 的 block 常包含 *.chatgpt.com，
+        // 若 block 先命中，initialize 会被回裸 {}，官方 SDK 的 _typedJsonParse 解析失败落 NoValues，
+        // enable_i18n 门控回落 false，官方 web UI 的 i18n 消息表整段不加载（界面停留英文）。
+        if (onIntercept) onIntercept(url);
+        diagnosticLog("statsig-net-fetch", "net_fetch_served_local", { url: String(url).split("?")[0] });
+        const deliver = () => buildStatsigNetResponse(bodyJson, url, ResponseCtor);
+        // 仅初始化响应加延迟以复刻真实往返、规避官方模块初始化竞态；遥测/异常上报保持即时。
+        if (String(url).includes("/v1/initialize") && STATSIG_INITIALIZE_DELAY_MS > 0) {
+          return new Promise((resolve) => setTimeout(() => resolve(deliver()), STATSIG_INITIALIZE_DELAY_MS));
+        }
+        return Promise.resolve(deliver());
+      }
+      // 非 Statsig 控制面的请求才按配置清单判定：被拦截的域名回 200 空对象，等价于「请求已完成」，
       // 既避免真实出网泄露信息，也避免连接挂起拖垮调用方。
       if (network && isBlockedUrl(url, network)) {
         if (onBlocked) onBlocked(url);
         diagnosticLog("network-guard", "net_fetch_blocked_by_config", { url: String(url).split("?")[0] });
         return Promise.resolve(buildStatsigNetResponse("{}", url, ResponseCtor));
       }
-      const bodyJson = statsigLocalResponseBodyForUrl(url);
-      if (!bodyJson) return nativeFetch(...args);
-      if (onIntercept) onIntercept(url);
-      diagnosticLog("statsig-net-fetch", "net_fetch_served_local", { url: String(url).split("?")[0] });
-      const deliver = () => buildStatsigNetResponse(bodyJson, url, ResponseCtor);
-      // 仅初始化响应加延迟以复刻真实往返、规避官方模块初始化竞态；遥测/异常上报保持即时。
-      if (String(url).includes("/v1/initialize") && STATSIG_INITIALIZE_DELAY_MS > 0) {
-        return new Promise((resolve) => setTimeout(() => resolve(deliver()), STATSIG_INITIALIZE_DELAY_MS));
-      }
-      return Promise.resolve(deliver());
+      return nativeFetch(...args);
     },
   });
   registerOverride(electronModule, "net", hookedNet);
