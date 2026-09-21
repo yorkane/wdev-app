@@ -26,3 +26,8 @@ linux-features/local/
 # graphify
 graphify-out/
 .graphify_*
+
+# GATEWAY_MARKER opencodex vendored gateway: sources are tracked, build artifacts are not
+opencodex/node_modules/
+opencodex/gateway/dist/
+opencodex/.build/

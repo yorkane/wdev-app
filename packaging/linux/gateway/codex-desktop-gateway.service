@@ -1,0 +1,24 @@
+[Unit]
+Description=codex-desktop gateway (Codex Desktop over the browser)
+Documentation=file:///opt/codex-desktop/gateway/README.md
+After=network-online.target codex-desktop-xvfb.service
+Wants=network-online.target
+Requires=codex-desktop-xvfb.service
+
+[Service]
+Type=simple
+User=codex-desktop
+Group=codex-desktop
+WorkingDirectory=/opt/codex-desktop/gateway
+# 站点品牌、出站域名策略、官方运行时路径都在这里配置。
+EnvironmentFile=/etc/codex-desktop/gateway.env
+ExecStart=/opt/codex-desktop/gateway/run-gateway.sh
+Restart=on-failure
+RestartSec=5
+# 官方 Electron 运行时是 Chromium，浏览器进程会打开较多文件描述符。
+LimitNOFILE=65535
+StandardOutput=append:/var/log/codex-desktop/gateway.log
+StandardError=append:/var/log/codex-desktop/gateway.log
+
+[Install]
+WantedBy=multi-user.target

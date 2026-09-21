@@ -1,0 +1,4 @@
+{
+  "plugin.mobileSidebarAutoCollapse.label": "移动端侧栏优化",
+  "plugin.mobileSidebarAutoCollapse.desc": "在移动端打开会话或新建会话后自动收起侧栏。"
+}

@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- 品牌名可由 config.yaml 的 brand.name 覆盖，渲染进程按 state.brand 刷新。 -->
+    <title>OpenCodex</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!-- 极简顶部导航栏 -->
+    <header class="app-header">
+      <div class="header-inner">
+        <!-- 左上角固定展示应用名称和 launcher 版本。 -->
+        <div class="header-brand">
+          <img class="logo" src="../web-shell/assets/icon.png" alt="Logo" />
+          <div class="header-copy">
+            <div class="brand-title">
+              <!-- 品牌名可由 config.yaml 的 brand.name 覆盖，渲染进程按 state.brand 刷新。 -->
+              <h1 id="brandName">OpenCodex</h1>
+              <span class="brand-version" id="openCodexVersion" data-i18n="common.unknown">未知</span>
+              <!-- 仅当 GitHub latest release 与本地版本不同，渲染进程才会显示此更新入口。 -->
+              <button class="update-badge" id="latestReleaseButton" type="button" hidden data-i18n="launcher.update.available">有新版本</button>
+            </div>
+          </div>
+        </div>
+        <div class="header-statuses">
+          <!-- 健康警告位于 Gateway 状态左侧，可打开完整诊断信息。 -->
+          <button class="status-pill offline" id="healthWarning" type="button" hidden data-i18n="launcher.status.healthWarning">健康异常</button>
+          <div class="status-pill" id="statusPill" data-i18n="launcher.status.starting">启动中</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <div class="container">
+
+        <!-- 错误提示 -->
+        <div class="notice" id="lastError" hidden></div>
+
+        <!-- 顶部核心大动作区域 -->
+        <section class="hero-section">
+          <div class="hero-content">
+            <div class="hero-label" data-i18n="launcher.hero.urlLabel">访问地址</div>
+            <div class="url-list" id="lanUrls" hidden></div>
+          </div>
+          <div class="hero-actions">
+            <button class="primary" id="openCodex" data-i18n="launcher.actions.openCodex">打开 OpenCodex</button>
+            <button id="copyUrl" data-i18n="launcher.actions.copyUrl">复制地址</button>
+            <button id="restart" data-i18n="launcher.actions.restart">重启服务</button>
+          </div>
+        </section>
+
+        <!-- 核心设置列表 -->
+        <section class="setting-section">
+          <h2><span data-i18n="launcher.settings.title">设置</span> <span class="section-caption" data-i18n="launcher.settings.accessCaption">服务访问</span></h2>
+          <div class="setting-list">
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.host.label">启动地址</div>
+                <div class="setting-desc" data-i18n="launcher.settings.host.description">选择服务运行的接口绑定</div>
+              </div>
+              <div class="setting-control">
+                <div class="segmented" id="hostModeGroup">
+                  <label>
+                    <input type="radio" name="hostMode" value="local" />
+                    <span data-i18n="launcher.settings.host.local">本机</span>
+                  </label>
+                  <label>
+                    <input type="radio" name="hostMode" value="lan" />
+                    <span data-i18n="launcher.settings.host.lan">局域网</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.port.label">端口</div>
+                <div class="setting-desc" data-i18n="launcher.settings.port.description">服务监听的网络端口</div>
+              </div>
+              <div class="setting-control port-row">
+                <input id="portInput" type="number" min="1" max="65535" step="1" inputmode="numeric" />
+                <button id="savePort" data-i18n="common.save">保存</button>
+              </div>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.auth.label">访问密码</div>
+                <div class="setting-desc">
+                  <span data-i18n="launcher.settings.auth.descriptionPrefix">设置访问权限 - 当前状态:</span>
+                  <span class="setting-status" id="authStatus">未启用</span>
+                </div>
+              </div>
+              <div class="setting-control password-row">
+                <input id="passwordInput" type="password" autocomplete="new-password" placeholder="留空关闭密码" data-i18n-placeholder="launcher.settings.auth.placeholder" />
+                <button id="savePassword" data-i18n="common.save">保存</button>
+                <button id="clearPassword" data-i18n="common.clear">清空</button>
+              </div>
+            </div>
+
+            <!-- 防睡眠能力由 launcher 主进程持有，开关只负责切换持久化设置。 -->
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.preventSleep.label">阻止电脑睡眠</div>
+                <div class="setting-desc" data-i18n="launcher.settings.preventSleep.description">启用后会保持系统唤醒保证服务可用，但不会阻止屏幕熄灭和锁屏</div>
+              </div>
+              <div class="setting-control">
+                <label class="toggle" for="preventSleepInput">
+                  <input id="preventSleepInput" type="checkbox" data-i18n-aria-label="launcher.settings.preventSleep.toggle" />
+                  <span aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <!-- 官方运行时扫描策略由 gateway 启动环境变量消费，关闭后优先复用已有缓存。 -->
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.officialAutoScanUpgrade.label">自动扫描官方运行时更新</div>
+                <div class="setting-desc" data-i18n="launcher.settings.officialAutoScanUpgrade.description">开启后启动时会扫描本地 Codex/ChatGPT Desktop 运行时版本，在发现新版时会自动跟进更新；关闭后复用现有缓存，仅在缓存缺失或不可用时才扫描。</div>
+              </div>
+              <div class="setting-control">
+                <label class="toggle" for="officialAutoScanUpgradeInput">
+                  <input id="officialAutoScanUpgradeInput" type="checkbox" data-i18n-aria-label="launcher.settings.officialAutoScanUpgrade.toggle" />
+                  <span aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label" data-i18n="launcher.settings.pluginDirs.label">外部插件目录</div>
+                <div class="setting-desc">
+                  <span data-i18n="launcher.settings.pluginDirs.descriptionPrefix">外部插件目录 - 当前状态:</span>
+                  <span class="setting-status" id="pluginDirsStatus">未设置</span>
+                </div>
+                <div class="setting-desc" data-i18n="launcher.settings.pluginDirs.description">留空则不设置；选择或填写包含插件子目录的根目录</div>
+              </div>
+              <div class="setting-control plugin-dirs-row">
+                <input id="pluginDirsInput" type="text" spellcheck="false" placeholder="留空不设置" data-i18n-placeholder="launcher.settings.pluginDirs.placeholder" />
+                <button id="choosePluginDir" data-i18n="common.choose">选择</button>
+                <button id="savePluginDirs" data-i18n="common.save">保存</button>
+                <button id="clearPluginDirs" data-i18n="common.clear">清空</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Codex 运行时 -->
+        <section class="setting-section">
+          <div class="section-head">
+            <h2>Codex <span class="section-caption" data-i18n="launcher.codex.caption">官方运行时</span></h2>
+            <!-- 仅在存在可用备份时展示还原入口，操作期间禁用按钮。 -->
+            <button id="restoreBundleBackup" class="secondary-btn" hidden disabled data-i18n="launcher.codex.restoreBackup">还原上一版本</button>
+          </div>
+          <div class="setting-list kv">
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.codex.version">版本</div>
+              <div class="setting-value" id="codexVersion" data-i18n="common.unknown">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.codex.build">构建</div>
+              <div class="setting-value" id="codexBuild" data-i18n="common.unknown">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.codex.cacheTime">缓存时间</div>
+              <div class="setting-value" id="cacheUpdatedAt" data-i18n="common.unknown">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.codex.path">桌面运行时路径</div>
+              <div class="setting-control"><button class="path" id="codexAppPath" data-i18n="common.notFound">未找到</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">app.asar</div>
+              <div class="setting-control"><button class="path" id="sourceAsarPath" data-i18n="common.notFound">未找到</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.codex.cli">命令行</div>
+              <div class="setting-control"><button class="path" id="codexBinaryPath" data-i18n="common.notFound">未找到</button></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 网关状态 -->
+        <section class="setting-section">
+          <h2><span data-i18n="launcher.gateway.title">网关</span> <span class="section-caption" data-i18n="launcher.gateway.caption">本机进程</span></h2>
+          <div class="setting-list kv">
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.gateway.process">进程</div>
+              <div class="setting-value" id="gatewayPid" data-i18n="common.notRunning">未运行</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.gateway.startedAt">启动时间</div>
+              <div class="setting-value" id="gatewayStartedAt" data-i18n="common.unknown">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.gateway.listen">监听</div>
+              <div class="setting-value" id="gatewayListen">127.0.0.1:3737</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.gateway.appServer">应用服务</div>
+              <div class="setting-value" id="appServerMode" data-i18n="common.unknown">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">Node</div>
+              <div class="setting-value" id="nodeVersion">未知</div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">Electron</div>
+              <div class="setting-value" id="electronVersion">未知</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 运行目录 -->
+        <section class="setting-section">
+          <div class="section-head">
+            <h2 data-i18n="launcher.paths.title">运行目录</h2>
+            <button id="openLogs" class="secondary-btn" data-i18n="launcher.paths.openLogs">查看日志</button>
+          </div>
+          <div class="setting-list kv paths">
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.paths.config">配置</div>
+              <div class="setting-control"><button class="path" id="configPath" data-i18n="common.notCreated">未创建</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.paths.log">日志</div>
+              <div class="setting-control"><button class="path" id="logPath" data-i18n="common.notCreated">未创建</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.paths.reports">报告</div>
+              <div class="setting-control"><button class="path" id="reportsDir" data-i18n="common.notCreated">未创建</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.paths.rendererCache">渲染器缓存</div>
+              <div class="setting-control"><button class="path" id="officialBundleDir" data-i18n="common.notCreated">未创建</button></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 底部关于信息，和 Web 设置页保持作者与仓库入口一致。 -->
+        <section class="setting-section about-section" aria-labelledby="launcherAboutTitle">
+          <h2 id="launcherAboutTitle" data-i18n="launcher.about.title">关于</h2>
+          <div class="setting-list kv about-list">
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.about.author">作者</div>
+              <div class="setting-control"><button class="path external-link" id="authorLink" type="button">Ryens</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label" data-i18n="launcher.about.github">GitHub</div>
+              <div class="setting-control"><button class="path external-link" id="githubLink" type="button">https://github.com/RyensX/OpenCodex</button></div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

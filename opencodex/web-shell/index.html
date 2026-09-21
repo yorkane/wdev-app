@@ -1,0 +1,1320 @@
+<!doctype html>
+<html lang="zh-CN" class="electron-light" data-codex-window-type="browser">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <!-- PWA 元数据只提供可安装壳，不引入 Service Worker 或离线缓存。 -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="application-name" content="OpenCodex" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="OpenCodex" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <!-- 浏览器首屏使用 192px 图标，避免为页签图标下载 1024px 原始素材。 -->
+    <link rel="icon" type="image/png" sizes="192x192" href="/assets/pwa-icon-192.png" />
+    <link rel="apple-touch-icon" href="/assets/pwa-icon-192.png" />
+    <title>OpenCodex</title>
+    <!-- codex-official-styles -->
+    <!-- opencodex-runtime-config -->
+    <script src="/opencodex-modification-runtime.js"></script>
+    <script src="/codex-runtime-compatibility.js"></script>
+    <script src="/codex-window-controls-overlay.js"></script>
+    <script src="/opencodex-plugin-system.js"></script>
+    <script src="/opencodex-plugin-loader.js"></script>
+    <script src="/opencodex-gateway-plugin-switches.js"></script>
+    <script src="/opencodex-modification-activate.js"></script>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--color-background-surface-under, #f4f4f5);
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        font-family:
+          var(--vscode-font-family, var(--font-sans-default, -apple-system, "system-ui", "Segoe UI", sans-serif));
+        font-size: var(--text-base, 14px);
+        line-height: 20px;
+      }
+      button,
+      input {
+        font: inherit;
+      }
+      #root {
+        min-height: 100%;
+      }
+      .entry {
+        position: relative;
+        box-sizing: border-box;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        overflow: hidden;
+        background: var(--color-token-main-surface-primary, #ffffff);
+      }
+      .entry::before {
+        display: none;
+      }
+      .entry::after {
+        display: none;
+      }
+      .panel {
+        position: relative;
+        z-index: 1;
+        box-sizing: border-box;
+        width: min(420px, 100%);
+        border: 1px solid var(--color-token-border-default, rgba(26, 28, 31, 0.12));
+        border-radius: var(--radius-lg, 12.5px);
+        /* 登录背景本身是纯色，使用不透明面板即可避免移动端为静态区域保留模糊合成层。 */
+        background: var(--color-token-main-surface-primary, #ffffff);
+        box-shadow:
+          var(--shadow-xl, rgba(26, 28, 31, 0.08) 0 18px 48px),
+          var(--shadow-md, rgba(26, 28, 31, 0.06) 0 2px 8px);
+        padding: 22px;
+      }
+      h1 {
+        margin: 0;
+        font-size: var(--text-heading-sm, 18px);
+        font-weight: var(--font-weight-semibold, 600);
+        line-height: 24px;
+        letter-spacing: 0;
+      }
+      .status,
+      .hint {
+        margin: 8px 0 0;
+        color: #6b7280;
+        font-size: var(--text-sm, 13px);
+        line-height: 18px;
+      }
+      form {
+        margin-top: 18px;
+      }
+      label {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--color-token-text-tertiary, rgba(26, 28, 31, 0.49));
+        font-size: var(--text-sm, 13px);
+        line-height: 18px;
+      }
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        height: 36px;
+        border: 1px solid var(--color-token-input-border, var(--color-token-border-default, rgba(26, 28, 31, 0.12)));
+        border-radius: var(--radius-md, 10px);
+        background: var(--color-token-input-background, var(--color-token-main-surface-primary, #ffffff));
+        color: var(--color-token-input-foreground, var(--color-token-editor-foreground, #1a1c1f));
+        padding: 8px 11px;
+        outline: none;
+      }
+      input:focus {
+        border-color: var(--color-token-focus-border, #0a84ff);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-token-focus-border, #0a84ff) 16%, transparent);
+      }
+      button {
+        width: 100%;
+        height: 36px;
+        margin-top: 12px;
+        border: 1px solid var(--color-token-button-border, transparent);
+        border-radius: var(--radius-lg, 12.5px);
+        background: var(--color-token-button-background, var(--color-token-text-primary, #1a1c1f));
+        color: var(--color-token-button-foreground, #ffffff);
+        font-size: var(--text-sm, 13px);
+        font-weight: var(--font-weight-semibold, 600);
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) {
+        background: var(--color-token-button-secondary-hover-background, color-mix(in srgb, var(--color-token-button-background, #1a1c1f) 86%, white));
+      }
+      #submit:hover:not(:disabled) {
+        background: color-mix(
+          in srgb,
+          var(--color-token-button-background, var(--color-token-text-primary, #1a1c1f)) 88%,
+          var(--color-token-main-surface-primary, #ffffff)
+        );
+      }
+      #submit:active:not(:disabled) {
+        background: color-mix(
+          in srgb,
+          var(--color-token-button-background, var(--color-token-text-primary, #1a1c1f)) 82%,
+          #000000
+        );
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.62;
+      }
+      .error {
+        min-height: 20px;
+        margin-top: 12px;
+        color: var(--color-token-error-foreground, #b42318);
+        font-size: var(--text-sm, 13px);
+        line-height: 18px;
+      }
+      /* 错误文案为空时不预留高度，避免登录按钮下方出现多余空白。 */
+      .error:empty {
+        display: none;
+      }
+      .hidden {
+        display: none;
+      }
+      .settings-button {
+        position: fixed;
+        z-index: 4;
+        top: 16px;
+        right: 16px;
+        width: auto;
+        min-width: 36px;
+        padding: 0 12px;
+        margin: 0;
+        border-color: var(--color-token-border-default, rgba(26, 28, 31, 0.12));
+        /* 设置入口位于纯色壳层上，不需要常驻 backdrop-filter。 */
+        background: var(--color-token-main-surface-primary, #ffffff);
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        box-shadow: var(--shadow-md, rgba(0, 0, 0, 0.08) 0 2px 4px -1px);
+      }
+      .settings-button:hover:not(:disabled) {
+        background: var(--color-token-list-hover-background, rgba(26, 28, 31, 0.05));
+      }
+      .settings-backdrop {
+        position: fixed;
+        z-index: 5;
+        inset: 0;
+        background: color-mix(in srgb, var(--color-token-foreground, #1a1c1f) 8%, transparent);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity var(--transition-duration-relaxed, 0.3s) var(--cubic-enter, ease);
+      }
+      .settings-sidebar {
+        position: fixed;
+        z-index: 6;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        box-sizing: border-box;
+        width: min(320px, 86vw);
+        background: var(--color-token-main-surface-primary, #ffffff);
+        border-left: 1px solid var(--color-token-border-default, rgba(26, 28, 31, 0.12));
+        box-shadow:
+          var(--color-token-border-heavy, rgba(26, 28, 31, 0.12)) 0 0 0 0.5px,
+          var(--shadow-md, rgba(0, 0, 0, 0.08) 0 2px 4px -1px);
+        padding: 16px;
+        transform: translateX(100%);
+        transition: transform var(--transition-duration-relaxed, 0.3s) var(--cubic-enter, ease);
+        /* 浏览器会在短暂的 transform 过渡期间自动提升图层，关闭后不再常驻合成层。 */
+      }
+      .settings-open .settings-backdrop {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .settings-open .settings-sidebar {
+        transform: translateX(0);
+      }
+      .settings-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        height: 36px;
+      }
+      .settings-header h2 {
+        margin: 0;
+        font-size: var(--text-heading-sm, 18px);
+        font-weight: var(--font-weight-semibold, 600);
+        line-height: 24px;
+        letter-spacing: 0;
+      }
+      .settings-close {
+        width: 32px;
+        height: 32px;
+        margin: 0;
+        padding: 0;
+        border-color: transparent;
+        background: transparent;
+        color: var(--color-token-editor-foreground, #1a1c1f);
+      }
+      .settings-close:hover:not(:disabled) {
+        background: var(--color-token-list-hover-background, rgba(26, 28, 31, 0.05));
+      }
+      .settings-list {
+        box-sizing: border-box;
+        display: grid;
+        gap: 4px;
+        /* 头部和底部按钮保持原位，仅让动态设置列表在短视口内独立滚动。 */
+        max-height: calc(100vh - 128px - env(safe-area-inset-bottom, 0px));
+        max-height: calc(100dvh - 128px - env(safe-area-inset-bottom, 0px));
+        margin-top: 16px;
+        padding-bottom: 8px;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+      }
+      .plugin-settings-list {
+        display: contents;
+      }
+      .plugin-settings-list[hidden] {
+        display: none;
+      }
+      .settings-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 12px;
+        min-height: 44px;
+        padding: 8px;
+        border-radius: var(--radius-md, 10px);
+      }
+      .settings-row:hover {
+        background: var(--color-token-list-hover-background, rgba(26, 28, 31, 0.05));
+      }
+      .settings-row label {
+        margin: 0;
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        font-size: var(--text-base, 14px);
+        line-height: 20px;
+      }
+      .settings-section-title {
+        margin: 20px 0 8px;
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        font-size: var(--text-heading-sm, 18px);
+        font-weight: var(--font-weight-semibold, 600);
+        line-height: 24px;
+        letter-spacing: 0;
+      }
+      .settings-link-row {
+        color: inherit;
+        text-decoration: none;
+      }
+      .settings-row-content {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+      .settings-row-title {
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        font-size: var(--text-base, 14px);
+        line-height: 20px;
+      }
+      .settings-row-description,
+      .settings-row-trailing {
+        color: var(--color-token-text-secondary, #6b7280);
+        font-size: var(--text-sm, 13px);
+        line-height: 18px;
+      }
+      .settings-row-description {
+        overflow-wrap: anywhere;
+      }
+      .settings-row-trailing {
+        font-size: var(--text-base, 14px);
+      }
+      .switch {
+        position: relative;
+        width: 38px;
+        height: 22px;
+        margin: 0;
+        appearance: none;
+        border: 1px solid var(--color-token-border-heavy, rgba(26, 28, 31, 0.12));
+        border-radius: var(--radius-full, 9999px);
+        background: var(--color-token-bg-tertiary, rgba(26, 28, 31, 0.08));
+        cursor: pointer;
+        transition:
+          background var(--transition-duration-basic, 0.15s) var(--ease-out, ease),
+          border-color var(--transition-duration-basic, 0.15s) var(--ease-out, ease);
+      }
+      .switch::before {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: var(--radius-full, 9999px);
+        background: var(--color-token-main-surface-primary, #ffffff);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+        transition: transform var(--transition-duration-basic, 0.15s) var(--ease-out, ease);
+      }
+      .switch:checked {
+        border-color: var(--color-token-button-background, #1a1c1f);
+        background: var(--color-token-button-background, #1a1c1f);
+      }
+      .switch:checked::before {
+        transform: translateX(16px);
+      }
+      .switch:focus-visible {
+        outline: 2px solid var(--color-token-focus-border, #0a84ff);
+        outline-offset: 2px;
+      }
+      .settings-restart {
+        position: absolute;
+        z-index: 1;
+        right: 16px;
+        bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 16px));
+        left: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: auto;
+        margin: 0;
+        border-color: #b42318;
+        background: #d92d20;
+        color: #ffffff;
+      }
+      .settings-restart:hover:not(:disabled) {
+        background: #b42318;
+      }
+      .settings-restart:disabled {
+        background: #b42318;
+        color: #ffffff;
+        opacity: 1;
+      }
+      .settings-restart-spinner {
+        box-sizing: border-box;
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(255, 255, 255, 0.42);
+        border-top-color: #ffffff;
+        border-radius: 50%;
+        animation: settings-restart-spin 0.8s linear infinite;
+      }
+      .settings-restart-spinner[hidden] {
+        display: none;
+      }
+      @keyframes settings-restart-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .restart-dialog {
+        box-sizing: border-box;
+        width: min(380px, calc(100vw - 32px));
+        padding: 0;
+        border: 1px solid var(--color-token-border-default, rgba(26, 28, 31, 0.12));
+        border-radius: var(--radius-lg, 12.5px);
+        background: var(--color-token-main-surface-primary, #ffffff);
+        color: var(--color-token-editor-foreground, #1a1c1f);
+        box-shadow: var(--shadow-xl, rgba(26, 28, 31, 0.2) 0 18px 48px);
+      }
+      .restart-dialog::backdrop {
+        background: rgba(15, 23, 42, 0.28);
+        backdrop-filter: blur(2px);
+      }
+      .restart-dialog-form {
+        margin: 0;
+        padding: 20px;
+      }
+      .restart-dialog-title {
+        margin: 0;
+        font-size: var(--text-heading-sm, 18px);
+        font-weight: var(--font-weight-semibold, 600);
+        line-height: 24px;
+      }
+      .restart-dialog-description {
+        margin: 8px 0 18px;
+        color: var(--color-token-text-secondary, #6b7280);
+        font-size: var(--text-sm, 13px);
+        line-height: 18px;
+      }
+      .restart-dialog-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        margin-top: 18px;
+      }
+      .restart-dialog-actions button {
+        width: auto;
+        min-width: 76px;
+        margin: 0;
+        padding: 0 14px;
+      }
+      .restart-dialog-cancel {
+        border-color: var(--color-token-border-default, rgba(26, 28, 31, 0.12));
+        background: var(--color-token-main-surface-primary, #ffffff);
+        color: var(--color-token-editor-foreground, #1a1c1f);
+      }
+      .restart-dialog-cancel:hover:not(:disabled) {
+        background: var(--color-token-list-hover-background, rgba(26, 28, 31, 0.05));
+      }
+      .restart-dialog-confirm {
+        border-color: #b42318;
+        background: #d92d20;
+        color: #ffffff;
+      }
+      .restart-dialog-confirm:hover:not(:disabled) {
+        background: #b42318;
+      }
+      .entry-version {
+        position: fixed;
+        z-index: 3;
+        left: 0;
+        right: 0;
+        bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 16px));
+        text-align: center;
+        color: #4b5563 !important;
+        -webkit-text-fill-color: #4b5563;
+        font-size: var(--text-xs, 11px);
+        font-weight: var(--font-weight-normal, 400);
+        line-height: 16px;
+        opacity: 1;
+        pointer-events: none;
+      }
+      .entry-version span {
+        display: block;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .settings-backdrop,
+        .settings-sidebar {
+          transition: none;
+        }
+      }
+      @media (max-width: 720px) {
+        .entry {
+          place-items: stretch;
+          align-items: center;
+          padding: 18px;
+        }
+        .entry::before {
+          display: none;
+        }
+        .entry::after {
+          inset: 0;
+          border-radius: 0;
+        }
+        .panel {
+          width: 100%;
+          padding: 20px;
+        }
+        .settings-button {
+          top: 12px;
+          right: 12px;
+        }
+        .entry-version {
+          bottom: max(12px, calc(env(safe-area-inset-bottom, 0px) + 12px));
+        }
+      }
+      @media (display-mode: window-controls-overlay) {
+        .settings-button {
+          /* PWA 窗口控件覆盖标题栏时，按浏览器暴露的可用标题栏区域避让右上角系统按钮。 */
+          top: max(12px, calc(var(--opencodex-wco-top) + 12px));
+          right: max(
+            12px,
+            calc(var(--opencodex-wco-right) + 12px)
+          );
+        }
+      }
+      html[data-opencodex-wco-visible="true"] .settings-button {
+        top: max(12px, calc(var(--opencodex-wco-top) + 12px));
+        right: max(12px, calc(var(--opencodex-wco-right) + 12px));
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <main class="entry" aria-live="polite">
+        <section class="panel">
+          <h1>OpenCodex</h1>
+          <p id="status" class="status" data-i18n="web.status.checkingAuth">正在检查访问权限...</p>
+          <form id="login-form" class="hidden" autocomplete="on">
+            <label for="password" data-i18n="web.auth.passwordLabel">访问密码</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" data-i18n-placeholder="web.auth.passwordPlaceholder" />
+            <button id="submit" type="submit" data-i18n="web.auth.enter">进入</button>
+            <div id="error" class="error"></div>
+          </form>
+          <p id="hint" class="hint hidden" data-i18n="web.auth.starting">正在启动 OpenCodex...</p>
+        </section>
+      </main>
+      <div class="entry-version">
+        <!-- 版本文本由 gateway 响应期从 shared/app-version.cjs 注入，静态 fallback 只用于直接打开 HTML。 -->
+        <span data-opencodex-version>v0.0.0</span>
+        <span>Powered by @Ryens</span>
+      </div>
+      <button id="settings-open" class="settings-button" type="button" aria-controls="settings-sidebar" aria-expanded="false">
+        <span data-i18n="web.settings.open">设置</span>
+      </button>
+      <div id="settings-backdrop" class="settings-backdrop" hidden></div>
+      <aside id="settings-sidebar" class="settings-sidebar" aria-label="设置" data-i18n-aria-label="web.settings.title" hidden>
+        <div class="settings-header">
+          <h2 data-i18n="web.settings.title">设置</h2>
+          <button id="settings-close" class="settings-close" type="button" aria-label="关闭设置" data-i18n-aria-label="web.settings.close">×</button>
+        </div>
+        <div class="settings-list">
+          <div class="settings-row">
+            <span class="settings-row-content">
+              <span class="settings-row-title" data-i18n="web.settings.notifications">浏览器通知</span>
+              <span id="setting-notification-status" class="settings-row-description"></span>
+            </span>
+            <input id="setting-notification-permission" class="switch" type="checkbox" role="switch" />
+          </div>
+          <div class="settings-section-title" data-i18n="web.settings.developerDiagnostics">开发者诊断</div>
+          <!-- 兼容性快照已经脱敏且只读，因此入口在认证前的设置侧栏中也可以直接使用。 -->
+          <a class="settings-row settings-link-row" href="/settings/developer/runtime-compatibility">
+            <span class="settings-row-content">
+              <span class="settings-row-title" data-i18n="web.settings.runtimeCompatibility">运行时兼容性</span>
+              <span class="settings-row-description" data-i18n="web.settings.runtimeCompatibilityDescription">查看修改点的定位、应用、验证、激活和命中状态</span>
+            </span>
+            <span class="settings-row-trailing" aria-hidden="true">›</span>
+          </a>
+          <!-- 关于入口固定放在插件列表前，避免插件较多时仓库链接被推到侧栏底部。 -->
+          <div class="settings-section-title" data-i18n="web.settings.about">关于</div>
+          <a class="settings-row settings-link-row" href="https://github.com/RyensX/OpenCodex" target="_blank" rel="noreferrer">
+            <span class="settings-row-content">
+              <span class="settings-row-title" data-i18n="web.settings.star">如果觉得有用，欢迎 Star 支持</span>
+              <span class="settings-row-description">https://github.com/RyensX/OpenCodex</span>
+            </span>
+            <span class="settings-row-trailing" aria-hidden="true">↗</span>
+          </a>
+          <div id="plugin-settings-title" class="settings-section-title" data-i18n="web.settings.plugins" hidden>插件</div>
+          <div id="plugin-settings-list" class="plugin-settings-list" hidden></div>
+        </div>
+        <button id="settings-restart" class="settings-restart" type="button">
+          <span id="settings-restart-label" data-i18n="web.settings.restart">重启服务</span>
+          <span id="settings-restart-spinner" class="settings-restart-spinner" aria-hidden="true" hidden></span>
+        </button>
+      </aside>
+      <dialog id="restart-dialog" class="restart-dialog" aria-labelledby="restart-dialog-title" aria-describedby="restart-dialog-description">
+        <form id="restart-form" class="restart-dialog-form">
+          <h2 id="restart-dialog-title" class="restart-dialog-title" data-i18n="web.settings.restartDialogTitle">重启服务</h2>
+          <p id="restart-dialog-description" class="restart-dialog-description" data-i18n="web.settings.restartDialogDescription">重启会暂时断开当前连接，请输入访问密码确认。</p>
+          <label for="restart-password" data-i18n="web.auth.passwordLabel">访问密码</label>
+          <input id="restart-password" type="password" autocomplete="current-password" placeholder="请输入密码" data-i18n-placeholder="web.auth.passwordPlaceholder" />
+          <div id="restart-error" class="error" role="status"></div>
+          <div class="restart-dialog-actions">
+            <button id="restart-cancel" class="restart-dialog-cancel" type="button" data-i18n="common.cancel">取消</button>
+            <button id="restart-confirm" class="restart-dialog-confirm" type="submit" data-i18n="web.settings.restartConfirm">确认重启</button>
+          </div>
+        </form>
+      </dialog>
+    </div>
+    <script>
+      (() => {
+        const forceLoginKey = "codex_web_force_login";
+        const pluginSystem = window.OpenCodexPluginSystem || window.__OpenCodexPluginSystem || null;
+        const runtimeConfig = window.__CODEX_WEB_CONFIG__ || {};
+        const locale = runtimeConfig.locale || "zh-CN";
+        const messages = runtimeConfig.messages && typeof runtimeConfig.messages === "object" ? runtimeConfig.messages : {};
+        const GATEWAY_RESTART_POLL_INTERVAL_MS = 800;
+        const GATEWAY_RESTART_STATUS_TIMEOUT_MS = 5_000;
+        const GATEWAY_RESTART_TIMEOUT_MS = 120_000;
+        let runtimeAuthToken = "";
+        // 登录成功后官方 renderer 会替换当前 document，但 window 对象仍会保留；这里把短期 token 暴露给 bridge 使用。
+        window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
+        const root = document.getElementById("root");
+        const status = document.getElementById("status");
+        const hint = document.getElementById("hint");
+        const form = document.getElementById("login-form");
+        const passwordInput = document.getElementById("password");
+        const submit = document.getElementById("submit");
+        const errorBox = document.getElementById("error");
+        const settingsOpen = document.getElementById("settings-open");
+        const settingsClose = document.getElementById("settings-close");
+        const settingsBackdrop = document.getElementById("settings-backdrop");
+        const settingsSidebar = document.getElementById("settings-sidebar");
+        const pluginSettingsTitle = document.getElementById("plugin-settings-title");
+        const pluginSettingsList = document.getElementById("plugin-settings-list");
+        const notificationPermissionButton = document.getElementById("setting-notification-permission");
+        const notificationStatus = document.getElementById("setting-notification-status");
+        const restartButton = document.getElementById("settings-restart");
+        const restartButtonLabel = document.getElementById("settings-restart-label");
+        const restartButtonSpinner = document.getElementById("settings-restart-spinner");
+        const restartDialog = document.getElementById("restart-dialog");
+        const restartForm = document.getElementById("restart-form");
+        const restartPasswordInput = document.getElementById("restart-password");
+        const restartErrorBox = document.getElementById("restart-error");
+        const restartCancel = document.getElementById("restart-cancel");
+        const restartConfirm = document.getElementById("restart-confirm");
+        const pluginSwitchInputs = new Map();
+        let settingsCloseTimer = 0;
+        let gatewayInstanceId = "";
+        let restartSubmitting = false;
+        let restartInProgress = false;
+        let legacyAuthStatusRequest = null;
+        const gatewayPluginSwitches = window.OpenCodexGatewayPluginSwitches?.create({
+          pluginSystem,
+          plugins: pluginDefinitions,
+          request: gatewayPluginConfigRequest,
+        });
+
+        function t(key, values) {
+          const template = messages[key] || key;
+          if (!values || typeof values !== "object") return template;
+          return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, name) =>
+            Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match
+          );
+        }
+
+        function applyI18n() {
+          // 登录壳必须在未认证时可用，所以只消费启动 HTML 注入的公开 locale/messages。
+          document.documentElement.lang = locale;
+          for (const node of document.querySelectorAll("[data-i18n]")) {
+            node.textContent = t(node.dataset.i18n);
+          }
+          for (const node of document.querySelectorAll("[data-i18n-placeholder]")) {
+            node.setAttribute("placeholder", t(node.dataset.i18nPlaceholder));
+          }
+          for (const node of document.querySelectorAll("[data-i18n-aria-label]")) {
+            node.setAttribute("aria-label", t(node.dataset.i18nAriaLabel));
+          }
+        }
+
+        function pluginDefinitions() {
+          if (pluginSystem && pluginSystem.plugins && typeof pluginSystem.plugins.list === "function") {
+            // 登录页只接管智能调度的总开关；网关插件的详细配置仍留在认证后的 Codex 设置中。
+            return pluginSystem.plugins
+              .list()
+              .filter((plugin) => plugin.persistence !== "gateway" || plugin.feature === "smart-model-router");
+          }
+          return [];
+        }
+
+        function pluginChecked(plugin) {
+          if (pluginSystem && pluginSystem.plugins && typeof pluginSystem.plugins.isEnabled === "function") {
+            return pluginSystem.plugins.isEnabled(plugin.id);
+          }
+          return plugin.enabled !== false;
+        }
+
+        function localizedPluginText(key, fallback) {
+          const localized = key ? t(key) : "";
+          return localized && localized !== key ? localized : fallback || "";
+        }
+
+        function pluginLabel(plugin) {
+          return localizedPluginText(plugin.labelKey, plugin.label || plugin.name || plugin.id);
+        }
+
+        function pluginDescription(plugin) {
+          return localizedPluginText(plugin.descKey, plugin.desc || "");
+        }
+
+        // 只要插件目录里发现插件，就在“插件”区域自动生成一个总开关。
+        function renderPluginSettingsControls() {
+          pluginSettingsList.textContent = "";
+          pluginSwitchInputs.clear();
+          const plugins = pluginDefinitions();
+          const hasPlugins = plugins.length > 0;
+          pluginSettingsTitle.hidden = !hasPlugins;
+          pluginSettingsList.hidden = !hasPlugins;
+          for (const plugin of plugins) {
+            const inputId = `setting-plugin-${plugin.id.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+            const row = document.createElement("div");
+            row.className = "settings-row";
+
+            const content = document.createElement("label");
+            content.className = "settings-row-content";
+            content.htmlFor = inputId;
+
+            const title = document.createElement("span");
+            title.className = "settings-row-title";
+            title.textContent = pluginLabel(plugin);
+            content.append(title);
+
+            const desc = pluginDescription(plugin);
+            if (desc) {
+              // desc 为空时不创建说明节点，避免插件设置列表出现多余间距。
+              const description = document.createElement("span");
+              description.className = "settings-row-description";
+              description.textContent = desc;
+              content.append(description);
+            }
+
+            const input = document.createElement("input");
+            input.id = inputId;
+            input.className = "switch";
+            input.type = "checkbox";
+            input.setAttribute("role", "switch");
+            input.dataset.pluginId = plugin.id;
+
+            row.append(content, input);
+            pluginSettingsList.append(row);
+            pluginSwitchInputs.set(plugin.id, { input, plugin });
+          }
+        }
+
+        function syncSettingsControls() {
+          for (const { input, plugin } of pluginSwitchInputs.values()) {
+            input.checked = pluginChecked(plugin);
+          }
+          syncNotificationPermissionControls();
+        }
+
+        function notificationPermissionState() {
+          if (!("Notification" in window)) return "unsupported";
+          return window.Notification.permission || "default";
+        }
+
+        function syncNotificationPermissionControls(messageOverride) {
+          const state = notificationPermissionState();
+          const labels = {
+            granted: t("web.settings.notificationEnabled"),
+            denied: t("web.settings.notificationBlocked"),
+            default: t("web.settings.notificationPrompt"),
+            unsupported: t("web.settings.notificationUnsupported"),
+          };
+          notificationStatus.textContent = messageOverride || labels[state] || labels.default;
+          notificationPermissionButton.checked = state === "granted";
+          // default/denied 都允许用户点击；denied 时浏览器可能直接返回 denied，但入口不能被我们提前禁用。
+          notificationPermissionButton.disabled =
+            state === "granted" || state === "unsupported" || typeof window.Notification.requestPermission !== "function";
+        }
+
+        function showNotificationPermissionTest() {
+          if (!("Notification" in window) || window.Notification.permission !== "granted") return;
+          try {
+            // 授权成功后立即发一条浏览器通知，便于确认系统通知链路是否真的可用。
+            new window.Notification(t("web.settings.notificationTestTitle"), {
+              body: t("web.settings.notificationTestBody"),
+            });
+          } catch {}
+        }
+
+        function setSettingsOpen(open) {
+          if (settingsCloseTimer) {
+            clearTimeout(settingsCloseTimer);
+            settingsCloseTimer = 0;
+          }
+          if (open) {
+            settingsBackdrop.hidden = false;
+            settingsSidebar.hidden = false;
+            syncSettingsControls();
+            requestAnimationFrame(() => {
+              root.classList.add("settings-open");
+              settingsOpen.setAttribute("aria-expanded", "true");
+              settingsClose.focus();
+            });
+            return;
+          }
+          root.classList.toggle("settings-open", open);
+          settingsOpen.setAttribute("aria-expanded", "false");
+          settingsCloseTimer = setTimeout(() => {
+            settingsCloseTimer = 0;
+            settingsBackdrop.hidden = true;
+            settingsSidebar.hidden = true;
+            settingsOpen.focus();
+          }, 300);
+        }
+
+        // 插件启用状态先写浏览器快照；网关插件由独立同步器在认证成功后提交。
+        function updatePluginEnabled(pluginId, value) {
+          if (pluginSystem && pluginSystem.plugins && typeof pluginSystem.plugins.setEnabled === "function") {
+            pluginSystem.plugins.setEnabled(pluginId, value);
+          }
+        }
+
+        async function gatewayPluginConfigRequest(path, options = {}) {
+          const response = await fetch(path, {
+            cache: "no-store",
+            credentials: "same-origin",
+            ...options,
+            headers: authHeaders({
+              accept: "application/json",
+              ...(options.body ? { "content-type": "application/json" } : {}),
+              ...(options.headers || {}),
+            }),
+          });
+          const value = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const error = new Error(value.error || `HTTP ${response.status}`);
+            error.status = response.status;
+            error.value = value;
+            throw error;
+          }
+          return value;
+        }
+
+        function storedToken() {
+          return runtimeAuthToken;
+        }
+
+        function storeToken(token) {
+          runtimeAuthToken = token || "";
+          window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = runtimeAuthToken;
+        }
+
+        function clearToken() {
+          runtimeAuthToken = "";
+          window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
+        }
+
+        function shouldForceLogin() {
+          try {
+            return localStorage.getItem(forceLoginKey) === "1";
+          } catch {
+            return false;
+          }
+        }
+
+        function clearForceLogin() {
+          try {
+            localStorage.removeItem(forceLoginKey);
+          } catch {}
+        }
+
+        function authHeaders(extra) {
+          const headers = new Headers(extra || {});
+          const token = storedToken();
+          if (token) {
+            headers.set("authorization", `Bearer ${token}`);
+            headers.set("x-codex-web-token", token);
+          }
+          return headers;
+        }
+
+        function localizedError(error) {
+          const message = error && error.message ? error.message : String(error || "");
+          if (message === "Invalid password") return t("web.auth.invalidPassword");
+          if (message === "Too many login attempts") {
+            // retryAfterMs 由 gateway 429 响应返回；没有该字段时给出 1 秒兜底，避免显示空值。
+            const seconds = Math.max(1, Math.ceil((Number(error && error.retryAfterMs) || 1000) / 1000));
+            return t("web.auth.tooManyAttempts", { seconds });
+          }
+          if (message === "Access password is not configured") return t("web.settings.restartPasswordNotConfigured");
+          if (message === "Service restart is unavailable") return t("web.settings.restartUnavailable");
+          if (message === "Service restart is already pending") return t("web.settings.restartAlreadyPending");
+          return message;
+        }
+
+        function localizedRestartError(error) {
+          const message = error && error.message ? error.message : String(error || "");
+          const localized = localizedError(error);
+          if (localized !== message) return localized;
+          return t("web.settings.restartFailed", { error: localized });
+        }
+
+        function escapeHtml(value) {
+          return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+        }
+
+        function showLogin(message) {
+          status.textContent = t("web.auth.prompt");
+          hint.classList.add("hidden");
+          form.classList.remove("hidden");
+          errorBox.textContent = message || "";
+          submit.disabled = false;
+          passwordInput.focus();
+        }
+
+        function showBoot(message) {
+          status.textContent = message;
+          form.classList.add("hidden");
+          hint.classList.remove("hidden");
+        }
+
+        async function authStatus(options = {}) {
+          const res = await fetch("/api/auth/status", {
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: authHeaders({ accept: "application/json" }),
+            ...(options.signal ? { signal: options.signal } : {}),
+          });
+          if (!res.ok) return { authRequired: true, authenticated: false };
+          return res.json();
+        }
+
+        async function authStatusWithin(timeoutMs) {
+          const delayMs = Math.max(1, timeoutMs);
+          if (typeof AbortController !== "function") {
+            // 老浏览器无法中止 fetch；同一时刻只保留一条底层请求，避免超时轮询累积悬挂连接。
+            legacyAuthStatusRequest ||= authStatus().finally(() => {
+              legacyAuthStatusRequest = null;
+            });
+            let timeout = 0;
+            try {
+              return await Promise.race([
+                legacyAuthStatusRequest,
+                new Promise((_, reject) => {
+                  timeout = setTimeout(() => reject(new Error("Gateway status request timed out")), delayMs);
+                }),
+              ]);
+            } finally {
+              clearTimeout(timeout);
+            }
+          }
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), delayMs);
+          try {
+            return await authStatus({ signal: controller.signal });
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+        async function requestServiceRestart(password) {
+          const passwordHash = await sha256Hex(password);
+          const res = await fetch("/api/service/restart", {
+            method: "POST",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify({ passwordHash }),
+          });
+          const body = await res.json().catch(() => null);
+          if (!res.ok || !body || body.ok === false) {
+            const restartError = new Error((body && body.error) || `HTTP ${res.status}`);
+            restartError.status = res.status;
+            restartError.retryAfterMs = body && Number.isFinite(Number(body.retryAfterMs)) ? Number(body.retryAfterMs) : 0;
+            throw restartError;
+          }
+          return body;
+        }
+
+        function setRestartInProgress() {
+          restartInProgress = true;
+          restartButton.disabled = true;
+          restartButtonLabel.textContent = t("web.settings.restarting");
+          restartButtonSpinner.hidden = false;
+        }
+
+        function setRestartIdle() {
+          restartInProgress = false;
+          restartButton.disabled = false;
+          restartButtonLabel.textContent = t("web.settings.restart");
+          restartButtonSpinner.hidden = true;
+        }
+
+        function showRestartWaitFailure(message) {
+          setRestartIdle();
+          restartPasswordInput.value = "";
+          restartErrorBox.textContent = message;
+          // 服务未恢复时重新打开确认框，让用户看到明确结果并可在修复后重试。
+          if (!restartDialog.open) restartDialog.showModal();
+          restartPasswordInput.focus();
+        }
+
+        function waitForRestartPollingWindow(deadlineMs) {
+          if (document.visibilityState !== "hidden") return Promise.resolve();
+          return new Promise((resolve) => {
+            let completed = false;
+            const finish = () => {
+              if (completed) return;
+              completed = true;
+              clearTimeout(timeout);
+              document.removeEventListener("visibilitychange", handleVisibility);
+              resolve();
+            };
+            const handleVisibility = () => {
+              if (document.visibilityState !== "hidden") finish();
+            };
+            // 后台页面不做网络轮询，仅保留一个总期限计时器，返回前台时再立即检查。
+            const timeout = setTimeout(finish, Math.max(1, deadlineMs - Date.now()));
+            document.addEventListener("visibilitychange", handleVisibility);
+          });
+        }
+
+        async function waitForGatewayRestart(previousInstanceId) {
+          // 只有轮询到不同实例标识才刷新，旧进程在退出前偶尔还能响应时不会产生误判。
+          const deadlineMs = Date.now() + GATEWAY_RESTART_TIMEOUT_MS;
+          while (restartInProgress && Date.now() < deadlineMs) {
+            if (document.visibilityState === "hidden") {
+              await waitForRestartPollingWindow(deadlineMs);
+              continue;
+            }
+            await new Promise((resolve) => setTimeout(resolve, GATEWAY_RESTART_POLL_INTERVAL_MS));
+            if (document.visibilityState === "hidden") continue;
+            try {
+              const state = await authStatusWithin(
+                Math.min(GATEWAY_RESTART_STATUS_TIMEOUT_MS, Math.max(1, deadlineMs - Date.now()))
+              );
+              if (state.instanceId && state.instanceId !== previousInstanceId) {
+                window.location.reload();
+                return;
+              }
+            } catch {
+              // 重启窗口内连接失败是预期状态，继续等待新实例恢复监听。
+            }
+          }
+          if (restartInProgress) showRestartWaitFailure(t("web.settings.restartTimeout"));
+        }
+
+        async function bootRenderer() {
+          showBoot(t("web.auth.starting"));
+          const res = await fetch("/official-index.patched.html", {
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: authHeaders({ accept: "text/html" }),
+          });
+          if (res.status === 401) {
+            clearToken();
+            showLogin(t("web.auth.expired"));
+            return;
+          }
+          if (!res.ok) throw new Error(t("web.auth.loadFailedHttp", { status: res.status }));
+          const html = await res.text();
+          try {
+            sessionStorage.setItem("opencodex_legacy_document_replace_hit", "1");
+          } catch {}
+          document.open();
+          document.write(html);
+          document.close();
+        }
+
+        function utf8Bytes(value) {
+          if (typeof TextEncoder !== "undefined") {
+            return Array.from(new TextEncoder().encode(String(value)));
+          }
+          const encoded = encodeURIComponent(String(value));
+          const bytes = [];
+          for (let i = 0; i < encoded.length; i += 1) {
+            if (encoded[i] === "%") {
+              bytes.push(parseInt(encoded.slice(i + 1, i + 3), 16));
+              i += 2;
+            } else {
+              bytes.push(encoded.charCodeAt(i));
+            }
+          }
+          return bytes;
+        }
+
+        function rotateRight(value, bits) {
+          return (value >>> bits) | (value << (32 - bits));
+        }
+
+        function sha256HexFallback(value) {
+          const k = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+          ];
+          const bytes = utf8Bytes(value);
+          const bitLength = bytes.length * 8;
+          bytes.push(0x80);
+          while (bytes.length % 64 !== 56) bytes.push(0);
+          const highBits = Math.floor(bitLength / 0x100000000);
+          const lowBits = bitLength >>> 0;
+          for (let i = 3; i >= 0; i -= 1) bytes.push((highBits >>> (i * 8)) & 0xff);
+          for (let i = 3; i >= 0; i -= 1) bytes.push((lowBits >>> (i * 8)) & 0xff);
+
+          let h0 = 0x6a09e667;
+          let h1 = 0xbb67ae85;
+          let h2 = 0x3c6ef372;
+          let h3 = 0xa54ff53a;
+          let h4 = 0x510e527f;
+          let h5 = 0x9b05688c;
+          let h6 = 0x1f83d9ab;
+          let h7 = 0x5be0cd19;
+
+          for (let offset = 0; offset < bytes.length; offset += 64) {
+            const w = new Array(64);
+            for (let i = 0; i < 16; i += 1) {
+              const j = offset + i * 4;
+              w[i] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) >>> 0;
+            }
+            for (let i = 16; i < 64; i += 1) {
+              const s0 = rotateRight(w[i - 15], 7) ^ rotateRight(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+              const s1 = rotateRight(w[i - 2], 17) ^ rotateRight(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+              w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+            }
+
+            let a = h0;
+            let b = h1;
+            let c = h2;
+            let d = h3;
+            let e = h4;
+            let f = h5;
+            let g = h6;
+            let h = h7;
+            for (let i = 0; i < 64; i += 1) {
+              const s1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+              const ch = (e & f) ^ (~e & g);
+              const temp1 = (h + s1 + ch + k[i] + w[i]) >>> 0;
+              const s0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+              const maj = (a & b) ^ (a & c) ^ (b & c);
+              const temp2 = (s0 + maj) >>> 0;
+              h = g;
+              g = f;
+              f = e;
+              e = (d + temp1) >>> 0;
+              d = c;
+              c = b;
+              b = a;
+              a = (temp1 + temp2) >>> 0;
+            }
+
+            h0 = (h0 + a) >>> 0;
+            h1 = (h1 + b) >>> 0;
+            h2 = (h2 + c) >>> 0;
+            h3 = (h3 + d) >>> 0;
+            h4 = (h4 + e) >>> 0;
+            h5 = (h5 + f) >>> 0;
+            h6 = (h6 + g) >>> 0;
+            h7 = (h7 + h) >>> 0;
+          }
+
+          return [h0, h1, h2, h3, h4, h5, h6, h7]
+            .map((part) => part.toString(16).padStart(8, "0"))
+            .join("");
+        }
+
+        async function sha256Hex(value) {
+          if (window.crypto && window.crypto.subtle && typeof TextEncoder !== "undefined") {
+            const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+            return Array.from(new Uint8Array(digest))
+              .map((byte) => byte.toString(16).padStart(2, "0"))
+              .join("");
+          }
+          return sha256HexFallback(value);
+        }
+
+        async function login(password) {
+          const passwordHash = await sha256Hex(password);
+          const res = await fetch("/api/auth/login", {
+            method: "POST",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify({ passwordHash }),
+          });
+          const body = await res.json().catch(() => null);
+          if (!res.ok || !body || body.ok === false) {
+            const loginError = new Error((body && body.error) || t("web.auth.loginFailedHttp", { status: res.status }));
+            // 429 限速需要把 retryAfterMs 带到 localizedError，便于入口页展示明确等待时间。
+            loginError.status = res.status;
+            loginError.retryAfterMs = body && Number.isFinite(Number(body.retryAfterMs)) ? Number(body.retryAfterMs) : 0;
+            throw loginError;
+          }
+          clearForceLogin();
+          if (body.token) storeToken(body.token);
+        }
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          errorBox.textContent = "";
+          submit.disabled = true;
+          try {
+            await login(passwordInput.value);
+            passwordInput.value = "";
+            await gatewayPluginSwitches?.sync();
+            await bootRenderer();
+          } catch (error) {
+            showLogin(localizedError(error));
+          }
+        });
+
+        settingsOpen.addEventListener("click", () => setSettingsOpen(true));
+        settingsClose.addEventListener("click", () => setSettingsOpen(false));
+        settingsBackdrop.addEventListener("click", () => setSettingsOpen(false));
+        restartButton.addEventListener("click", () => {
+          if (restartInProgress || restartSubmitting || restartDialog.open) return;
+          restartPasswordInput.value = "";
+          restartErrorBox.textContent = "";
+          restartDialog.showModal();
+          restartPasswordInput.focus();
+        });
+        restartCancel.addEventListener("click", () => {
+          if (!restartSubmitting) restartDialog.close();
+        });
+        restartDialog.addEventListener("cancel", (event) => {
+          // 请求已经发出时禁止 Escape 关闭，避免用户误以为操作被取消。
+          if (restartSubmitting) event.preventDefault();
+        });
+        restartForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          if (restartSubmitting || restartInProgress) return;
+          if (!restartPasswordInput.value) {
+            restartErrorBox.textContent = t("web.settings.restartPasswordRequired");
+            restartPasswordInput.focus();
+            return;
+          }
+          restartSubmitting = true;
+          restartErrorBox.textContent = "";
+          restartCancel.disabled = true;
+          restartConfirm.disabled = true;
+          restartConfirm.textContent = t("web.settings.restartVerifying");
+          try {
+            const result = await requestServiceRestart(restartPasswordInput.value);
+            const previousInstanceId = result.instanceId || gatewayInstanceId;
+            restartPasswordInput.value = "";
+            restartDialog.close();
+            setRestartInProgress();
+            void waitForGatewayRestart(previousInstanceId);
+          } catch (error) {
+            restartPasswordInput.value = "";
+            restartErrorBox.textContent = localizedRestartError(error);
+            restartPasswordInput.focus();
+          } finally {
+            restartSubmitting = false;
+            restartCancel.disabled = false;
+            restartConfirm.disabled = false;
+            restartConfirm.textContent = t("web.settings.restartConfirm");
+          }
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && !restartDialog.open && root.classList.contains("settings-open")) {
+            setSettingsOpen(false);
+          }
+        });
+        pluginSettingsList.addEventListener("change", (event) => {
+          const input = event.target;
+          if (!input || !input.dataset || !input.dataset.pluginId) return;
+          updatePluginEnabled(input.dataset.pluginId, input.checked);
+          const plugin = pluginDefinitions().find((item) => item.id === input.dataset.pluginId);
+          if (plugin && plugin.persistence === "gateway") {
+            gatewayPluginSwitches?.markPending(plugin.id, input.checked);
+          }
+        });
+        notificationPermissionButton.addEventListener("change", async () => {
+          if (!("Notification" in window) || typeof window.Notification.requestPermission !== "function") {
+            syncNotificationPermissionControls();
+            return;
+          }
+          if (!notificationPermissionButton.checked) {
+            // 浏览器不允许网页主动撤销通知权限，关闭只能到浏览器站点设置里处理。
+            syncNotificationPermissionControls();
+            return;
+          }
+          notificationPermissionButton.disabled = true;
+          notificationStatus.textContent = t("web.settings.notificationRequesting");
+          let nextPermission = "";
+          try {
+            // 只有用户明确点击设置按钮时才请求权限，避免进入页面时打断登录或会话加载。
+            nextPermission = await window.Notification.requestPermission();
+          } catch {}
+          if (nextPermission === "granted" || window.Notification.permission === "granted") {
+            showNotificationPermissionTest();
+          }
+          syncNotificationPermissionControls(nextPermission === "denied" ? t("web.settings.notificationBlockedHelp") : "");
+        });
+        applyI18n();
+        renderPluginSettingsControls();
+        syncSettingsControls();
+
+        (async () => {
+          try {
+            const state = await authStatus();
+            gatewayInstanceId = state.instanceId || "";
+            if (state.authRequired !== false && shouldForceLogin()) {
+              clearToken();
+              showLogin("");
+              return;
+            }
+            clearForceLogin();
+            if (state.authenticated || state.authRequired === false) {
+              await gatewayPluginSwitches?.sync();
+              await bootRenderer();
+              return;
+            }
+            showLogin("");
+          } catch (error) {
+            root.innerHTML =
+              '<main class="entry"><section class="panel"><h1>OpenCodex</h1><p class="error">' +
+              escapeHtml(localizedError(error)) +
+              "</p></section></main>";
+            console.error("[codex-web] bootstrap failed", error);
+          }
+        })();
+      })();
+    </script>
+  </body>
+</html>

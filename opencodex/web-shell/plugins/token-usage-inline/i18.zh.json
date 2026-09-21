@@ -1,0 +1,4 @@
+{
+  "plugin.tokenUsageInline.label": "显示 Token 消耗",
+  "plugin.tokenUsageInline.desc": "在 AI 回复底部显示输入、输出 token 和缓存命中率。"
+}

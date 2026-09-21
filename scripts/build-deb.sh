@@ -23,6 +23,9 @@ MAX_BUILD_THREADS="${MAX_BUILD_THREADS:-0}"
 UPDATER_BINARY_SOURCE="${UPDATER_BINARY_SOURCE:-$REPO_DIR/target/release/codex-update-manager}"
 UPDATER_SERVICE_SOURCE="${UPDATER_SERVICE_SOURCE:-$SERVICE_TEMPLATE}"
 PACKAGED_RUNTIME_SOURCE="${PACKAGED_RUNTIME_SOURCE:-$PACKAGED_RUNTIME_TEMPLATE}"
+# GATEWAY_MARKER gateway packaging templates (packaging/linux/gateway/*)
+GATEWAY_TEMPLATES_DIR="$REPO_DIR/packaging/linux/gateway"
+GATEWAY_RUNNER_TEMPLATE="$REPO_DIR/packaging/linux/run-gateway.sh"
 
 validate_max_build_threads() {
     case "$MAX_BUILD_THREADS" in
@@ -50,6 +53,12 @@ main() {
     validate_max_build_threads
 
     ensure_app_layout
+    # GATEWAY_MARKER gateway templates must exist; a missing gateway build tree degrades to a
+    # no-gateway package with a warning (the deb Makefile target auto-runs gateway-build).
+    [ -f "$GATEWAY_RUNNER_TEMPLATE" ] || error "Missing gateway runner template: $GATEWAY_RUNNER_TEMPLATE"
+    if ! gateway_tree_present; then
+        warn "opencodex gateway build tree missing or incomplete; package will be built WITHOUT the gateway (run: make gateway-build)"
+    fi
     ensure_file_exists "$CONTROL_TEMPLATE" "control template"
     ensure_file_exists "$DESKTOP_TEMPLATE" "desktop template"
     ensure_file_exists "$ICON_SOURCE" "icon"
@@ -79,11 +88,13 @@ main() {
         "$PKG_ROOT/opt"
 
     stage_common_package_files "$PKG_ROOT"
+    stage_gateway_package_files "$PKG_ROOT"   # GATEWAY_MARKER
     stage_optional_update_builder_bundle "$PKG_ROOT"
     write_launcher_stub "$PKG_ROOT"
     stage_linux_feature_package_resources "$PKG_ROOT" "deb"
     run_linux_feature_package_hooks "$PKG_ROOT" "deb"
     normalize_package_payload_permissions "$PKG_ROOT"
+    restore_gateway_payload_permissions "$PKG_ROOT"  # GATEWAY_MARKER
     restore_linux_feature_payload_permissions "$PKG_ROOT"
     restore_linux_feature_package_resource_permissions "$PKG_ROOT" "deb"
 
@@ -92,6 +103,21 @@ main() {
     upstream_recommends="$(upstream_linux_control_field Recommends)"
     upstream_suggests="$(upstream_linux_control_field Suggests)"
     [ -n "$upstream_depends" ] || error "Official Linux package control metadata has no Depends field"
+    # GATEWAY_MARKER gateway dependencies: only xvfb is added. Deliberately NOT nodejs (>= 22):
+    # target boxes (241.t) ship system node v12 and the gateway bundles its own node runtime,
+    # so a >=22 constraint would make the package uninstallable.
+    if gateway_tree_present; then
+        case ", $upstream_depends, " in
+            *",xvfb, "*) : ;;
+            *) upstream_depends="$upstream_depends, xvfb" ;;
+        esac
+        if ! package_with_updater_enabled; then
+            case ", $upstream_depends, " in
+                *",nodejs, "*) : ;;
+                *) upstream_depends="$upstream_depends, nodejs" ;;
+            esac
+        fi
+    fi
 
     sed \
         -e "s/__PACKAGE_NAME__/$PACKAGE_NAME/g" \
@@ -145,6 +171,13 @@ CONTROL
         write_no_updater_deb_prerm "$PKG_ROOT/DEBIAN/prerm"
     fi
     append_deb_apparmor_postinst "$PKG_ROOT/DEBIAN/postinst"
+    # GATEWAY_MARKER gateway maintainer sections (postinst account/dirs/enable, prerm stop, postrm cleanup)
+    if gateway_tree_present; then
+        if ! package_with_updater_enabled && [ ! -f "$PKG_ROOT/DEBIAN/postrm" ]; then
+            write_no_updater_deb_postrm "$PKG_ROOT/DEBIAN/postrm"
+        fi
+        append_gateway_deb_maintainer_scripts "$PKG_ROOT"
+    fi
 
     mkdir -p "$DIST_DIR"
     info "Building $output_file"

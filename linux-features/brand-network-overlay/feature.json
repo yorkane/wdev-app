@@ -1,0 +1,28 @@
+{
+  "id": "brand-network-overlay",
+  "title": "Brand & Network Overlay",
+  "description": "Local brand text overlay, outbound host blocking, and local Statsig responses for ChatGPT Community on Linux.",
+  "defaultEnabled": false,
+  "entrypoints": {
+    "patchDescriptors": "./patch.js"
+  },
+  "brandNetworkOverlay": {
+    "brand": {
+      "name": "wdev"
+    },
+    "network": {
+      "block": [
+        "chatgpt.com",
+        "*.chatgpt.com",
+        "*.openai.com",
+        "*.oaiusercontent.com",
+        "*.statsig.com",
+        "statsigapi.net"
+      ],
+      "allow": []
+    },
+    "statsig": {
+      "initializeDelayMs": 400
+    }
+  }
+}

@@ -1,0 +1,789 @@
+(function () {
+  const w = window;
+  const adapterHost = w.__OpenCodexAdapterHost;
+  if (!adapterHost?.providers?.registerManaged) return;
+
+  // 脚本加载只登记实现；DOM 副作用由 RuntimeView Contribution 的 apply/dispose 生命周期托管。
+  adapterHost.providers.registerManaged("window-controls", "primary", ({ onHit }) => {
+    const scheduler = adapterHost.scheduler?.capture?.() || w;
+    if (!adapterHost.dom?.observe || !adapterHost.events?.observe) {
+      throw new Error("PWA 标题栏 Provider 缺少共享 DOM 或事件能力");
+    }
+    let contributionStyles = null;
+
+  /**
+   * PWA window-controls-overlay 会把页面铺到系统标题栏下方。
+   *
+   * 官方 renderer 的 header 默认横跨整窗；Web shell 这里把浏览器 WCO 几何信息
+   * 翻译成可用标题栏矩形，避免左上/右上工具按钮被系统窗口按钮压住。
+   */
+  function installWindowControlsOverlaySafeArea() {
+    if (!document || !document.documentElement) return null;
+    const overlay = navigator.windowControlsOverlay || null;
+    const displayModeQuery =
+      typeof w.matchMedia === "function" ? w.matchMedia("(display-mode: window-controls-overlay)") : null;
+    const root = document.documentElement;
+    const rootStyle = root.style;
+    const cleanupHandlers = [];
+    const initialRootStyles = new Map();
+    const managedAttributeNodes = new Map();
+    const managedRootDatasetKeys = [
+      "opencodexWcoVisible",
+      "opencodexWcoTitlebarScheme",
+      "opencodexWcoImagePreviewOpen",
+      "opencodexWcoImagePreviewScheme",
+    ];
+    const initialRootDataset = new Map(
+      managedRootDatasetKeys.map((key) => [
+        key,
+        Object.prototype.hasOwnProperty.call(root.dataset, key) ? root.dataset[key] : undefined,
+      ])
+    );
+
+    function addCleanup(handler) {
+      if (typeof handler === "function") cleanupHandlers.push(handler);
+    }
+
+    function roundPixel(value) {
+      return Math.max(0, Math.round(Number(value) || 0));
+    }
+
+    let cssLengthProbe = null;
+
+    function measureCssLength(value) {
+      if (!cssLengthProbe) {
+        cssLengthProbe = document.createElement("div");
+        cssLengthProbe.style.cssText =
+          "position:fixed;left:-10000px;top:-10000px;height:0;visibility:hidden;pointer-events:none;contain:strict;";
+        (document.body || document.documentElement).appendChild(cssLengthProbe);
+      }
+      cssLengthProbe.style.width = value;
+      return roundPixel(cssLengthProbe.getBoundingClientRect().width);
+    }
+
+    function envInsets() {
+      const titlebarX = measureCssLength("var(--opencodex-wco-env-titlebar-x)");
+      const titlebarWidth = measureCssLength("var(--opencodex-wco-env-titlebar-width)");
+      return {
+        left: titlebarX,
+        right: measureCssLength("var(--opencodex-wco-env-right)"),
+        top: measureCssLength("var(--opencodex-wco-env-top)"),
+        height: measureCssLength("var(--opencodex-wco-env-height)"),
+        titlebarEnd: titlebarX + titlebarWidth,
+        titlebarWidth,
+        titlebarX,
+      };
+    }
+
+    function insetsFromRect(rect) {
+      const width = w.innerWidth || document.documentElement.clientWidth || 0;
+      return {
+        left: rect.x,
+        right: Math.max(0, width - rect.x - rect.width),
+        top: rect.y,
+        height: rect.height,
+        titlebarEnd: rect.x + rect.width,
+        titlebarWidth: rect.width,
+        titlebarX: rect.x,
+      };
+    }
+
+    function ensureOverrideStyles() {
+      if (document.getElementById("codex-web-window-controls-overlay-styles")) return;
+      const link = document.createElement("link");
+      link.id = "codex-web-window-controls-overlay-styles";
+      link.rel = "stylesheet";
+      link.href = "/codex-window-controls-overlay.css";
+      // WCO 适配样式体积较大，独立 CSS 文件比塞进 polyfill 更容易维护。
+      (document.head || document.documentElement).appendChild(link);
+      contributionStyles = link;
+    }
+
+    function setInsets(visible, insets) {
+      const rawInsets = insets || { left: 0, right: 0, top: 0, height: 0 };
+      const cssInsets = visible
+        ? envInsets()
+        : { left: 0, right: 0, top: 0, height: 0, titlebarEnd: 0, titlebarWidth: 0, titlebarX: 0 };
+      const rawTitlebarWidth = roundPixel(rawInsets.titlebarWidth);
+      const titlebarSource = rawTitlebarWidth > 0 ? rawInsets : cssInsets;
+      // left/right 作为禁区避让值取较大值；titlebar 矩形保持同一来源，避免 x 和 width 拼出错误区域。
+      const nextInsets = {
+        left: Math.max(roundPixel(rawInsets.left), cssInsets.left),
+        right: Math.max(roundPixel(rawInsets.right), cssInsets.right),
+        top: Math.max(roundPixel(rawInsets.top), cssInsets.top),
+        height: Math.max(roundPixel(rawInsets.height), cssInsets.height),
+        titlebarEnd: roundPixel(titlebarSource.titlebarEnd),
+        titlebarWidth: roundPixel(titlebarSource.titlebarWidth),
+        titlebarX: roundPixel(titlebarSource.titlebarX),
+      };
+      root.dataset.opencodexWcoVisible = visible ? "true" : "false";
+      if (!insets) {
+        // JS rect 不可用时，删除 inline 覆盖，让上面的 CSS env(titlebar-area-*) 继续提供 WCO 数据。
+        removeManagedRootStyle("--opencodex-wco-left");
+        removeManagedRootStyle("--opencodex-wco-right");
+        removeManagedRootStyle("--opencodex-wco-top");
+        removeManagedRootStyle("--opencodex-wco-height");
+        removeManagedRootStyle("--opencodex-wco-titlebar-x");
+        removeManagedRootStyle("--opencodex-wco-titlebar-width");
+        removeManagedRootStyle("--spacing-token-safe-header-left");
+        removeManagedRootStyle("--spacing-token-safe-header-right");
+        removeManagedRootStyle("--safe-area-left");
+        removeManagedRootStyle("--safe-area-right");
+        return;
+      }
+      setManagedRootStyle("--opencodex-wco-left", `${nextInsets.left}px`);
+      setManagedRootStyle("--opencodex-wco-right", `${nextInsets.right}px`);
+      setManagedRootStyle("--opencodex-wco-top", `${nextInsets.top}px`);
+      setManagedRootStyle("--opencodex-wco-height", `${nextInsets.height}px`);
+      setManagedRootStyle("--opencodex-wco-titlebar-x", `${nextInsets.titlebarX}px`);
+      setManagedRootStyle("--opencodex-wco-titlebar-width", `${nextInsets.titlebarWidth}px`);
+      setManagedRootStyle("--spacing-token-safe-header-left", "0px");
+      setManagedRootStyle("--spacing-token-safe-header-right", "0px");
+      removeManagedRootStyle("--safe-area-left");
+      removeManagedRootStyle("--safe-area-right");
+    }
+
+    let rightHeaderSlotMetricsQueued = false;
+    let metricFrameId = null;
+    let metricTimeoutId = null;
+    let managedThemeColorState = null;
+    let windowControlsThemeColor = "";
+    let imagePreviewThemeColor = "";
+    let cssColorProbe = null;
+    let disposeMutationObservation = null;
+    let managedRootStyleMutationBudget = 0;
+    let resizeObserver = null;
+    let heavyObserversActive = false;
+    let inactiveMetricsSynced = false;
+    let compatibilityHitReported = false;
+    let currentImagePreviewRoot = null;
+    const RIGHT_PANEL_FOCUS_SELECTOR = '[data-app-shell-focus-area="right-panel"]';
+    const METRIC_MOUNT_SELECTOR = [
+      "header[data-app-shell-header-edge-scroll]",
+      RIGHT_PANEL_FOCUS_SELECTOR,
+      '[data-app-shell-tab-strip-controller="right"]',
+      '[data-testid="image-preview-dismiss-area"]',
+    ].join(",");
+
+    function setManagedRootStyle(name, value) {
+      rememberRootStyle(name);
+      const nextValue = String(value);
+      if (rootStyle.getPropertyValue(name) === nextValue) return;
+      // 每次实际自写对应一个 style MutationRecord，observer 据此只过滤自身产生的记录。
+      if (disposeMutationObservation) managedRootStyleMutationBudget += 1;
+      rootStyle.setProperty(name, nextValue);
+    }
+
+    function removeManagedRootStyle(name) {
+      rememberRootStyle(name);
+      if (!rootStyle.getPropertyValue(name)) return;
+      if (disposeMutationObservation) managedRootStyleMutationBudget += 1;
+      rootStyle.removeProperty(name);
+    }
+
+    function rememberRootStyle(name) {
+      if (initialRootStyles.has(name)) return;
+      initialRootStyles.set(name, {
+        priority: rootStyle.getPropertyPriority(name),
+        value: rootStyle.getPropertyValue(name),
+      });
+    }
+
+    function restoreManagedDomState() {
+      for (const [name, initial] of initialRootStyles) {
+        if (initial.value) rootStyle.setProperty(name, initial.value, initial.priority);
+        else rootStyle.removeProperty(name);
+      }
+      for (const [key, initial] of initialRootDataset) {
+        if (initial === undefined) delete root.dataset[key];
+        else root.dataset[key] = initial;
+      }
+      // 只清理由当前实例实际标记过的节点，页面代际切换时不会误触新文档中的同名节点。
+      for (const [attribute, nodes] of managedAttributeNodes) {
+        for (const node of nodes) node.removeAttribute(attribute);
+      }
+      managedAttributeNodes.clear();
+      contributionStyles?.remove();
+      contributionStyles = null;
+    }
+
+    function setManagedNodeAttribute(node, attribute, value = "true") {
+      if (!node) return;
+      node.setAttribute(attribute, value);
+      let nodes = managedAttributeNodes.get(attribute);
+      if (!nodes) {
+        nodes = new Set();
+        managedAttributeNodes.set(attribute, nodes);
+      }
+      nodes.add(node);
+    }
+
+    function removeManagedNodeAttribute(node, attribute) {
+      if (!node) return;
+      node.removeAttribute(attribute);
+      managedAttributeNodes.get(attribute)?.delete(node);
+    }
+
+    function visibleLayoutElement(element) {
+      if (!(element instanceof HTMLElement)) return false;
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = w.getComputedStyle(element);
+      return style.display !== "none" && style.visibility !== "hidden";
+    }
+
+    function firstVisibleElement(selector) {
+      const candidates = Array.from(document.querySelectorAll(selector));
+      return candidates.find(visibleLayoutElement) || candidates[0] || null;
+    }
+
+    function directHeaderSlots(header) {
+      if (!(header instanceof HTMLElement)) return [];
+      return Array.from(header.children).filter(
+        (child) => child instanceof HTMLElement && child.getAttribute("data-test-id") === "header-shell-slot"
+      );
+    }
+
+    function parseRgbColor(value) {
+      const match = String(value || "").match(/rgba?\(([^)]+)\)/i);
+      if (!match) return null;
+      const [channelsPart, slashAlpha] = match[1].split("/");
+      const parts = channelsPart.includes(",")
+        ? channelsPart.split(",").map((part) => part.trim())
+        : channelsPart.trim().split(/\s+/);
+      const channels = parts.slice(0, 3).map((part) => Number.parseFloat(part));
+      if (channels.length !== 3 || !channels.every((part) => Number.isFinite(part))) return null;
+      const alphaSource = slashAlpha ?? parts[3] ?? "";
+      const parsedAlpha = alphaSource.trim().endsWith("%")
+        ? Number.parseFloat(alphaSource) / 100
+        : Number.parseFloat(alphaSource);
+      const alpha = Number.isFinite(parsedAlpha) ? parsedAlpha : 1;
+      return { alpha, channels };
+    }
+
+    function visibleCssColor(value) {
+      if (!value || value === "transparent") return false;
+      const rgb = parseRgbColor(value);
+      return !rgb || rgb.alpha > 0;
+    }
+
+    function colorSchemeFromCssColor(value) {
+      const rgb = parseRgbColor(value);
+      if (!rgb) return fallbackColorScheme();
+      const { channels } = rgb;
+      const [red, green, blue] = channels.map((channel) => {
+        const normalized = Math.max(0, Math.min(255, channel)) / 255;
+        return normalized <= 0.03928
+          ? normalized / 12.92
+          : Math.pow((normalized + 0.055) / 1.055, 2.4);
+      });
+      // WCO 只需要知道标题栏更接近亮色还是暗色，阈值按相对亮度判断。
+      const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+      return luminance < 0.5 ? "dark" : "light";
+    }
+
+    function fallbackColorScheme() {
+      const explicitTheme = root.dataset.theme;
+      if (explicitTheme === "dark" || explicitTheme === "light") return explicitTheme;
+      if (root.classList.contains("electron-dark") || root.classList.contains("dark")) return "dark";
+      if (root.classList.contains("electron-light") || root.classList.contains("light")) return "light";
+      const media = typeof w.matchMedia === "function" ? w.matchMedia("(prefers-color-scheme: dark)") : null;
+      return media?.matches ? "dark" : "light";
+    }
+
+    function resolveCssColor(value) {
+      const color = String(value || "").trim();
+      if (!color) return "";
+      if (!cssColorProbe) {
+        cssColorProbe = document.createElement("div");
+        cssColorProbe.style.cssText =
+          "position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;visibility:hidden;pointer-events:none;contain:strict;";
+        (document.body || document.documentElement).appendChild(cssColorProbe);
+      }
+      cssColorProbe.style.backgroundColor = "";
+      cssColorProbe.style.backgroundColor = color;
+      const resolved = w.getComputedStyle(cssColorProbe).backgroundColor;
+      return visibleCssColor(resolved) ? resolved : "";
+    }
+
+    function findSurfaceColorFromElement(element, minWidth) {
+      for (let node = element; node instanceof HTMLElement; node = node.parentElement) {
+        const color = resolveCssColor(w.getComputedStyle(node).backgroundColor);
+        if (!color) continue;
+        const rect = node === document.body ? document.documentElement.getBoundingClientRect() : node.getBoundingClientRect();
+        const isPageSurface =
+          node === document.body ||
+          node === document.documentElement ||
+          rect.width >= minWidth ||
+          rect.height >= Math.max(1, measureCssLength("var(--opencodex-wco-height)")) * 2;
+        if (isPageSurface) return color;
+      }
+      return "";
+    }
+
+    function findSurfaceColorAtPoint(x, y, minWidth) {
+      const element = document.elementFromPoint(
+        Math.max(0, Math.min(w.innerWidth - 1, x)),
+        Math.max(0, Math.min(w.innerHeight - 1, y))
+      );
+      return element instanceof HTMLElement ? findSurfaceColorFromElement(element, minWidth) : "";
+    }
+
+    function findTokenSurfaceColor() {
+      const computedRoot = w.getComputedStyle(root);
+      const tokenNames = [
+        "--color-token-main-surface-primary",
+        "--color-background-surface-under",
+        "--color-token-bg-primary",
+        "--color-bg-primary",
+        "--vscode-editor-background",
+      ];
+      for (const tokenName of tokenNames) {
+        const color = resolveCssColor(computedRoot.getPropertyValue(tokenName));
+        if (color) return color;
+      }
+      return resolveCssColor(w.getComputedStyle(document.body).backgroundColor) ||
+        resolveCssColor(computedRoot.backgroundColor);
+    }
+
+    function findWindowControlsTitlebarColors() {
+      const viewportWidth = w.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = w.innerHeight || document.documentElement.clientHeight || 0;
+      const leftInset = measureCssLength("var(--opencodex-wco-left)");
+      const rightInset = measureCssLength("var(--opencodex-wco-right)");
+      const titlebarX = measureCssLength("var(--opencodex-wco-titlebar-x)");
+      const titlebarWidth = measureCssLength("var(--opencodex-wco-titlebar-width)");
+      const titlebarTop = measureCssLength("var(--opencodex-wco-top)");
+      const titlebarHeight = Math.max(1, measureCssLength("var(--opencodex-wco-height)"));
+      const probeY = Math.max(0, Math.min(viewportHeight - 1, titlebarTop + titlebarHeight / 2));
+      const minSurfaceWidth = Math.max(titlebarHeight * 3, Math.min(viewportWidth, titlebarWidth) * 0.12);
+      const header = firstVisibleElement("header[data-app-shell-header-edge-scroll]");
+      const fallback = findTokenSurfaceColor();
+      const centerX =
+        titlebarWidth > 0
+          ? titlebarX + Math.max(1, Math.min(titlebarWidth - 1, titlebarWidth / 2))
+          : viewportWidth / 2;
+      const centerColor =
+        findSurfaceColorAtPoint(centerX, probeY, minSurfaceWidth) ||
+        (header instanceof HTMLElement ? findSurfaceColorFromElement(header, minSurfaceWidth) : "") ||
+        fallback;
+      const leftColor =
+        leftInset > 0 ? findSurfaceColorAtPoint(leftInset / 2, probeY, minSurfaceWidth) || centerColor : centerColor;
+      const rightColor =
+        rightInset > 0
+          ? findSurfaceColorAtPoint(viewportWidth - rightInset / 2, probeY, minSurfaceWidth) || centerColor
+          : centerColor;
+      // theme-color 只能设置单色，优先取右侧系统按钮区域的真实表面色；补底层仍分别使用左右采样色。
+      const themeColor = rightColor || leftColor || centerColor;
+      return {
+        centerColor,
+        leftColor,
+        rightColor,
+        themeColor,
+      };
+    }
+
+    function setWindowControlsThemeColor(color) {
+      windowControlsThemeColor = color || "";
+      applyManagedThemeColor();
+    }
+
+    function setImagePreviewThemeColor(color) {
+      imagePreviewThemeColor = color || "";
+      applyManagedThemeColor();
+    }
+
+    function applyManagedThemeColor() {
+      const color =
+        root.dataset.opencodexWcoVisible === "true" ? imagePreviewThemeColor || windowControlsThemeColor : "";
+      if (!color) {
+        if (managedThemeColorState) {
+          const { created, meta, previousContent } = managedThemeColorState;
+          if (created) {
+            meta.remove();
+          } else if (previousContent == null) {
+            meta.removeAttribute("content");
+          } else {
+            meta.setAttribute("content", previousContent);
+          }
+          managedThemeColorState = null;
+        }
+        return;
+      }
+      let meta = document.querySelector('meta[name="theme-color"]');
+      let created = false;
+      if (!meta) {
+        meta = document.createElement("meta");
+        meta.setAttribute("name", "theme-color");
+        document.head?.appendChild(meta);
+        created = true;
+      }
+      if (!managedThemeColorState || managedThemeColorState.meta !== meta) {
+        managedThemeColorState = {
+          created,
+          meta,
+          previousContent: meta.getAttribute("content"),
+        };
+      }
+      // Chrome PWA 会参考 theme-color 绘制 WCO 标题栏底色，这里统一管理普通标题栏和图片预览遮罩。
+      meta.setAttribute("content", color);
+    }
+
+    function syncWindowControlsThemeState() {
+      if (root.dataset.opencodexWcoVisible !== "true") {
+        setWindowControlsThemeColor("");
+        root.removeAttribute("data-opencodex-wco-titlebar-scheme");
+        return;
+      }
+      const { centerColor, leftColor, rightColor, themeColor } = findWindowControlsTitlebarColors();
+      if (centerColor) setManagedRootStyle("--opencodex-wco-titlebar-background", centerColor);
+      if (leftColor) setManagedRootStyle("--opencodex-wco-titlebar-left-background", leftColor);
+      if (rightColor) setManagedRootStyle("--opencodex-wco-titlebar-right-background", rightColor);
+      root.dataset.opencodexWcoTitlebarScheme = themeColor ? colorSchemeFromCssColor(themeColor) : fallbackColorScheme();
+      setWindowControlsThemeColor(themeColor);
+    }
+
+    function findImagePreviewScrimColor(previewRoot) {
+      const viewportWidth = w.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = w.innerHeight || document.documentElement.clientHeight || 0;
+      const candidates = new Set();
+      for (let node = previewRoot; node instanceof HTMLElement; node = node.parentElement) {
+        const parent = node.parentElement;
+        if (!parent) break;
+        for (const child of parent.children) {
+          if (child instanceof HTMLElement && child !== node && !node.contains(child)) {
+            candidates.add(child);
+          }
+        }
+        if (parent === document.body) break;
+      }
+      for (const candidate of candidates) {
+        const style = w.getComputedStyle(candidate);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        if (style.position !== "fixed" && style.position !== "absolute") continue;
+        if (!visibleCssColor(style.backgroundColor)) continue;
+        const rect = candidate.getBoundingClientRect();
+        const coversViewport =
+          rect.width >= viewportWidth * 0.8 &&
+          rect.height >= viewportHeight * 0.8 &&
+          rect.left <= viewportWidth * 0.1 &&
+          rect.top <= viewportHeight * 0.1;
+        if (coversViewport) return style.backgroundColor;
+      }
+      return "";
+    }
+
+    function syncImagePreviewOverlayState() {
+      const dismissArea = document.querySelector('[data-testid="image-preview-dismiss-area"]');
+      const previewRoot = dismissArea?.parentElement instanceof HTMLElement ? dismissArea.parentElement : null;
+      currentImagePreviewRoot = previewRoot;
+      const scrimColor = previewRoot ? findImagePreviewScrimColor(previewRoot) : "";
+      root.dataset.opencodexWcoImagePreviewOpen = previewRoot ? "true" : "false";
+      root.dataset.opencodexWcoImagePreviewScheme = scrimColor ? colorSchemeFromCssColor(scrimColor) : "";
+      if (scrimColor) {
+        setManagedRootStyle("--opencodex-wco-image-preview-scrim", scrimColor);
+      } else {
+        removeManagedRootStyle("--opencodex-wco-image-preview-scrim");
+      }
+      setImagePreviewThemeColor(root.dataset.opencodexWcoVisible === "true" ? scrimColor : "");
+
+      for (const node of document.querySelectorAll('[data-opencodex-wco-image-preview="true"]')) {
+        if (node !== previewRoot) removeManagedNodeAttribute(node, "data-opencodex-wco-image-preview");
+      }
+      for (const node of document.querySelectorAll('[data-opencodex-wco-image-preview-controls="true"]')) {
+        removeManagedNodeAttribute(node, "data-opencodex-wco-image-preview-controls");
+      }
+      if (!previewRoot) return;
+
+      setManagedNodeAttribute(previewRoot, "data-opencodex-wco-image-preview");
+      const controls = Array.from(previewRoot.children).find((child) => {
+        if (!(child instanceof HTMLElement)) return false;
+        return child.classList.contains("top-3") && child.classList.contains("right-3") && child.querySelector("a,button");
+      });
+      // 官方图片预览没有稳定 test id，这里按直接子节点的 top/right 工具条特征补一个稳定标记。
+      setManagedNodeAttribute(controls, "data-opencodex-wco-image-preview-controls");
+    }
+
+    function syncRightHeaderSlotMetrics() {
+      rightHeaderSlotMetricsQueued = false;
+      const header = firstVisibleElement("header[data-app-shell-header-edge-scroll]");
+      const slots = directHeaderSlots(header);
+      const slot = slots[slots.length - 1] || null;
+      for (const node of document.querySelectorAll('[data-opencodex-wco-right-slot="true"]')) {
+        if (node !== slot) removeManagedNodeAttribute(node, "data-opencodex-wco-right-slot");
+      }
+      for (const node of document.querySelectorAll('[data-opencodex-wco-align-right-panel="true"]')) {
+        if (node !== slot) removeManagedNodeAttribute(node, "data-opencodex-wco-align-right-panel");
+      }
+      // 官方 header 末尾可能继续挂载标题栏障碍节点，不能再用 :last-child 判断右侧 slot。
+      setManagedNodeAttribute(slot, "data-opencodex-wco-right-slot");
+      const headerRect = header?.getBoundingClientRect();
+      const rightPanel = headerRect
+        ? Array.from(document.querySelectorAll(`aside${RIGHT_PANEL_FOCUS_SELECTOR}`)).find((candidate) => {
+            if (!visibleLayoutElement(candidate)) return false;
+            const panelRect = candidate.getBoundingClientRect();
+            // 只有覆盖标题栏右边缘的物理右侧栏，才应决定 end slot 的占位宽度。
+            return panelRect.left < headerRect.right && panelRect.right >= headerRect.right - 1;
+          })
+        : null;
+      const panelRect = rightPanel?.getBoundingClientRect();
+      const overlapWidth =
+        headerRect && panelRect
+          ? Math.max(
+              0,
+              Math.min(headerRect.right, panelRect.right) - Math.max(headerRect.left, panelRect.left)
+            )
+          : 0;
+      const alignedWidth = Math.round(overlapWidth * 100) / 100;
+      if (slot && alignedWidth > 0) {
+        setManagedNodeAttribute(slot, "data-opencodex-wco-align-right-panel");
+      } else {
+        removeManagedNodeAttribute(slot, "data-opencodex-wco-align-right-panel");
+      }
+      setManagedRootStyle("--opencodex-wco-right-slot-width", `${alignedWidth}px`);
+
+      // 清理旧版按内部按钮分组收缩 slot 留下的状态。
+      for (const [selector, attribute] of [
+        ['[data-opencodex-wco-has-leading]', "data-opencodex-wco-has-leading"],
+        ['[data-opencodex-wco-leading]', "data-opencodex-wco-leading"],
+        ['[data-opencodex-wco-fixed]', "data-opencodex-wco-fixed"],
+      ]) {
+        for (const node of document.querySelectorAll(selector)) node.removeAttribute(attribute);
+      }
+      removeManagedRootStyle("--opencodex-wco-right-slot-min");
+      removeManagedRootStyle("--opencodex-wco-leading-max");
+    }
+
+    function syncRightPanelTabStripMetrics() {
+      const strips = Array.from(
+        document.querySelectorAll('[data-app-shell-tab-strip-controller="right"]')
+      );
+      // 缓存路由里可能残留不可见 strip，只能让当前右侧面板中的可见实例参与布局。
+      const strip = strips.find(
+        (candidate) => candidate.closest?.(RIGHT_PANEL_FOCUS_SELECTOR) && visibleLayoutElement(candidate)
+      ) || null;
+      const toolbarCandidate = strip?.closest?.('[data-app-shell-tab-row]') || strip?.parentElement;
+      const toolbar = toolbarCandidate instanceof HTMLElement ? toolbarCandidate : null;
+      for (const node of document.querySelectorAll('[data-opencodex-wco-right-panel-toolbar="true"]')) {
+        if (node !== toolbar) removeManagedNodeAttribute(node, "data-opencodex-wco-right-panel-toolbar");
+      }
+      // 清除旧版跨分栏位移留下的状态，热更新后也不能继续影响当前页面。
+      for (const [selector, attribute] of [
+        ['[data-opencodex-wco-right-panel-strip="true"]', "data-opencodex-wco-right-panel-strip"],
+        [
+          '[data-opencodex-wco-right-panel-toolbar-clip="true"]',
+          "data-opencodex-wco-right-panel-toolbar-clip",
+        ],
+      ]) {
+        for (const node of document.querySelectorAll(selector)) {
+          node.removeAttribute(attribute);
+        }
+      }
+      for (const header of document.querySelectorAll("header[data-opencodex-wco-has-right-panel-toolbar]")) {
+        header.removeAttribute("data-opencodex-wco-has-right-panel-toolbar");
+      }
+      removeManagedRootStyle("--opencodex-wco-right-panel-toolbar-extend");
+      setManagedNodeAttribute(toolbar, "data-opencodex-wco-right-panel-toolbar");
+    }
+
+    function syncHeaderAndPanelMetrics() {
+      syncRightHeaderSlotMetrics();
+      syncRightPanelTabStripMetrics();
+      syncWindowControlsThemeState();
+      syncImagePreviewOverlayState();
+    }
+
+    function queueRightHeaderSlotMetrics() {
+      if (rightHeaderSlotMetricsQueued) return;
+      rightHeaderSlotMetricsQueued = true;
+      if (typeof w.requestAnimationFrame === "function") {
+        metricFrameId = scheduler.requestAnimationFrame(() => {
+          metricFrameId = null;
+          syncHeaderAndPanelMetrics();
+        });
+      } else {
+        metricTimeoutId = scheduler.setTimeout(() => {
+          metricTimeoutId = null;
+          syncHeaderAndPanelMetrics();
+        }, 0);
+      }
+    }
+
+    function cancelQueuedMetrics() {
+      if (metricFrameId != null && typeof w.cancelAnimationFrame === "function") {
+        scheduler.cancelAnimationFrame(metricFrameId);
+      }
+      if (metricTimeoutId != null) scheduler.clearTimeout(metricTimeoutId);
+      metricFrameId = null;
+      metricTimeoutId = null;
+      rightHeaderSlotMetricsQueued = false;
+    }
+
+    function nodeTouchesMetricMount(node, includeDescendants = false) {
+      if (!node || node.nodeType !== 1) return false;
+      if (node.matches?.(METRIC_MOUNT_SELECTOR) || node.closest?.(METRIC_MOUNT_SELECTOR)) return true;
+      if (
+        currentImagePreviewRoot &&
+        (node === currentImagePreviewRoot || currentImagePreviewRoot.contains?.(node))
+      ) {
+        return true;
+      }
+      return includeDescendants && !!node.firstElementChild && !!node.querySelector?.(METRIC_MOUNT_SELECTOR);
+    }
+
+    function mutationTouchesMetrics(record) {
+      if (!record) return false;
+      if (record.type === "attributes") {
+        if (record.target === root || record.target === document.body) return true;
+        return nodeTouchesMetricMount(record.target);
+      }
+      if (record.type !== "childList") return false;
+      if (nodeTouchesMetricMount(record.target)) return true;
+      return [...Array.from(record.addedNodes || []), ...Array.from(record.removedNodes || [])].some(
+        (node) => nodeTouchesMetricMount(node, true)
+      );
+    }
+
+    function startHeavyObservers() {
+      if (heavyObserversActive) return;
+      heavyObserversActive = true;
+      inactiveMetricsSynced = false;
+      // 只有 WCO 真正可见时才观察官方 renderer；普通网页和移动端无需承担整页 DOM 监听成本。
+      disposeMutationObservation = adapterHost.dom.observe({
+        key: {},
+        root: document.documentElement,
+        options: {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class", "style", "data-theme"],
+        },
+        callback(records) {
+          let hasExternalMutation = false;
+          for (const record of Array.from(records || [])) {
+            // CSS 测量探针会频繁改写自身 style；绝不能让它们反向触发下一轮测量。
+            if (record.target === cssLengthProbe || record.target === cssColorProbe) continue;
+            const isRootStyle =
+              record.type === "attributes" && record.target === root && record.attributeName === "style";
+            if (isRootStyle && managedRootStyleMutationBudget > 0) {
+              managedRootStyleMutationBudget -= 1;
+              continue;
+            }
+            if (mutationTouchesMetrics(record)) hasExternalMutation = true;
+          }
+          // 预算之外的根 style 记录来自官方 renderer，必须像其它外部变化一样重新测量。
+          if (hasExternalMutation) queueRightHeaderSlotMetrics();
+        },
+      });
+      if (typeof ResizeObserver === "function") {
+        resizeObserver = new ResizeObserver(queueRightHeaderSlotMetrics);
+        resizeObserver.observe(root);
+      }
+    }
+
+    function stopHeavyObservers() {
+      disposeMutationObservation?.();
+      resizeObserver?.disconnect();
+      disposeMutationObservation = null;
+      managedRootStyleMutationBudget = 0;
+      resizeObserver = null;
+      currentImagePreviewRoot = null;
+      heavyObserversActive = false;
+      cancelQueuedMetrics();
+    }
+
+    function syncInsets() {
+      const visible = Boolean(overlay?.visible || displayModeQuery?.matches);
+      if (document.visibilityState === "hidden") {
+        // 后台页面保留最后一份 CSS 几何值，但彻底停止 DOM/布局观察；回前台时再统一校准。
+        stopHeavyObservers();
+        return;
+      }
+      if (visible && overlay && typeof overlay.getTitlebarAreaRect === "function") {
+        if (!compatibilityHitReported) {
+          compatibilityHitReported = true;
+          onHit();
+        }
+        startHeavyObservers();
+        const rect = overlay.getTitlebarAreaRect();
+        setInsets(true, insetsFromRect(rect));
+        queueRightHeaderSlotMetrics();
+        return;
+      }
+      if (visible) {
+        if (!compatibilityHitReported) {
+          compatibilityHitReported = true;
+          onHit();
+        }
+        startHeavyObservers();
+        setInsets(true, null);
+        queueRightHeaderSlotMetrics();
+        return;
+      }
+      setInsets(false, null);
+      stopHeavyObservers();
+      if (!inactiveMetricsSynced) {
+        // 从 WCO 退出时只做一次完整清理，之后普通页面的 DOM 更新不再触发布局测量。
+        inactiveMetricsSynced = true;
+        syncHeaderAndPanelMetrics();
+      }
+    }
+
+    ensureOverrideStyles();
+    if (overlay?.addEventListener) {
+      addCleanup(adapterHost.events.observe({ key: {}, target: overlay, type: "geometrychange", callback: syncInsets }));
+    }
+    if (displayModeQuery?.addEventListener) {
+      addCleanup(adapterHost.events.observe({ key: {}, target: displayModeQuery, type: "change", callback: syncInsets }));
+    } else if (displayModeQuery?.addListener) {
+      displayModeQuery.addListener(syncInsets);
+      addCleanup(() => displayModeQuery.removeListener?.(syncInsets));
+    }
+    addCleanup(adapterHost.events.observe({ key: {}, target: w, type: "resize", callback: syncInsets }));
+    addCleanup(adapterHost.events.observe({ key: {}, target: document, type: "visibilitychange", callback: syncInsets }));
+    syncInsets();
+    const initialFrameId =
+      typeof w.requestAnimationFrame === "function" ? scheduler.requestAnimationFrame(syncInsets) : null;
+    const initialTimeoutId = scheduler.setTimeout(syncInsets, 250);
+    return () => {
+      setWindowControlsThemeColor("");
+      setImagePreviewThemeColor("");
+      stopHeavyObservers();
+      if (initialFrameId != null && typeof w.cancelAnimationFrame === "function") {
+        scheduler.cancelAnimationFrame(initialFrameId);
+      }
+      scheduler.clearTimeout(initialTimeoutId);
+      for (const cleanup of cleanupHandlers.splice(0).reverse()) {
+        try {
+          cleanup();
+        } catch {
+          // 页面切换期间 DOM/监听对象可能已经失效，逐个清理时保持幂等。
+        }
+      }
+      cssLengthProbe?.remove();
+      cssColorProbe?.remove();
+      restoreManagedDomState();
+    };
+  }
+
+    const cleanup = installWindowControlsOverlaySafeArea();
+    if (!cleanup) throw new Error("PWA 标题栏 Provider 无法定位当前文档根节点");
+    let active = true;
+    return Object.freeze({
+      verify() {
+        if (!active) throw new Error("PWA 标题栏 Contribution 已经释放");
+        const styles = document.getElementById("codex-web-window-controls-overlay-styles") || contributionStyles;
+        const stylesConnected = styles ? styles.isConnected ?? Boolean(styles.parentNode) : false;
+        if (!stylesConnected) {
+          throw new Error("PWA 标题栏样式没有连接到当前页面");
+        }
+      },
+      dispose() {
+        if (!active) return;
+        active = false;
+        cleanup();
+      },
+    });
+
+  });
+})();

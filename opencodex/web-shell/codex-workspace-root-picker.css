@@ -1,0 +1,195 @@
+/* 远端路径弹窗叠在官方 renderer 上方，层级需要高于菜单和 toast 外的大多数浮层。 */
+.codex-web-workspace-root-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.24);
+}
+
+/* 尺寸按官方 compact dialog 收敛，避免按截图物理像素写导致 Web 端视觉放大。 */
+.codex-web-workspace-root-panel {
+  box-sizing: border-box;
+  width: min(390px, calc(100vw - 24px));
+  color: var(--text-primary, #202123);
+  background: var(--main-surface-primary, #fff);
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.08));
+  border-radius: 18px;
+  box-shadow: 0 11px 35px rgba(0, 0, 0, 0.22);
+  padding: 20px;
+}
+
+/* 标题区只放标题和关闭按钮，结构保持接近官方“Name project”弹窗。 */
+.codex-web-workspace-root-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-web-workspace-root-title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.codex-web-workspace-root-description {
+  margin: 6px 0 16px;
+  color: var(--text-secondary, #8e8e8e);
+  font-size: 13px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.codex-web-workspace-root-close {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 999px;
+  color: var(--text-secondary, #6f6f6f);
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 18px;
+}
+
+.codex-web-workspace-root-close:hover {
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.06));
+}
+
+/* 输入框使用官方命名弹窗附近的 text-base / rounded-xl 量级。 */
+.codex-web-workspace-root-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.1));
+  border-radius: 12px;
+  color: var(--text-primary, #202123);
+  background: var(--main-surface-primary, #fff);
+  font-size: 16px;
+  line-height: 1.3;
+  letter-spacing: 0;
+  outline: none;
+  padding: 0 12px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.02);
+}
+
+.codex-web-workspace-root-input:focus {
+  border-color: var(--text-primary, #202123);
+}
+
+/* 新版官方多目录选择在 Web 端使用一行一个路径，textarea 保留同一套输入框视觉。 */
+.codex-web-workspace-root-input-multiple {
+  height: 104px;
+  min-height: 72px;
+  padding: 8px 12px;
+  resize: vertical;
+}
+
+/* 底部按钮右对齐，和官方 dialog action row 的视觉位置保持一致。 */
+.codex-web-workspace-root-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+/* 自定义按钮不用官方 React Button，但状态色按 outline/primary 的语义模拟。 */
+.codex-web-workspace-root-button {
+  appearance: none;
+  min-width: 56px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.1));
+  background: var(--main-surface-primary, #fff);
+  color: var(--text-primary, #202123);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0;
+  padding: 0 14px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.codex-web-workspace-root-button:enabled:hover {
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.06));
+}
+
+.codex-web-workspace-root-button:enabled:active {
+  background: var(--button-secondary-active-background, rgba(0, 0, 0, 0.1));
+}
+
+.codex-web-workspace-root-button:focus-visible {
+  outline: 2px solid var(--token-focus-border, rgba(0, 0, 0, 0.35));
+  outline-offset: 2px;
+}
+
+.codex-web-workspace-root-button-primary {
+  border-color: var(--token-foreground, var(--text-primary, #202123));
+  background: var(--token-foreground, var(--text-primary, #202123));
+  color: var(--main-surface-primary, #fff);
+}
+
+/* primary hover/active 必须单独覆盖，避免被普通按钮 hover 变成浅灰底白字。 */
+.codex-web-workspace-root-button-primary:enabled:hover {
+  border-color: var(--token-foreground, var(--text-primary, #202123));
+  background: var(--token-foreground, var(--text-primary, #202123));
+  opacity: 0.82;
+}
+
+.codex-web-workspace-root-button-primary:enabled:active {
+  border-color: var(--token-foreground, var(--text-primary, #202123));
+  background: var(--token-foreground, var(--text-primary, #202123));
+  opacity: 0.74;
+}
+
+.codex-web-workspace-root-button:disabled,
+.codex-web-workspace-root-input:disabled {
+  cursor: wait;
+  opacity: 0.64;
+}
+
+/* 窄屏只收缩容器，不放大控件；这样移动端也能维持 compact 弹窗比例。 */
+@media (max-width: 640px) {
+  .codex-web-workspace-root-panel {
+    width: min(390px, calc(100vw - 24px));
+    border-radius: 18px;
+    padding: 20px;
+  }
+
+  .codex-web-workspace-root-title {
+    font-size: 17px;
+  }
+
+  .codex-web-workspace-root-description {
+    font-size: 13px;
+  }
+
+  .codex-web-workspace-root-input {
+    height: 36px;
+    font-size: 16px;
+  }
+
+  .codex-web-workspace-root-input-multiple {
+    height: 104px;
+    min-height: 72px;
+  }
+
+  .codex-web-workspace-root-actions {
+    gap: 10px;
+  }
+
+  .codex-web-workspace-root-button {
+    min-width: 56px;
+    height: 32px;
+    font-size: 14px;
+    padding: 0 14px;
+  }
+}

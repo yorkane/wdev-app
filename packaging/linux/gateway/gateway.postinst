@@ -1,0 +1,59 @@
+#!/bin/sh
+# codex-desktop 网关段：建服务账户与运行时目录，注册并启用 systemd 服务。
+# 由 build-deb 拼接到 postinst 末尾（AppArmor 段之前）；不破坏既有更新器逻辑。
+set -e
+
+GATEWAY_DIR=/opt/codex-desktop/gateway
+STATE_DIR=/var/lib/codex-desktop
+LOG_DIR=/var/log/codex-desktop
+GATEWAY_UNIT=codex-desktop-gateway.service
+XVFB_UNIT=codex-desktop-xvfb.service
+
+if [ -f "$GATEWAY_DIR/VERSION" ]; then
+    create_gateway_service_account() {
+        if ! getent passwd codex-desktop >/dev/null 2>&1; then
+            adduser --system --group --disabled-password --home "$STATE_DIR" \
+                --no-create-home --gecos "codex-desktop gateway" codex-desktop >/dev/null 2>&1 || true
+        fi
+        if ! getent group codex-desktop >/dev/null 2>&1; then
+            addgroup --system codex-desktop >/dev/null 2>&1 || true
+        fi
+    }
+
+    create_gateway_runtime_dirs() {
+        install -d -o codex-desktop -g codex-desktop -m 0755 "$STATE_DIR"
+        install -d -o codex-desktop -g codex-desktop -m 0755 \
+            "$STATE_DIR/codexhome" \
+            "$STATE_DIR/runtime" \
+            "$STATE_DIR/reports" \
+            "$STATE_DIR/official-bundle" \
+            "$STATE_DIR/official-user-data"
+        # 网关把官方 Electron 子进程日志写到 StandardOutput 指定的文件，目录必须可写。
+        install -d -o codex-desktop -g codex-desktop -m 0750 "$LOG_DIR"
+        touch "$LOG_DIR/gateway.log"
+        chown codex-desktop:codex-desktop "$LOG_DIR/gateway.log" 2>/dev/null || true
+        chmod 0640 "$LOG_DIR/gateway.log"
+    }
+
+    gateway_reload_systemd() {
+        # chroot 或容器里没有运行 systemd 时不能让安装失败。
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    }
+
+    case "$1" in
+        configure)
+            create_gateway_service_account
+            create_gateway_runtime_dirs
+            gateway_reload_systemd
+            systemctl enable "$XVFB_UNIT" >/dev/null 2>&1 || true
+            systemctl enable "$GATEWAY_UNIT" >/dev/null 2>&1 || true
+            if [ -n "${2:-}" ]; then
+                # 升级：只在服务本来就在运行时重启，避免把管理员手动停掉的服务拉起来。
+                systemctl try-restart "$GATEWAY_UNIT" >/dev/null 2>&1 || true
+            else
+                systemctl restart "$XVFB_UNIT" >/dev/null 2>&1 || true
+                systemctl restart "$GATEWAY_UNIT" >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+fi

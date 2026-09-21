@@ -1,0 +1,17 @@
+# 官方 Codex Desktop 是 Electron 应用，需要一个 X 显示环境；服务器上由 Xvfb 提供。
+[Unit]
+Description=Virtual X server for codex-desktop gateway
+After=network.target
+
+[Service]
+Type=simple
+# 显示号与网关共用同一个 DISPLAY，避免两个单元各写一份而漂移；
+# 宿主机上已有 Xvfb 占用同一个显示号时，改 /etc/codex-desktop/gateway.env 的 DISPLAY 即可。
+EnvironmentFile=-/etc/codex-desktop/gateway.env
+# -ac 关闭访问控制；GLX 与 render 是部分 Electron 版本的必要扩展。
+ExecStart=/usr/bin/Xvfb $DISPLAY -screen 0 1920x1080x24 -ac +extension GLX +render -noreset
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

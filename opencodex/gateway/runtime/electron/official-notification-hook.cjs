@@ -1,0 +1,286 @@
+const { EventEmitter } = require("events");
+const { DEBUG_LOGS } = require("../core/config.cjs");
+const { diagnosticLog, diagnosticWarn, shortId } = require("../core/diagnostics.cjs");
+const {
+  registerOfficialElectronModuleOverride,
+} = require("./official-electron-module-hook.cjs");
+
+const NOTIFICATION_EVENT_TYPE = "opencodex:notification-event";
+const NOTIFICATION_SHOW_TYPE = "opencodex:notification";
+const NOTIFICATION_CLOSE_TYPE = "opencodex:notification-close";
+const MAX_ACTIVE_NOTIFICATIONS = 128;
+
+const state = {
+  installed: false,
+  createdCount: 0,
+  shownCount: 0,
+  forwardedCount: 0,
+  droppedCount: 0,
+  closedCount: 0,
+  browserClickCount: 0,
+  browserCloseCount: 0,
+  requireHookInstalled: false,
+  lastCreatedAt: null,
+  lastShownAt: null,
+  lastForwardedAt: null,
+  lastDroppedAt: null,
+  lastClosedAt: null,
+  lastError: null,
+};
+
+const notifications = new Map();
+let publishNotification = null;
+
+function trackNotification(notification) {
+  notifications.delete(notification.notificationId);
+  notifications.set(notification.notificationId, notification);
+  while (notifications.size > MAX_ACTIVE_NOTIFICATIONS) {
+    const oldest = notifications.values().next().value;
+    if (!oldest || oldest === notification) break;
+    // 极端通知风暴只淘汰最旧路由；对象自身仍按 Electron close 语义发出关闭事件。
+    oldest.close({ notifyBrowser: oldest.visible === true });
+  }
+}
+
+function nextNotificationId() {
+  return `notification-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function stringField(value, maxLength) {
+  const text = String(value || "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function safeBrowserIcon(value) {
+  if (typeof value !== "string") return "";
+  const icon = value.trim();
+  if (!icon) return "";
+  // 浏览器 Notification 只能可靠消费 URL/data URL；不转发本机文件路径，避免跨设备不可读和泄露本地路径。
+  if (/^(?:https?:|data:|blob:|\/)/i.test(icon)) return icon.length > 4096 ? "" : icon;
+  return "";
+}
+
+function safeActions(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .slice(0, 2)
+    .map((action) => {
+      if (!action || typeof action !== "object") return null;
+      return {
+        action: stringField(action.type || action.action || action.text, 80),
+        title: stringField(action.text || action.title || action.type || action.action, 120),
+      };
+    })
+    .filter((action) => action && action.action && action.title);
+}
+
+function optionsFromConstructor(options) {
+  return options && typeof options === "object" ? options : {};
+}
+
+function browserNotificationPayload(notification) {
+  const options = notification.options;
+  const payload = {
+    type: NOTIFICATION_SHOW_TYPE,
+    notificationId: notification.notificationId,
+    title: stringField(notification.title, 512),
+    body: stringField(notification.body, 4096),
+    silent: !!options.silent,
+  };
+  const icon = safeBrowserIcon(options.icon);
+  if (icon) payload.icon = icon;
+  const tag = stringField(options.tag, 160);
+  if (tag) payload.tag = tag;
+  const actions = safeActions(options.actions);
+  if (actions.length > 0) payload.actions = actions;
+  if (options.renotify != null) payload.renotify = !!options.renotify;
+  if (options.requireInteraction != null) payload.requireInteraction = !!options.requireInteraction;
+  return payload;
+}
+
+function publish(payload) {
+  if (typeof publishNotification !== "function") return 0;
+  try {
+    const sent = Number(publishNotification(payload)) || 0;
+    // 转发恢复后清除当前故障，历史异常仍保留在诊断日志中。
+    state.lastError = null;
+    return sent;
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : String(error);
+    diagnosticWarn("official-notification", "publish_failed", { error: state.lastError });
+    return 0;
+  }
+}
+
+function installOfficialNotificationHook(electronModule, options = {}) {
+  if (!electronModule || state.installed) return officialNotificationHookStatus();
+
+  const NativeNotification = electronModule.Notification;
+  if (typeof NativeNotification !== "function") {
+    diagnosticWarn("official-notification", "notification_unavailable");
+    return officialNotificationHookStatus();
+  }
+
+  publishNotification = options.publishNotification;
+  const reportIntercept = () => {
+    try {
+      options.onIntercept?.();
+    } catch {
+      // 命中诊断不能改变官方 Notification 构造语义。
+    }
+  };
+
+  /**
+   * 官方 main 会直接创建系统通知。gateway 是后台服务，不应该自己弹系统通知；
+   * 这里用无 UI 的 Notification 替身接住官方调用，再把通知转发给已连接浏览器。
+   */
+  class GatewayNotification extends EventEmitter {
+    constructor(options) {
+      super();
+      const normalizedOptions = optionsFromConstructor(options);
+      this.__opencodexGatewayNotification = true;
+      this.notificationId = nextNotificationId();
+      this.options = { ...normalizedOptions };
+      this.title = stringField(normalizedOptions.title, 512);
+      this.subtitle = stringField(normalizedOptions.subtitle, 512);
+      this.body = stringField(normalizedOptions.body, 4096);
+      this.replyPlaceholder = stringField(normalizedOptions.replyPlaceholder, 512);
+      this.closeButtonText = stringField(normalizedOptions.closeButtonText, 120);
+      this.sound = normalizedOptions.sound || "";
+      this.icon = normalizedOptions.icon || null;
+      this.silent = !!normalizedOptions.silent;
+      this.hasReply = !!normalizedOptions.hasReply;
+      this.timeoutType = normalizedOptions.timeoutType || "";
+      this.urgency = normalizedOptions.urgency || "";
+      this.actions = Array.isArray(normalizedOptions.actions) ? normalizedOptions.actions.slice() : [];
+      this.visible = false;
+      this.destroyed = false;
+      trackNotification(this);
+      state.createdCount += 1;
+      state.lastCreatedAt = new Date().toISOString();
+      reportIntercept();
+    }
+
+    show() {
+      if (this.destroyed) return;
+      this.visible = true;
+      // Electron 允许同一实例再次 show；若上次无人接收已释放路由，这里重新登记。
+      trackNotification(this);
+      state.shownCount += 1;
+      state.lastShownAt = new Date().toISOString();
+      const sent = publish(browserNotificationPayload(this));
+      if (sent > 0) {
+        state.forwardedCount += 1;
+        state.lastForwardedAt = new Date().toISOString();
+      } else {
+        // 通知是时效消息；没有在线浏览器或 WS 尚未 ready 时直接丢弃，不做持久化队列。
+        state.droppedCount += 1;
+        state.lastDroppedAt = new Date().toISOString();
+        notifications.delete(this.notificationId);
+      }
+      if (DEBUG_LOGS) {
+        diagnosticLog("official-notification", "notification_show_intercepted", {
+          notificationId: shortId(this.notificationId),
+          sent,
+        });
+      }
+      setImmediate(() => {
+        if (!this.destroyed) this.emit("show");
+      });
+    }
+
+    close(options = {}) {
+      if (this.destroyed) return;
+      this.visible = false;
+      this.destroyed = true;
+      notifications.delete(this.notificationId);
+      state.closedCount += 1;
+      state.lastClosedAt = new Date().toISOString();
+      if (options.notifyBrowser !== false) {
+        publish({
+          type: NOTIFICATION_CLOSE_TYPE,
+          notificationId: this.notificationId,
+        });
+      }
+      setImmediate(() => this.emit("close"));
+    }
+  }
+
+  GatewayNotification.isSupported = () => true;
+  Object.setPrototypeOf(GatewayNotification, NativeNotification);
+  const registerElectronOverride =
+    typeof options.registerElectronOverride === "function"
+      ? options.registerElectronOverride
+      : registerOfficialElectronModuleOverride;
+  try {
+    registerElectronOverride(electronModule, "Notification", GatewayNotification);
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : String(error);
+    diagnosticWarn("official-notification", "notification_hook_failed", { error: state.lastError });
+    return officialNotificationHookStatus();
+  }
+
+  state.requireHookInstalled = true;
+  state.installed = true;
+  state.lastError = null;
+  if (DEBUG_LOGS) diagnosticLog("official-notification", "notification_hook_installed", { strategy: "module_load_wrapper" });
+  return officialNotificationHookStatus();
+}
+
+function handleOfficialNotificationEvent(message) {
+  if (!message || typeof message !== "object" || message.type !== NOTIFICATION_EVENT_TYPE) return false;
+  const notificationId = typeof message.notificationId === "string" ? message.notificationId : "";
+  const event = typeof message.event === "string" ? message.event : "";
+  const notification = notificationId ? notifications.get(notificationId) : null;
+  if (!notification) return true;
+
+  if (event === "click") {
+    state.browserClickCount += 1;
+    notification.emit("click");
+    return true;
+  }
+  if (event === "close") {
+    state.browserCloseCount += 1;
+    notification.close({ notifyBrowser: false });
+    return true;
+  }
+  if (event === "action") {
+    notification.emit("action", message.action || "");
+    return true;
+  }
+  if (event === "reply") {
+    notification.emit("reply", message.reply || "");
+    return true;
+  }
+  return true;
+}
+
+function officialNotificationHookStatus() {
+  return {
+    installed: state.installed,
+    createdCount: state.createdCount,
+    shownCount: state.shownCount,
+    forwardedCount: state.forwardedCount,
+    droppedCount: state.droppedCount,
+    closedCount: state.closedCount,
+    browserClickCount: state.browserClickCount,
+    browserCloseCount: state.browserCloseCount,
+    requireHookInstalled: state.requireHookInstalled,
+    activeCount: notifications.size,
+    lastCreatedAt: state.lastCreatedAt,
+    lastShownAt: state.lastShownAt,
+    lastForwardedAt: state.lastForwardedAt,
+    lastDroppedAt: state.lastDroppedAt,
+    lastClosedAt: state.lastClosedAt,
+    lastError: state.lastError,
+  };
+}
+
+module.exports = {
+  NOTIFICATION_CLOSE_TYPE,
+  NOTIFICATION_EVENT_TYPE,
+  NOTIFICATION_SHOW_TYPE,
+  handleOfficialNotificationEvent,
+  installOfficialNotificationHook,
+  officialNotificationHookStatus,
+};

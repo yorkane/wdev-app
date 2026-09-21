@@ -1,0 +1,4 @@
+{
+  "plugin.mobileSidebarAutoCollapse.label": "Mobile sidebar auto collapse",
+  "plugin.mobileSidebarAutoCollapse.desc": "Automatically collapses the sidebar after opening or creating a chat on mobile."
+}

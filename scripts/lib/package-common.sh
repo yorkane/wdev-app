@@ -1149,3 +1149,145 @@ exec /opt/$PACKAGE_NAME/start.sh "\$@"
 SCRIPT
     chmod 0755 "$root/usr/bin/$PACKAGE_NAME"
 }
+
+gateway_tree_present() {
+    local gateway_app="${1:-$REPO_DIR/opencodex}"
+    [ -d "$gateway_app" ] &&
+    [ -f "$gateway_app/gateway/dist/modification/catalog.js" ] &&
+    [ -d "$gateway_app/.build/node_modules" ] &&
+    [ -x "$gateway_app/.build/node/bin/node" ]
+}
+
+stage_gateway_package_files() {
+    local root="$1"
+    local app_root="$root/opt/$PACKAGE_NAME"
+    local gateway_root="$app_root/gateway"
+
+    [ -d "$GATEWAY_TEMPLATES_DIR" ] || error "Missing gateway templates: $GATEWAY_TEMPLATES_DIR"
+    ensure_file_exists "$GATEWAY_RUNNER_TEMPLATE" "gateway runner template"
+    local template
+    for template in \
+        codex-desktop-gateway.service \
+        codex-desktop-xvfb.service \
+        conffiles \
+        gateway.env \
+        config.yaml \
+        codex-desktop-gateway; do
+        ensure_file_exists "$GATEWAY_TEMPLATES_DIR/$template" "gateway template $template"
+    done
+
+    if ! gateway_tree_present; then
+        warn "OpenCodex gateway build tree not found (opencodex/gateway/dist + .build); run 'make gateway-build'"
+        warn "Debian package will be built WITHOUT the gateway"
+        return 0
+    fi
+
+    mkdir -p \
+        "$gateway_root" \
+        "$root/etc/$PACKAGE_NAME" \
+        "$root/lib/systemd/system" \
+        "$root/usr/bin"
+
+    # ---- application tree: runtime code + production deps + bundled node ----
+    # pnpm dependency tree contains symlinks; cp -a preserves them (same as
+    # OpenCodex build-deb.sh copy_tree). @electron/asar needs transitive deps
+    # like minimatch, which only exist under node_modules/.pnpm.
+    cp -a "$REPO_DIR/opencodex/gateway" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/web-shell" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/launcher" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/shared" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/package.json" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/LICENSE" "$gateway_root/" 2>/dev/null || true
+    cp -a "$REPO_DIR/opencodex/config.example.yaml" "$gateway_root/"
+    cp -a "$REPO_DIR/opencodex/.build/node_modules" "$gateway_root/node_modules"
+    cp -a "$REPO_DIR/opencodex/.build/node" "$gateway_root/node"
+    node -p "require('$REPO_DIR/opencodex/package.json').version" > "$gateway_root/VERSION"
+    install -m 0755 "$GATEWAY_RUNNER_TEMPLATE" "$gateway_root/run-gateway.sh"
+
+    # ---- systemd units (system-level; rewrite package-name placeholders) ----
+    local unit
+    for unit in codex-desktop-gateway.service codex-desktop-xvfb.service; do
+        sed "s|/opt/codex-desktop|/opt/$PACKAGE_NAME|g; s|/etc/codex-desktop|/etc/$PACKAGE_NAME|g; s|/var/lib/codex-desktop|/var/lib/$PACKAGE_NAME|g; s|/var/log/codex-desktop|/var/log/$PACKAGE_NAME|g; s|codex-desktop-|${PACKAGE_NAME}-|g; s|User=codex-desktop|User=${PACKAGE_NAME}|; s|Group=codex-desktop|Group=${PACKAGE_NAME}|" \
+            "$GATEWAY_TEMPLATES_DIR/$unit" > "$root/lib/systemd/system/${PACKAGE_NAME}-${unit#codex-desktop-}"
+        chmod 0644 "$root/lib/systemd/system/${PACKAGE_NAME}-${unit#codex-desktop-}"
+    done
+
+    # ---- conffiles (/etc/<pkg> config protected across upgrades) ----
+    sed "s|/etc/codex-desktop|/etc/$PACKAGE_NAME|g" "$GATEWAY_TEMPLATES_DIR/conffiles" > "$root/DEBIAN/conffiles"
+    chmod 0644 "$root/DEBIAN/conffiles"
+
+    # ---- etc templates ----
+    local etc_template
+    for etc_template in gateway.env config.yaml; do
+        sed "s|/opt/codex-desktop|/opt/$PACKAGE_NAME|g" \
+            "$GATEWAY_TEMPLATES_DIR/$etc_template" > "$root/etc/$PACKAGE_NAME/$etc_template"
+        chmod 0644 "$root/etc/$PACKAGE_NAME/$etc_template"
+    done
+
+    # ---- launcher CLI ----
+    sed "s|/opt/codex-desktop|/opt/$PACKAGE_NAME|g; s|/etc/codex-desktop|/etc/$PACKAGE_NAME|g; s|codex-desktop-gateway|${PACKAGE_NAME}-gateway|g; s|codex-desktop-xvfb|${PACKAGE_NAME}-xvfb|g" \
+        "$GATEWAY_TEMPLATES_DIR/codex-desktop-gateway" > "$root/usr/bin/${PACKAGE_NAME}-gateway"
+    chmod 0755 "$root/usr/bin/${PACKAGE_NAME}-gateway"
+
+    info "Gateway staged: $(find "$gateway_root" -type f | wc -l) files (bundled node + prod deps included)"
+}
+
+restore_gateway_payload_permissions() {
+    local root="$1"
+    local gateway_root="$root/opt/$PACKAGE_NAME/gateway"
+    [ -d "$gateway_root" ] || return 0
+    # normalize_package_payload_permissions already preserves x bits; this is a
+    # belt-and-suspenders guard for the few critical executables.
+    [ -f "$gateway_root/node/bin/node" ] && chmod 0755 "$gateway_root/node/bin/node" 2>/dev/null || true
+    [ -f "$gateway_root/run-gateway.sh" ] && chmod 0755 "$gateway_root/run-gateway.sh" 2>/dev/null || true
+    [ -f "$gateway_root/gateway/dev/run-gateway.cjs" ] && chmod 0755 "$gateway_root/gateway/dev/run-gateway.cjs" 2>/dev/null || true
+}
+
+_gateway_last_exit_line() {
+    grep -n '^exit 0$' "$1" | tail -1 | cut -d: -f1
+}
+
+append_gateway_deb_maintainer_scripts() {
+    local root="$1"
+    [ -d "$GATEWAY_TEMPLATES_DIR" ] || return 0
+    # postinst: gateway section appends AFTER the existing (updater) logic, before exit 0
+    if [ -f "$root/DEBIAN/postinst" ]; then
+        local exit_line maintainer_file="$root/DEBIAN/postinst"
+        exit_line="$(_gateway_last_exit_line "$maintainer_file")"
+        [ -n "$exit_line" ] && sed -i "${exit_line}d" "$root/DEBIAN/postinst"
+        sed "s|/opt/codex-desktop|/opt/$PACKAGE_NAME|g; s|/var/lib/codex-desktop|/var/lib/$PACKAGE_NAME|g; s|/var/log/codex-desktop|/var/log/$PACKAGE_NAME|g; s|codex-desktop-gateway.service|${PACKAGE_NAME}-gateway.service|g; s|codex-desktop-xvfb.service|${PACKAGE_NAME}-xvfb.service|g; s|codex-desktop|${PACKAGE_NAME}|g" \
+            "$GATEWAY_TEMPLATES_DIR/gateway.postinst" >> "$root/DEBIAN/postinst"
+        printf '\nexit 0\n' >> "$root/DEBIAN/postinst"
+    fi
+    # prerm: append stop-services section (existing upgrade early-exit path preserved)
+    if [ -f "$root/DEBIAN/prerm" ]; then
+        local exit_line maintainer_file="$root/DEBIAN/prerm"
+        exit_line="$(_gateway_last_exit_line "$maintainer_file")"
+        [ -n "$exit_line" ] && sed -i "${exit_line}d" "$root/DEBIAN/prerm"
+        sed "s|/opt/codex-desktop|/opt/$PACKAGE_NAME|g; s|codex-desktop-gateway.service|${PACKAGE_NAME}-gateway.service|g; s|codex-desktop-xvfb.service|${PACKAGE_NAME}-xvfb.service|g" \
+            "$GATEWAY_TEMPLATES_DIR/gateway.prerm" >> "$root/DEBIAN/prerm"
+        printf '\nexit 0\n' >> "$root/DEBIAN/prerm"
+    fi
+    # postrm: append cleanup section (with-updater ships a postrm; no-updater gets one here)
+    if [ -f "$root/DEBIAN/postrm" ]; then
+        local exit_line maintainer_file="$root/DEBIAN/postrm"
+        exit_line="$(_gateway_last_exit_line "$maintainer_file")"
+        [ -n "$exit_line" ] && sed -i "${exit_line}d" "$root/DEBIAN/postrm"
+        sed "s|/var/lib/codex-desktop|/var/lib/$PACKAGE_NAME|g; s|/var/log/codex-desktop|/var/log/$PACKAGE_NAME|g; s|codex-desktop|${PACKAGE_NAME}|g" \
+            "$GATEWAY_TEMPLATES_DIR/gateway.postrm" >> "$root/DEBIAN/postrm"
+        printf '\nexit 0\n' >> "$root/DEBIAN/postrm"
+    fi
+    chmod 0755 "$root/DEBIAN/postinst" "$root/DEBIAN/prerm" 2>/dev/null || true
+    [ -f "$root/DEBIAN/postrm" ] && chmod 0755 "$root/DEBIAN/postrm"
+}
+
+write_no_updater_deb_postrm() {
+    local target="$1"
+    cat > "$target" <<SCRIPT
+#!/bin/sh
+set -eu
+
+exit 0
+SCRIPT
+    chmod 0755 "$target"
+}

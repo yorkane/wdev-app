@@ -1,0 +1,10 @@
+# codex-desktop 网关段：移除前先停服务，避免 dpkg 删掉正在运行的文件。
+# 升级（upgrade）不停服务：与更新器同理，dpkg 事务可能由服务自身链路发起。
+case "${1:-}" in
+    remove|deconfigure|purge)
+        if [ -f /opt/codex-desktop/gateway/VERSION ]; then
+            systemctl stop codex-desktop-gateway.service >/dev/null 2>&1 || true
+            systemctl stop codex-desktop-xvfb.service >/dev/null 2>&1 || true
+        fi
+        ;;
+esac

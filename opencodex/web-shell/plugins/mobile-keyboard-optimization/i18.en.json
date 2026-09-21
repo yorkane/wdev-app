@@ -1,0 +1,4 @@
+{
+  "plugin.mobileKeyboardOptimization.label": "Mobile keyboard optimization",
+  "plugin.mobileKeyboardOptimization.desc": "Optimizes mobile composer focus and viewport height to reduce soft-keyboard overlap."
+}

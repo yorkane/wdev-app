@@ -1,0 +1,608 @@
+:root {
+  color-scheme: light;
+  --bg-primary: #FFFFFF;
+  --bg-secondary: #F9F9F9;
+  --border-color: #E5E5E5;
+  --text-primary: #202123;
+  --text-secondary: #6E6E80;
+  --accent-color: #10A37F;
+  --accent-hover: #1A7F64;
+  --focus-ring: rgba(16, 163, 127, 0.4);
+  --btn-bg: #FFFFFF;
+  --btn-border: #D9D9E3;
+  --btn-hover: #ECECF1;
+  --pill-bg: #E7F6F1;
+  --pill-text: #10A37F;
+  --pill-offline-bg: #FEF0C7;
+  --pill-offline-text: #B54708;
+  --error-bg: #FEF3F2;
+  --error-text: #B42318;
+  --error-border: #FECDCA;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Header */
+.app-header {
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.header-inner {
+  max-width: 800px;
+  margin: 0 auto;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-brand .logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+
+.header-copy {
+  min-width: 0;
+}
+
+/* 左上角品牌只展示应用名称和 launcher 版本，服务类型不再占据主视觉。 */
+.brand-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.brand-title h1 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.brand-version {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.update-badge {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 12px;
+  background-color: var(--accent-color);
+  color: #FFFFFF;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.update-badge:hover {
+  background-color: var(--accent-hover);
+}
+
+.update-badge[hidden] {
+  display: none;
+}
+
+.header-statuses {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#healthWarning[hidden] { display: none; }
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background-color: var(--pill-bg);
+  color: var(--pill-text);
+  gap: 6px;
+}
+
+.status-pill::before {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-color);
+}
+
+.status-pill.offline {
+  background-color: var(--pill-offline-bg);
+  color: var(--pill-offline-text);
+}
+
+.status-pill.offline::before {
+  background-color: #F79009;
+}
+
+/* Main Container */
+.app-main {
+  padding: 40px 24px 80px;
+}
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.notice {
+  margin-bottom: 24px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background-color: var(--error-bg);
+  color: var(--error-text);
+  border: 1px solid var(--error-border);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Hero Section */
+.hero-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 40px;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.hero-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.url-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.url-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 6px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13.5px;
+  color: var(--text-primary);
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--btn-border);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.url-chip:hover {
+  background-color: var(--btn-hover);
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+}
+
+/* Buttons */
+button {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  height: 36px;
+  padding: 0 16px;
+  border-radius: 6px;
+  border: 1px solid var(--btn-border);
+  background-color: var(--btn-bg);
+  color: var(--text-primary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+button:hover {
+  background-color: var(--btn-hover);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--focus-ring);
+  border-color: var(--accent-color);
+}
+
+button.primary {
+  background-color: var(--accent-color);
+  color: #FFFFFF;
+  border-color: transparent;
+}
+
+button.primary:hover {
+  background-color: var(--accent-hover);
+}
+
+/* Setting Sections */
+.setting-section {
+  margin-bottom: 56px;
+}
+
+.setting-section h2 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 0 24px 0;
+  color: var(--text-primary);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.section-caption {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.section-head h2 {
+  margin-bottom: 0;
+}
+
+/* Setting List */
+.setting-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.setting-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border-color);
+  gap: 32px;
+}
+
+.setting-item:first-child {
+  border-top: 1px solid var(--border-color);
+}
+
+.setting-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-label {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.setting-desc {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.setting-status {
+  font-weight: 600;
+}
+
+.setting-status.is-disabled {
+  color: var(--error-text);
+}
+
+.setting-status.is-enabled {
+  color: var(--accent-color);
+}
+
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+/* Inputs */
+input[type="number"],
+input[type="password"],
+input[type="text"] {
+  font-family: inherit;
+  font-size: 14px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--btn-border);
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  width: 220px;
+  transition: all 0.15s ease;
+}
+
+.plugin-dirs-row input[type="text"] {
+  width: 100%;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+}
+
+.plugin-dirs-row {
+  width: min(440px, 52vw);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+/* Segmented */
+.segmented {
+  display: inline-flex;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--btn-border);
+  border-radius: 6px;
+  padding: 3px;
+}
+
+.segmented label {
+  position: relative;
+  margin: 0;
+}
+
+.segmented input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.segmented span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 16px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.segmented input:checked + span {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* 防睡眠是二元状态，用紧凑开关减少设置区横向占用。 */
+.toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 46px;
+  height: 26px;
+  flex: 0 0 auto;
+}
+
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.toggle span {
+  position: relative;
+  width: 46px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid var(--btn-border);
+  background-color: var(--bg-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.toggle span::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background-color: #FFFFFF;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  transition: transform 0.15s ease;
+}
+
+.toggle input:checked + span {
+  border-color: var(--accent-color);
+  background-color: var(--accent-color);
+}
+
+.toggle input:checked + span::before {
+  transform: translateX(20px);
+}
+
+.toggle input:focus-visible + span {
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.toggle input:disabled + span {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+/* Value Display / Path Button */
+.setting-value {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13.5px;
+  color: var(--text-primary);
+}
+
+.path {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13.5px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  padding: 0;
+  height: auto;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+  transition: color 0.15s, text-decoration-color 0.15s;
+}
+
+.path:hover {
+  color: var(--accent-color);
+  background: transparent;
+  text-decoration-color: var(--accent-color);
+  transform: none;
+}
+
+.path:focus-visible {
+  box-shadow: none;
+  border-color: transparent;
+  text-decoration-color: var(--accent-color);
+}
+
+/* KV Overrides */
+.kv .setting-item {
+  padding: 16px 0;
+}
+.kv .setting-label {
+  color: var(--text-secondary);
+  font-weight: 400;
+  margin-bottom: 0;
+  flex: 0 0 140px;
+}
+.kv .setting-value,
+.kv .setting-control {
+  flex: 1;
+  justify-content: flex-end;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+
+.paths .setting-label {
+  flex: 0 0 140px;
+}
+
+/* 关于信息位于页面底部，去掉额外底部间距，让最后一组信息收束干净。 */
+.about-section {
+  margin-bottom: 0;
+}
+
+.about-list .external-link {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.about-list .external-link::after {
+  content: "↗";
+  margin-left: 6px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+@media (max-width: 640px) {
+  .hero-section {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .setting-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .setting-control {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  input[type="number"],
+  input[type="password"],
+  input[type="text"] {
+    width: 100%;
+    flex: 1;
+  }
+  .plugin-dirs-row {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .kv .setting-item {
+    flex-direction: row;
+    align-items: center;
+  }
+  .kv .setting-value,
+  .kv .setting-control {
+    text-align: right;
+  }
+}

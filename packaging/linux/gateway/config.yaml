@@ -1,0 +1,22 @@
+# codex-desktop 站点配置（桌面端 + 网关共用同一份规则源）。
+# 修改网关侧后执行 `codex-desktop-gateway restart` 生效；桌面端下次启动读取。
+
+# 可选访问口令：本机自查用；前置了带认证的反向代理时留空即可。
+auth:
+  password: ""
+
+# 界面上显示的 Codex / ChatGPT / OpenAI 文案与标识统一换成这个名字。
+brand:
+  name: "wdev"
+
+# 出站域名策略：命中 block 的域名一律本地拦截，不发真实请求，避免信息泄露。
+# 模型流量走本机代理，不经过浏览器出站通道，因此不需要（也不应该）写在这里。
+network:
+  block:
+    - "*.chatgpt.com"
+    - "chatgpt.com"
+    - "*.openai.com"
+    - "*.oaiusercontent.com"
+    - "*.statsig.com"
+    - "statsigapi.net"
+  allow: []

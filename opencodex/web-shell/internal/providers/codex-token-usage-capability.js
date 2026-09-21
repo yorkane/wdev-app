@@ -1,0 +1,831 @@
+(function () {
+  const w = window;
+  const modificationScope = w.__OpenCodexCurrentProviderScope;
+  const modificationEffects = modificationScope?.effects;
+  const scheduler = w.__OpenCodexAdapterHost?.scheduler?.capture?.() || w;
+  const providerGeneration = modificationScope?.generation || (typeof document !== "undefined" ? document : w);
+  if (
+    w.__OpenCodexTokenUsageCapabilityGeneration === providerGeneration &&
+    typeof w.__OpenCodexCreateTokenUsageCapability === "function"
+  ) return;
+  w.__OpenCodexTokenUsageCapabilityGeneration = providerGeneration;
+
+  w.__OpenCodexCreateTokenUsageCapability = function createOpenCodexTokenUsageCapability(options = {}) {
+    // 这里集中管理 token 用量数据的惰性查询、被动解析和有界缓存，避免 bridge polyfill 继续膨胀。
+    const TOKEN_USAGE_GLOBAL_CACHE_LIMIT = 500;
+    const TOKEN_USAGE_THREAD_CACHE_LIMIT = 100;
+    const TOKEN_USAGE_THREAD_STATE_LIMIT = 256;
+    const TOKEN_USAGE_PENDING_QUERY_LIMIT = 256;
+    const TOKEN_USAGE_TTL_MS = 24 * 60 * 60 * 1000;
+    // 新回复的最终 token_count 可能晚于操作栏出现；空结果只做瞬时缓存，交给 UI 的有界重试补齐。
+    const TOKEN_USAGE_NEGATIVE_TTL_MS = 2 * 1000;
+    const TOKEN_USAGE_TURN_ASSOCIATION_WINDOW_MS = 10 * 60 * 1000;
+    const TOKEN_USAGE_TREE_SCAN_LIMIT = 2000;
+    const TOKEN_USAGE_FETCH_TIMEOUT_MS = 12 * 1000;
+    const TOKEN_USAGE_PASSIVE_HINT_SCAN_LIMIT = 80;
+    const TOKEN_USAGE_PASSIVE_HINT_DEPTH_LIMIT = 3;
+    const TOKEN_USAGE_PASSIVE_HINT_RE =
+      /token_count|last_token_usage|lastTokenUsage|total_token_usage|totalTokenUsage|tokenUsage|token_usage|thread\/tokenUsage\/updated|turn\/started|turn\/completed|task_started|turn_started|task_complete|task_completed|task_failed|task_interrupted|turn_completed/;
+
+    function tokenUsageAuthHeaders(headers) {
+      if (typeof options.getAuthHeaders === "function") return options.getAuthHeaders(headers);
+      // capability 独立运行时仍保持同源请求；没有 bridge 认证助手时只透传调用方 headers。
+      return typeof Headers === "function" ? new Headers(headers || {}) : headers || {};
+    }
+
+    const tokenUsageState = {
+      activeTurnsByThread: new Map(),
+      // 主缓存按 threadId+turnId 存归一化后的数字；不保存原始 IPC payload 或消息正文。
+      cache: new Map(),
+      consumers: new Set(),
+      pendingQueries: new Map(),
+      pendingUsageByThread: new Map(),
+      recentTurnsByThread: new Map(),
+      subscribers: new Set(),
+      // threadKeys/turnKeys 是裁剪索引：支持按会话限额清理，也支持页面缺 threadId 时反查缓存。
+      threadKeys: new Map(),
+      turnKeys: new Map(),
+    };
+
+    const tokenUsageDiagnostics = {
+      cacheSize: 0,
+      consumers: 0,
+      lastFetchAt: 0,
+      lastFetchError: "",
+      lastFetchStatus: null,
+      lastFetchThreadId: "",
+      lastFetchTurnId: "",
+      lastFetchUsageFound: null,
+      passiveHandled: 0,
+      passiveSkipped: 0,
+      pendingQueries: 0,
+    };
+
+    w.__OpenCodexTokenUsage = tokenUsageDiagnostics;
+
+    function updateTokenUsageDiagnostics(values = {}) {
+      // 诊断对象只记录状态和数字，不记录 prompt、回复正文或工具输出。
+      Object.assign(tokenUsageDiagnostics, values, {
+        cacheSize: tokenUsageState.cache.size,
+        consumers: tokenUsageState.consumers.size,
+        pendingQueries: tokenUsageState.pendingQueries.size,
+      });
+    }
+
+    function normalizeTokenUsageId(value) {
+      if (value == null) return null;
+      const raw = String(value).trim();
+      if (!raw) return null;
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    }
+
+    function tokenUsageCacheKey(threadId, turnId) {
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      const normalizedTurnId = normalizeTokenUsageId(turnId);
+      if (!normalizedThreadId || !normalizedTurnId) return null;
+      // 使用不会出现在 ID 中的分隔符，避免普通字符串拼接造成 key 冲突。
+      return `${normalizedThreadId}\0${normalizedTurnId}`;
+    }
+
+    function tokenUsageQueryKey(threadId, turnId) {
+      const normalizedTurnId = normalizeTokenUsageId(turnId);
+      if (!normalizedTurnId) return null;
+      return `${normalizeTokenUsageId(threadId) || "__unknown_thread__"}\0${normalizedTurnId}`;
+    }
+
+    function tokenUsageConsumerActive() {
+      return tokenUsageState.consumers.size > 0;
+    }
+
+    function currentTokenUsageThreadId() {
+      const pathname = String(w.location?.pathname || "");
+      const patterns = [
+        /\/local\/([^/?#]+)/,
+        /\/hotkey-window\/thread\/([^/?#]+)/,
+        /\/thread\/([^/?#]+)/,
+        /\/conversation\/([^/?#]+)/,
+      ];
+      for (const pattern of patterns) {
+        const match = pattern.exec(pathname);
+        if (match?.[1]) return normalizeTokenUsageId(match[1]);
+      }
+      return null;
+    }
+
+    function tokenUsageNumber(value) {
+      const number = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+    }
+
+    function tokenUsageValueAtPath(object, path) {
+      let cursor = object;
+      for (const part of path) {
+        if (!cursor || typeof cursor !== "object" || !Object.prototype.hasOwnProperty.call(cursor, part)) {
+          return undefined;
+        }
+        cursor = cursor[part];
+      }
+      return cursor;
+    }
+
+    function tokenUsageNumberFromPaths(object, paths) {
+      if (!object || typeof object !== "object") return null;
+      for (const path of paths) {
+        const number = tokenUsageNumber(tokenUsageValueAtPath(object, path));
+        if (number != null) return number;
+      }
+      return null;
+    }
+
+    function normalizeTokenUsagePayload(rawUsage, threadId, turnId, source) {
+      if (!rawUsage || typeof rawUsage !== "object") return null;
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      const normalizedTurnId = normalizeTokenUsageId(turnId);
+      if (!normalizedThreadId || !normalizedTurnId) return null;
+      // 官方/网关/会话文件可能使用不同命名风格；统一兼容后只向插件输出稳定字段。
+      const inputTokens = tokenUsageNumberFromPaths(rawUsage, [
+        ["inputTokens"],
+        ["input_tokens"],
+        ["promptTokens"],
+        ["prompt_tokens"],
+        ["inputTokenCount"],
+        ["input_token_count"],
+        ["promptTokenCount"],
+        ["prompt_token_count"],
+        ["input", "tokens"],
+        ["input", "totalTokens"],
+        ["input", "total_tokens"],
+        ["input", "total"],
+        ["prompt", "tokens"],
+        ["prompt", "totalTokens"],
+        ["prompt", "total_tokens"],
+        ["prompt", "total"],
+      ]);
+      const outputTokens = tokenUsageNumberFromPaths(rawUsage, [
+        ["outputTokens"],
+        ["output_tokens"],
+        ["completionTokens"],
+        ["completion_tokens"],
+        ["outputTokenCount"],
+        ["output_token_count"],
+        ["completionTokenCount"],
+        ["completion_token_count"],
+        ["output", "tokens"],
+        ["output", "totalTokens"],
+        ["output", "total_tokens"],
+        ["output", "total"],
+        ["completion", "tokens"],
+        ["completion", "totalTokens"],
+        ["completion", "total_tokens"],
+        ["completion", "total"],
+      ]);
+      const cachedInputTokens = tokenUsageNumberFromPaths(rawUsage, [
+        ["cachedInputTokens"],
+        ["cached_input_tokens"],
+        ["cacheReadInputTokens"],
+        ["cache_read_input_tokens"],
+        ["cachedTokens"],
+        ["cached_tokens"],
+        ["inputTokensDetails", "cachedTokens"],
+        ["inputTokensDetails", "cached_tokens"],
+        ["input_tokens_details", "cachedTokens"],
+        ["input_tokens_details", "cached_tokens"],
+        ["promptTokensDetails", "cachedTokens"],
+        ["promptTokensDetails", "cached_tokens"],
+        ["prompt_tokens_details", "cachedTokens"],
+        ["prompt_tokens_details", "cached_tokens"],
+        ["input", "cachedTokens"],
+        ["input", "cached_tokens"],
+        ["prompt", "cachedTokens"],
+        ["prompt", "cached_tokens"],
+      ]);
+      if (inputTokens == null && outputTokens == null && cachedInputTokens == null) return null;
+      const cacheHitRate =
+        inputTokens != null && inputTokens > 0 && cachedInputTokens != null
+          ? Math.max(0, Math.min(1, cachedInputTokens / inputTokens))
+          : null;
+      return {
+        cacheHitRate,
+        cachedInputTokens,
+        inputTokens,
+        outputTokens,
+        source: String(source || "unknown"),
+        threadId: normalizedThreadId,
+        turnId: normalizedTurnId,
+        updatedAt: Date.now(),
+      };
+    }
+
+    function deleteTokenUsageCacheKey(key) {
+      const entry = tokenUsageState.cache.get(key);
+      tokenUsageState.cache.delete(key);
+      const threadId = entry?.threadId;
+      const turnId = entry?.value?.turnId;
+      if (turnId && tokenUsageState.turnKeys.get(turnId) === key) tokenUsageState.turnKeys.delete(turnId);
+      if (!threadId) return;
+      const keys = tokenUsageState.threadKeys.get(threadId);
+      if (!keys) return;
+      keys.delete(key);
+      if (keys.size === 0) tokenUsageState.threadKeys.delete(threadId);
+    }
+
+    function pruneTokenUsageCache(now = Date.now()) {
+      // 先清过期项，再按 Map 插入顺序裁剪最旧项，维持近似 LRU。
+      for (const [key, entry] of Array.from(tokenUsageState.cache.entries())) {
+        if (entry.expiresAt <= now) deleteTokenUsageCacheKey(key);
+      }
+      while (tokenUsageState.cache.size > TOKEN_USAGE_GLOBAL_CACHE_LIMIT) {
+        const oldestKey = tokenUsageState.cache.keys().next().value;
+        if (!oldestKey) break;
+        deleteTokenUsageCacheKey(oldestKey);
+      }
+    }
+
+    function pruneTokenUsageThreadCache(threadId) {
+      const keys = tokenUsageState.threadKeys.get(threadId);
+      if (!keys) return;
+      while (keys.size > TOKEN_USAGE_THREAD_CACHE_LIMIT) {
+        const oldestKey = keys.values().next().value;
+        if (!oldestKey) break;
+        deleteTokenUsageCacheKey(oldestKey);
+      }
+    }
+
+    function setTokenUsageCacheEntry(value) {
+      const key = tokenUsageCacheKey(value?.threadId, value?.turnId);
+      if (!key) return;
+      deleteTokenUsageCacheKey(key);
+      // 正向缓存命中后通知订阅者，已渲染的回复可以不用再发起 session API 请求。
+      const entry = {
+        expiresAt: Date.now() + TOKEN_USAGE_TTL_MS,
+        negative: false,
+        threadId: value.threadId,
+        updatedAt: Date.now(),
+        value,
+      };
+      tokenUsageState.cache.set(key, entry);
+      if (!tokenUsageState.threadKeys.has(value.threadId)) tokenUsageState.threadKeys.set(value.threadId, new Set());
+      tokenUsageState.threadKeys.get(value.threadId).add(key);
+      tokenUsageState.turnKeys.set(value.turnId, key);
+      pruneTokenUsageThreadCache(value.threadId);
+      pruneTokenUsageCache();
+      // 无论数据来自实时协议还是 session API，只有成功归一化并缓存后才算实际命中。
+      modificationEffects?.primary?.emit();
+      for (const subscriber of Array.from(tokenUsageState.subscribers)) {
+        try {
+          subscriber(value);
+        } catch (error) {
+          console.warn("[opencodex-token-usage] subscriber failed", error);
+        }
+      }
+    }
+
+    function setTokenUsageNegativeCache(threadId, turnId) {
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      const normalizedTurnId = normalizeTokenUsageId(turnId);
+      const key = tokenUsageCacheKey(normalizedThreadId, normalizedTurnId);
+      if (!key || !normalizedThreadId) return;
+      deleteTokenUsageCacheKey(key);
+      // 负缓存只保存短 TTL，避免不可用 turn 在滚动/重渲染时反复打后端。
+      tokenUsageState.cache.set(key, {
+        expiresAt: Date.now() + TOKEN_USAGE_NEGATIVE_TTL_MS,
+        negative: true,
+        threadId: normalizedThreadId,
+        updatedAt: Date.now(),
+        value: null,
+      });
+      if (!tokenUsageState.threadKeys.has(normalizedThreadId)) tokenUsageState.threadKeys.set(normalizedThreadId, new Set());
+      tokenUsageState.threadKeys.get(normalizedThreadId).add(key);
+      pruneTokenUsageThreadCache(normalizedThreadId);
+      pruneTokenUsageCache();
+    }
+
+    function getTokenUsageCacheEntry(threadId, turnId) {
+      // 页面没有 threadId 时按 turnId 找已解析缓存；后端响应会补齐真实 threadId。
+      const key = tokenUsageCacheKey(threadId, turnId) || tokenUsageState.turnKeys.get(normalizeTokenUsageId(turnId));
+      if (!key) return null;
+      const entry = tokenUsageState.cache.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt <= Date.now()) {
+        deleteTokenUsageCacheKey(key);
+        return null;
+      }
+      // Map 重新插入即可维持 LRU 顺序，避免额外维护访问时间索引。
+      tokenUsageState.cache.delete(key);
+      tokenUsageState.cache.set(key, entry);
+      return entry;
+    }
+
+    function clearTokenUsageThread(threadId) {
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      if (!normalizedThreadId) return;
+      for (const key of Array.from(tokenUsageState.threadKeys.get(normalizedThreadId) || [])) {
+        deleteTokenUsageCacheKey(key);
+      }
+      tokenUsageState.activeTurnsByThread.delete(normalizedThreadId);
+      tokenUsageState.recentTurnsByThread.delete(normalizedThreadId);
+      tokenUsageState.pendingUsageByThread.delete(normalizedThreadId);
+    }
+
+    function setBoundedTokenUsageThreadState(map, threadId, value) {
+      // 页面长期切换会话时只保留最近状态；过旧状态已经超过关联窗口，淘汰不会影响当前回合归属。
+      map.delete(threadId);
+      map.set(threadId, value);
+      while (map.size > TOKEN_USAGE_THREAD_STATE_LIMIT) {
+        const oldestThreadId = map.keys().next().value;
+        if (!oldestThreadId) break;
+        map.delete(oldestThreadId);
+      }
+    }
+
+    function rememberTokenUsageTurn(threadId, turnId, status) {
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      const normalizedTurnId = normalizeTokenUsageId(turnId);
+      if (!normalizedThreadId || !normalizedTurnId) return;
+      const record = { status: status || "unknown", seenAt: Date.now(), turnId: normalizedTurnId };
+      if (status === "completed" || status === "failed" || status === "interrupted") {
+        // 有些 token usage 通知先于 completed 到达；完成事件出现后再把暂存 usage 绑定到确定的 turn。
+        tokenUsageState.activeTurnsByThread.delete(normalizedThreadId);
+        setBoundedTokenUsageThreadState(tokenUsageState.recentTurnsByThread, normalizedThreadId, record);
+        const pending = tokenUsageState.pendingUsageByThread.get(normalizedThreadId);
+        if (pending && Date.now() - pending.seenAt <= TOKEN_USAGE_TURN_ASSOCIATION_WINDOW_MS) {
+          const normalized = normalizeTokenUsagePayload(pending.rawUsage, normalizedThreadId, normalizedTurnId, pending.source);
+          if (normalized) setTokenUsageCacheEntry(normalized);
+        }
+        // 无论是否仍在关联窗口内，完成事件都应结束该线程的暂存 usage 生命周期。
+        tokenUsageState.pendingUsageByThread.delete(normalizedThreadId);
+        return;
+      }
+      setBoundedTokenUsageThreadState(tokenUsageState.activeTurnsByThread, normalizedThreadId, record);
+      setBoundedTokenUsageThreadState(tokenUsageState.recentTurnsByThread, normalizedThreadId, record);
+    }
+
+    function recentTokenUsageTurnId(threadId) {
+      const normalizedThreadId = normalizeTokenUsageId(threadId);
+      if (!normalizedThreadId) return null;
+      const active = tokenUsageState.activeTurnsByThread.get(normalizedThreadId);
+      if (active && Date.now() - active.seenAt <= TOKEN_USAGE_TURN_ASSOCIATION_WINDOW_MS) return active.turnId;
+      if (active) tokenUsageState.activeTurnsByThread.delete(normalizedThreadId);
+      const recent = tokenUsageState.recentTurnsByThread.get(normalizedThreadId);
+      if (recent && Date.now() - recent.seenAt <= TOKEN_USAGE_TURN_ASSOCIATION_WINDOW_MS) return recent.turnId;
+      if (recent) tokenUsageState.recentTurnsByThread.delete(normalizedThreadId);
+      return null;
+    }
+
+    function tokenUsageNotificationFromObject(message) {
+      if (!message || typeof message !== "object") return [];
+      // 兼容 JSON-RPC、gateway 包装和 notification 包装三种通知形态。
+      if (typeof message.method === "string") return [message];
+      const notification = message.notification && typeof message.notification === "object" ? message.notification : null;
+      if (notification && typeof notification.method === "string") return [notification];
+      if (message.type === "notification" && message.params && typeof message.params === "object") {
+        const nested = message.params;
+        if (typeof nested.method === "string") {
+          return [{ method: nested.method, params: nested.params }];
+        }
+      }
+      return [];
+    }
+
+    function handleTokenUsageNotification(notification, source) {
+      if (!tokenUsageConsumerActive() || !notification || typeof notification !== "object") return;
+      const method = typeof notification.method === "string" ? notification.method : "";
+      const params = notification.params && typeof notification.params === "object" ? notification.params : {};
+      if (method === "turn/started") {
+        rememberTokenUsageTurn(params.threadId, params.turn?.id ?? params.turnId, params.turn?.status ?? "inProgress");
+        return;
+      }
+      if (method === "turn/completed") {
+        rememberTokenUsageTurn(params.threadId, params.turn?.id ?? params.turnId, params.turn?.status ?? "completed");
+        return;
+      }
+      if (method === "thread/archived" || method === "thread/deleted" || method === "thread/unsubscribed") {
+        clearTokenUsageThread(params.threadId);
+        return;
+      }
+      if (method !== "thread/tokenUsage/updated") return;
+      const threadId = normalizeTokenUsageId(params.threadId);
+      if (!threadId) return;
+      const rawUsage = params.tokenUsage || params.token_usage || params.usage;
+      const explicitTurnId =
+        params.turnId ??
+        params.turn_id ??
+        rawUsage?.turnId ??
+        rawUsage?.turn_id ??
+        rawUsage?.turn?.id ??
+        null;
+      const turnId = normalizeTokenUsageId(explicitTurnId) || recentTokenUsageTurnId(threadId);
+      if (!turnId) {
+        // 官方当前通知可能只有 threadId；没有活跃 turn 时先短暂暂存，等待 turn/completed 再绑定。
+        setBoundedTokenUsageThreadState(tokenUsageState.pendingUsageByThread, threadId, {
+          rawUsage,
+          seenAt: Date.now(),
+          source,
+        });
+        return;
+      }
+      const normalized = normalizeTokenUsagePayload(rawUsage, threadId, turnId, source);
+      if (normalized) {
+        tokenUsageState.pendingUsageByThread.delete(threadId);
+        setTokenUsageCacheEntry(normalized);
+      }
+    }
+
+    function tokenUsageEventPayloadFromMessage(message) {
+      if (!message || typeof message !== "object") return null;
+      if (message.type === "event_msg" && message.payload && typeof message.payload === "object") return message.payload;
+      if (typeof message.type === "string") return message;
+      return null;
+    }
+
+    function handleTokenUsageEventMessage(message, source, parentThreadId, parentTurnId) {
+      if (!tokenUsageConsumerActive() || !message || typeof message !== "object") return;
+      const event = tokenUsageEventPayloadFromMessage(message);
+      if (!event || typeof event !== "object") return;
+      const eventType = typeof event.type === "string" ? event.type : "";
+      // 被动事件不一定每层都带 threadId，向上继承容器 threadId，最后才回退到当前 URL。
+      const threadId =
+        normalizeTokenUsageId(
+          event.threadId ??
+            event.thread_id ??
+            event.conversationId ??
+            event.conversation_id ??
+            message.threadId ??
+            message.thread_id ??
+            message.conversationId ??
+            message.conversation_id ??
+            parentThreadId
+        ) || currentTokenUsageThreadId();
+      if (!threadId) return;
+      const turnId = normalizeTokenUsageId(
+        event.turnId ??
+          event.turn_id ??
+          message.turnId ??
+          message.turn_id ??
+          event.turn?.id ??
+          message.turn?.id ??
+          parentTurnId
+      );
+
+      if (eventType === "task_started" || eventType === "turn_started") {
+        rememberTokenUsageTurn(threadId, turnId, "inProgress");
+        return;
+      }
+      if (
+        eventType === "task_complete" ||
+        eventType === "task_completed" ||
+        eventType === "task_failed" ||
+        eventType === "task_interrupted" ||
+        eventType === "turn_completed"
+      ) {
+        rememberTokenUsageTurn(threadId, turnId, "completed");
+        return;
+      }
+      if (eventType !== "token_count") return;
+
+      // Codex 会话真实落盘的是 event_msg/token_count；按 last_token_usage 绑定到最近活跃 turn。
+      const rawUsage =
+        event.info?.last_token_usage ??
+        event.info?.lastTokenUsage ??
+        event.last_token_usage ??
+        event.lastTokenUsage ??
+        event.info?.total_token_usage ??
+        event.info?.totalTokenUsage ??
+        event.total_token_usage ??
+        event.totalTokenUsage ??
+        null;
+      const associatedTurnId = turnId || recentTokenUsageTurnId(threadId);
+      if (!associatedTurnId) {
+        setBoundedTokenUsageThreadState(tokenUsageState.pendingUsageByThread, threadId, {
+          rawUsage,
+          seenAt: Date.now(),
+          source,
+        });
+        return;
+      }
+      const normalized = normalizeTokenUsagePayload(rawUsage, threadId, associatedTurnId, source);
+      if (normalized) {
+        tokenUsageState.pendingUsageByThread.delete(threadId);
+        setTokenUsageCacheEntry(normalized);
+      }
+    }
+
+    function maybeTokenUsageContainerThreadId(object, parentThreadId) {
+      if (!object || typeof object !== "object") return parentThreadId;
+      const direct = object.threadId ?? object.thread_id ?? object.conversationId ?? object.conversation_id;
+      if (direct != null) return normalizeTokenUsageId(direct) || parentThreadId;
+      if (Array.isArray(object.turns) && object.id != null) return normalizeTokenUsageId(object.id) || parentThreadId;
+      return parentThreadId;
+    }
+
+    function maybeTokenUsageContainerTurnId(object, parentTurnId) {
+      if (!object || typeof object !== "object") return parentTurnId;
+      const direct = object.turnId ?? object.turn_id ?? object.turn?.id;
+      if (direct != null) return normalizeTokenUsageId(direct) || parentTurnId;
+      return parentTurnId;
+    }
+
+    function tokenUsagePayloadFromContainer(object) {
+      if (!object || typeof object !== "object") return null;
+      return object.tokenUsage || object.token_usage || object.usage || null;
+    }
+
+    function tokenUsageTextHasPassiveHint(value) {
+      return typeof value === "string" && TOKEN_USAGE_PASSIVE_HINT_RE.test(value);
+    }
+
+    function tokenUsageObjectHasPassiveHint(root) {
+      if (tokenUsageTextHasPassiveHint(root)) return true;
+      if (!root || typeof root !== "object") return false;
+      // 只做浅层、限量探测；没有 token 线索的 IPC 不进入昂贵 JSON 树遍历。
+      const visited = new WeakSet();
+      const stack = [{ depth: 0, value: root }];
+      let scanned = 0;
+      while (stack.length && scanned < TOKEN_USAGE_PASSIVE_HINT_SCAN_LIMIT) {
+        const current = stack.pop();
+        scanned += 1;
+        const value = current.value;
+        if (tokenUsageTextHasPassiveHint(value)) return true;
+        if (!value || typeof value !== "object") continue;
+        if (visited.has(value)) continue;
+        visited.add(value);
+        const available = Math.max(0, TOKEN_USAGE_PASSIVE_HINT_SCAN_LIMIT - scanned - stack.length);
+        if (available === 0) continue;
+        // 深度限制对数组和普通对象一致生效，避免嵌套对象从普通属性分支绕过浅层探测边界。
+        if (current.depth >= TOKEN_USAGE_PASSIVE_HINT_DEPTH_LIMIT) continue;
+        if (Array.isArray(value)) {
+          // 只把预算内的前部候选压栈，超宽数组不能先制造百万级临时 stack 再慢慢退出。
+          for (let index = Math.min(value.length, available) - 1; index >= 0; index -= 1) {
+            stack.push({ depth: current.depth + 1, value: value[index] });
+          }
+          continue;
+        }
+        const children = [];
+        for (const key in value) {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          if (tokenUsageTextHasPassiveHint(key)) return true;
+          const child = value[key];
+          if (tokenUsageTextHasPassiveHint(child)) return true;
+          children.push(child);
+          if (children.length >= available) break;
+        }
+        for (let index = children.length - 1; index >= 0; index -= 1) {
+          // 原始值也进入统一预算；大量字符串/数字字段不能绕过只统计对象的上限。
+          stack.push({ depth: current.depth + 1, value: children[index] });
+        }
+      }
+      return false;
+    }
+
+    function shouldHandleTokenUsagePassiveMessage(message) {
+      // 被动通道只做轻量表层筛选；真正展示仍以按 turnId 懒查询为主，避免每条官方 IPC 都深扫对象树。
+      return tokenUsageObjectHasPassiveHint(message);
+    }
+
+    function markTokenUsagePassiveSkipped() {
+      tokenUsageDiagnostics.passiveSkipped += 1;
+    }
+
+    function markTokenUsagePassiveHandled() {
+      tokenUsageDiagnostics.passiveHandled += 1;
+    }
+
+    function collectTokenUsageFromTree(root, source, initialThreadId = null, initialTurnId = null) {
+      if (!tokenUsageConsumerActive() || !root || typeof root !== "object") return;
+      // 被动解析是优化路径：能从实时 IPC 里拿到就提前缓存，拿不到仍由 getForTurn 懒查 session API。
+      const visited = new WeakSet();
+      const stack = [{ depth: 0, threadId: initialThreadId, turnId: initialTurnId, value: root }];
+      let scanned = 0;
+      let inspectedChildren = 0;
+      while (stack.length && scanned < TOKEN_USAGE_TREE_SCAN_LIMIT) {
+        const current = stack.pop();
+        const value = current.value;
+        if (!value || typeof value !== "object") continue;
+        if (visited.has(value)) continue;
+        visited.add(value);
+        scanned += 1;
+        const threadId = maybeTokenUsageContainerThreadId(value, current.threadId);
+        const turnId = maybeTokenUsageContainerTurnId(value, current.turnId);
+        // 批消息中的 JSON-RPC notification 也复用这次有界遍历，不能在数组外再逐项深扫一遍。
+        tokenUsageNotificationFromObject(value).forEach((notification) =>
+          handleTokenUsageNotification(notification, source)
+        );
+        handleTokenUsageEventMessage(value, source, threadId, turnId);
+        const rawUsage = tokenUsagePayloadFromContainer(value);
+        if (rawUsage && threadId && turnId) {
+          const normalized = normalizeTokenUsagePayload(rawUsage, threadId, turnId, source);
+          if (normalized) setTokenUsageCacheEntry(normalized);
+        }
+        if (current.depth >= 6) continue;
+        if (inspectedChildren >= TOKEN_USAGE_TREE_SCAN_LIMIT) continue;
+        if (Array.isArray(value)) {
+          const childCount = Math.min(value.length, TOKEN_USAGE_TREE_SCAN_LIMIT - inspectedChildren);
+          inspectedChildren += childCount;
+          // 限制一次展开宽度，避免异常列表在对象扫描上限生效前先占满内存。
+          for (let index = childCount - 1; index >= 0; index -= 1) {
+            const child = value[index];
+            if (child && typeof child === "object") {
+              stack.push({ depth: current.depth + 1, threadId, turnId, value: child });
+            }
+          }
+          continue;
+        }
+        for (const key in value) {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          inspectedChildren += 1;
+          const child = value[key];
+          if (child && typeof child === "object") {
+            stack.push({ depth: current.depth + 1, threadId, turnId, value: child });
+          }
+          if (inspectedChildren >= TOKEN_USAGE_TREE_SCAN_LIMIT) break;
+        }
+      }
+    }
+
+    function handleTokenUsageProtocolMessage(message, source, prechecked) {
+      if (!tokenUsageConsumerActive() || !message) return;
+      if (!prechecked && !shouldHandleTokenUsagePassiveMessage(message)) {
+        markTokenUsagePassiveSkipped();
+        return;
+      }
+      if (typeof message !== "object") return;
+      markTokenUsagePassiveHandled();
+      const treeRoot = message.result ?? message.payload ?? message;
+      // result/payload 包装之外的 notification 仍需先处理；根对象自身则由 collect 统一处理，避免重复回执。
+      if (treeRoot !== message) {
+        tokenUsageNotificationFromObject(message).forEach((notification) =>
+          handleTokenUsageNotification(notification, source)
+        );
+      }
+      // 只扫描原有 result/payload 子树，同时把 wrapper 上的会话标识传入，兼容新版结构化 envelope。
+      const initialThreadId =
+        message.threadId ?? message.thread_id ?? message.conversationId ?? message.conversation_id ?? null;
+      const initialTurnId = message.turnId ?? message.turn_id ?? message.turn?.id ?? null;
+      collectTokenUsageFromTree(treeRoot, source, initialThreadId, initialTurnId);
+    }
+
+    function handleTokenUsageAppHostData(data, rawFrame = data, decodeFrame = null) {
+      if (!tokenUsageConsumerActive()) return;
+      if (data && typeof data === "object") {
+        // 共享 ProtocolPipeline 已完成一次解码；仍沿用原关键词/结构过滤，命中口径不变。
+        if (typeof rawFrame === "string" && !tokenUsageTextHasPassiveHint(rawFrame)) {
+          markTokenUsagePassiveSkipped();
+          return;
+        }
+        if (!shouldHandleTokenUsagePassiveMessage(data)) {
+          markTokenUsagePassiveSkipped();
+          return;
+        }
+        handleTokenUsageProtocolMessage(data, "app-host", true);
+        return;
+      }
+      if (typeof data !== "string" || !data.trim()) return;
+      if (!tokenUsageTextHasPassiveHint(data)) {
+        markTokenUsagePassiveSkipped();
+        return;
+      }
+      try {
+        // app-host 通道是字符串帧，只有命中 token 关键词后才 parse，避免每条 RPC 都 JSON.parse。
+        const decoded = typeof decodeFrame === "function" ? decodeFrame() : JSON.parse(data);
+        handleTokenUsageProtocolMessage(decoded, "app-host", true);
+      } catch {}
+    }
+
+    function handleTokenUsageGatewayPayload(payload) {
+      if (!tokenUsageConsumerActive() || !payload || typeof payload !== "object") return;
+      if (!shouldHandleTokenUsagePassiveMessage(payload)) {
+        markTokenUsagePassiveSkipped();
+        return;
+      }
+      handleTokenUsageProtocolMessage(payload, "gateway", true);
+    }
+
+    async function fetchTokenUsageForTurn(threadId, turnId) {
+      if (!tokenUsageConsumerActive()) return null;
+      // 使用当前页面同源 API，避免 gatewayBaseUrl 主机名差异导致鉴权 cookie 没有随请求发送。
+      const url = new URL("/api/token-usage", w.location.origin);
+      if (threadId) url.searchParams.set("threadId", threadId);
+      url.searchParams.set("turnId", turnId);
+      updateTokenUsageDiagnostics({
+        lastFetchAt: Date.now(),
+        lastFetchError: "",
+        lastFetchStatus: "pending",
+        lastFetchThreadId: String(threadId || ""),
+        lastFetchTurnId: String(turnId || ""),
+        lastFetchUsageFound: null,
+      });
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const releaseController = controller && modificationScope?.own
+        ? modificationScope.own(() => controller.abort())
+        : null;
+      // 未知 threadId 的冷查询可能需要索引 sessions；后端命中缓存后同屏后续请求会快速返回。
+      const timer = controller ? scheduler.setTimeout(() => controller.abort(), TOKEN_USAGE_FETCH_TIMEOUT_MS) : null;
+      try {
+        const response = await fetch(url.toString(), {
+          cache: "no-store",
+          credentials: "same-origin",
+          // token 用量接口在 auth gate 后面；显式带运行期 token，避免 cookie 竞态导致静默 401。
+          headers: tokenUsageAuthHeaders(),
+          signal: controller?.signal,
+        });
+        if (!response.ok) {
+          updateTokenUsageDiagnostics({ lastFetchStatus: response.status, lastFetchUsageFound: false });
+          return null;
+        }
+        const payload = await response.json();
+        const resolvedThreadId = payload?.usage?.threadId ?? payload?.threadId ?? threadId;
+        const resolvedTurnId = payload?.usage?.turnId ?? payload?.turnId ?? turnId;
+        const usage = normalizeTokenUsagePayload(payload?.usage, resolvedThreadId, resolvedTurnId, "session-api");
+        updateTokenUsageDiagnostics({ lastFetchStatus: response.status, lastFetchUsageFound: !!usage });
+        return usage;
+      } catch (error) {
+        updateTokenUsageDiagnostics({
+          lastFetchError: error?.message || String(error || "token usage fetch failed"),
+          lastFetchStatus: "error",
+          lastFetchUsageFound: false,
+        });
+        return null;
+      } finally {
+        if (timer) scheduler.clearTimeout(timer);
+        releaseController?.();
+      }
+    }
+
+    const tokenUsageCapability = Object.freeze({
+      handleAppHostData: handleTokenUsageAppHostData,
+      handleGatewayPayload: handleTokenUsageGatewayPayload,
+      acquireConsumer(consumerId) {
+        const id = String(consumerId || "").trim();
+        if (!id) return () => {};
+        tokenUsageState.consumers.add(id);
+        pruneTokenUsageCache();
+        updateTokenUsageDiagnostics();
+        return () => tokenUsageCapability.releaseConsumer(id);
+      },
+      getForTurn(request) {
+        const threadId = normalizeTokenUsageId(request?.threadId);
+        const turnId = normalizeTokenUsageId(request?.turnId);
+        const key = tokenUsageQueryKey(threadId, turnId);
+        if (!key || !turnId) return Promise.resolve(null);
+        const cached = getTokenUsageCacheEntry(threadId, turnId);
+        updateTokenUsageDiagnostics();
+        if (cached) return Promise.resolve(cached.negative ? null : cached.value);
+        // 同一回复的并发请求共用一个 Promise，避免多个可见 badge 同时触发重复后端查询。
+        if (tokenUsageState.pendingQueries.has(key)) return tokenUsageState.pendingQueries.get(key);
+        if (tokenUsageState.pendingQueries.size >= TOKEN_USAGE_PENDING_QUERY_LIMIT) {
+          // 可见回复异常暴增时优先等待下一次滚动重试，避免同时保留无限 fetch/AbortController。
+          updateTokenUsageDiagnostics({ lastFetchError: "token usage query limit exceeded" });
+          return Promise.resolve(null);
+        }
+        const pending = fetchTokenUsageForTurn(threadId, turnId)
+          .then((usage) => {
+            const refreshed = getTokenUsageCacheEntry(threadId, turnId);
+            if (refreshed) return refreshed.negative ? null : refreshed.value;
+            if (usage) {
+              // 插件在请求途中被停用时，已发出的 fetch 仍可能完成；零消费者状态不得重新回填已释放的缓存。
+              if (!tokenUsageConsumerActive()) return null;
+              setTokenUsageCacheEntry(usage);
+              return usage;
+            }
+            if (!tokenUsageConsumerActive()) return null;
+            if (threadId) setTokenUsageNegativeCache(threadId, turnId);
+            return null;
+          })
+          .finally(() => {
+            tokenUsageState.pendingQueries.delete(key);
+            updateTokenUsageDiagnostics();
+          });
+        tokenUsageState.pendingQueries.set(key, pending);
+        updateTokenUsageDiagnostics();
+        return pending;
+      },
+      onUpdate(handler) {
+        if (typeof handler !== "function") return () => {};
+        tokenUsageState.subscribers.add(handler);
+        return () => tokenUsageState.subscribers.delete(handler);
+      },
+      releaseConsumer(consumerId) {
+        const id = String(consumerId || "").trim();
+        if (!id) return;
+        tokenUsageState.consumers.delete(id);
+        if (tokenUsageState.consumers.size === 0) {
+          // 没有插件消费时清空运行期 token 数据，避免后台继续持有无需展示的用量记录。
+          tokenUsageState.activeTurnsByThread.clear();
+          tokenUsageState.cache.clear();
+          tokenUsageState.pendingUsageByThread.clear();
+          tokenUsageState.pendingQueries.clear();
+          tokenUsageState.recentTurnsByThread.clear();
+          tokenUsageState.threadKeys.clear();
+          tokenUsageState.turnKeys.clear();
+        }
+        updateTokenUsageDiagnostics();
+      },
+    });
+
+    return tokenUsageCapability;
+  };
+})();

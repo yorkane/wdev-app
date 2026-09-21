@@ -1,0 +1,4 @@
+{
+  "plugin.tokenUsageInline.label": "Show token usage",
+  "plugin.tokenUsageInline.desc": "Shows input tokens, output tokens, and cache hit rate under AI responses."
+}

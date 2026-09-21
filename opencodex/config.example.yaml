@@ -1,0 +1,19 @@
+auth:
+  password: "your-password"
+
+# 品牌名：替换界面上显示的 Codex / ChatGPT / OpenAI 文案与标识。
+# 不配置时保持历史默认值 OpenCodex；也可用环境变量 OPENCODEX_BRAND_NAME 覆盖。
+brand:
+  name: "wdev"
+
+# 出站域名策略：除模型服务外，浏览器与隐藏 Runtime 发起的外部请求都经过这张清单。
+# block 命中即本地拦截（不发真实请求），allow 用于在被拉黑的域族里开洞。
+# 支持精确主机名与 *.example.com 通配（通配只匹配子域，不含顶级域本身）。
+network:
+  block:
+    # - "*.chatgpt.com"
+    # - "chatgpt.com"
+    # - "*.openai.com"
+    # - "*.statsig.com"
+    # - "statsigapi.net"
+  allow: []

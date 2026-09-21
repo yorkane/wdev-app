@@ -1,0 +1,95 @@
+:root {
+  --opencodex-wco-env-titlebar-x: env(titlebar-area-x, 0px);
+  --opencodex-wco-env-titlebar-width: env(titlebar-area-width, 100vw);
+  --opencodex-wco-env-left: var(--opencodex-wco-env-titlebar-x);
+  --opencodex-wco-env-right: max(0px, calc(100vw - var(--opencodex-wco-env-titlebar-x) - var(--opencodex-wco-env-titlebar-width)));
+  --opencodex-wco-env-top: env(titlebar-area-y, 0px);
+  --opencodex-wco-env-height: env(titlebar-area-height, 0px);
+  --opencodex-wco-left: var(--opencodex-wco-env-left);
+  --opencodex-wco-right: var(--opencodex-wco-env-right);
+  --opencodex-wco-top: var(--opencodex-wco-env-top);
+  --opencodex-wco-height: var(--opencodex-wco-env-height);
+  --opencodex-wco-titlebar-x: var(--opencodex-wco-env-titlebar-x);
+  --opencodex-wco-titlebar-width: var(--opencodex-wco-env-titlebar-width);
+  --opencodex-wco-right-slot-width: 0px;
+  --opencodex-wco-titlebar-background: transparent;
+  --opencodex-wco-titlebar-left-background: var(--opencodex-wco-titlebar-background);
+  --opencodex-wco-titlebar-right-background: var(--opencodex-wco-titlebar-background);
+}
+:root[data-opencodex-wco-visible="true"][data-opencodex-wco-titlebar-scheme="dark"] {
+  /* 普通 WCO 标题栏按当前应用表面色同步明暗方案，避免系统按钮继续按浅色绘制。 */
+  color-scheme: dark !important;
+}
+:root[data-opencodex-wco-visible="true"][data-opencodex-wco-titlebar-scheme="light"] {
+  color-scheme: light !important;
+}
+:root[data-opencodex-wco-visible="true"] body::before {
+  /* WCO 左右系统按钮区域不属于应用 header，用实际采样到的页面底色补齐整条标题栏。 */
+  background:
+    linear-gradient(
+      to right,
+      var(--opencodex-wco-titlebar-left-background) 0 var(--opencodex-wco-titlebar-x),
+      var(--opencodex-wco-titlebar-background) var(--opencodex-wco-titlebar-x) calc(var(--opencodex-wco-titlebar-x) + var(--opencodex-wco-titlebar-width)),
+      var(--opencodex-wco-titlebar-right-background) calc(var(--opencodex-wco-titlebar-x) + var(--opencodex-wco-titlebar-width)) 100%
+    );
+  content: "";
+  height: max(48px, calc(var(--opencodex-wco-top) + var(--opencodex-wco-height)));
+  inset-inline: 0;
+  inset-block-start: 0;
+  pointer-events: none;
+  position: fixed;
+}
+:root[data-opencodex-wco-visible="true"] header[data-app-shell-header-edge-scroll],
+:root[data-opencodex-wco-visible="true"] header[data-app-shell-header-edge-scroll] * {
+  /* header 自身已经被限制到 WCO 可用矩形内，内部 safe padding 继续叠加会制造左侧空白。 */
+  --spacing-token-safe-header-left: 0px !important;
+  --spacing-token-safe-header-right: 0px !important;
+}
+:root[data-opencodex-wco-visible="true"] header[data-app-shell-header-edge-scroll] {
+  /* 参考 WCO 示例页：直接把 header 放进 titlebar-area-x/width 描述的可用标题栏区域。 */
+  inset-inline-start: var(--opencodex-wco-titlebar-x) !important;
+  inset-inline-end: auto !important;
+  inline-size: var(--opencodex-wco-titlebar-width) !important;
+  max-inline-size: var(--opencodex-wco-titlebar-width) !important;
+  left: var(--opencodex-wco-titlebar-x) !important;
+  right: auto !important;
+  width: var(--opencodex-wco-titlebar-width) !important;
+  max-width: var(--opencodex-wco-titlebar-width) !important;
+  overflow: hidden !important;
+}
+:root[data-opencodex-wco-visible="true"] header[data-app-shell-header-edge-scroll] > [data-opencodex-wco-right-slot="true"] {
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+}
+:root[data-opencodex-wco-visible="true"] header[data-app-shell-header-edge-scroll] > [data-opencodex-wco-right-slot="true"][data-opencodex-wco-align-right-panel="true"] {
+  /* 按侧栏与 WCO 可用标题栏的交叠宽度占位，让主区操作停在真实分割线左侧。 */
+  flex: 0 0 var(--opencodex-wco-right-slot-width) !important;
+  inline-size: var(--opencodex-wco-right-slot-width) !important;
+  width: var(--opencodex-wco-right-slot-width) !important;
+}
+:root[data-opencodex-wco-visible="true"] [data-opencodex-wco-right-panel-toolbar="true"] {
+  /* 工具条留在自己的分栏内，仅避让右侧 Chrome 控件，不能跨过分栏边界向左移动。 */
+  box-sizing: border-box !important;
+  padding-right: max(0.5rem, calc(var(--opencodex-wco-right) + 0.5rem)) !important;
+}
+:root[data-opencodex-wco-visible="true"][data-opencodex-wco-image-preview-open="true"][data-opencodex-wco-image-preview-scheme="dark"] {
+  /* 图片预览遮罩色由官方 overlay 计算得出，这里只同步明暗方案给 WCO。 */
+  color-scheme: dark !important;
+}
+:root[data-opencodex-wco-visible="true"][data-opencodex-wco-image-preview-open="true"][data-opencodex-wco-image-preview-scheme="light"] {
+  color-scheme: light !important;
+}
+:root[data-opencodex-wco-visible="true"][data-opencodex-wco-image-preview-open="true"] body::before {
+  /* 图片预览打开时覆盖普通标题栏补底，使用官方遮罩的 computed color。 */
+  background: var(--opencodex-wco-image-preview-scrim, var(--opencodex-wco-titlebar-background));
+  z-index: 31;
+}
+:root[data-opencodex-wco-visible="true"] [data-opencodex-wco-image-preview="true"] {
+  /* 确保图片预览内容压过上面的标题栏补底层。 */
+  z-index: 32;
+}
+:root[data-opencodex-wco-visible="true"] [data-opencodex-wco-image-preview-controls="true"] {
+  /* 图片预览自己的右上角按钮需要避开 Chrome 的 WCO 菜单/插件按钮。 */
+  right: max(0.75rem, calc(var(--opencodex-wco-right) + 0.75rem)) !important;
+  top: max(0.75rem, calc(var(--opencodex-wco-top) + 0.75rem)) !important;
+}

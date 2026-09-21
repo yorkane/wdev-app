@@ -34,7 +34,7 @@ esac; \
 printf '%s\n' "$$format"
 endef
 
-.PHONY: help check test ci-pr ci-all build-updater maybe-build-updater build-native-feature-helpers update rebuild rebuild-install inspect-upstream build-app build-app-fresh setup-native bootstrap-native install-native update-native rebuild-next run-app deb rpm pacman appimage package install service-enable service-status clean-dist clean-state
+.PHONY: help check test ci-pr ci-all build-updater maybe-build-updater build-native-feature-helpers gateway-build update rebuild rebuild-install inspect-upstream build-app build-app-fresh setup-native bootstrap-native install-native update-native rebuild-next run-app deb rpm pacman appimage package install service-enable service-status clean-dist clean-state
 
 help:
 	@printf '\nChatGPT Community from the official OpenAI Linux package\n\n'
@@ -67,6 +67,12 @@ build-updater:
 
 maybe-build-updater:
 	@case "$(PACKAGE_WITH_UPDATER)" in 0|false|no|off) echo '[make] updater omitted' ;; *) $(MAKE) build-updater ;; esac
+
+# GATEWAY_MARKER build the vendored opencodex gateway: tsc dist + production dependency
+# closure + bundled portable node runtime (npmmirror). Env: GATEWAY_NODE_VERSION (v24.20.0),
+# GATEWAY_NODE_BASE_URL (https://registry.npmmirror.com/-/binary/node).
+gateway-build:
+	bash opencodex/build-gateway.sh
 
 build-native-feature-helpers:
 	@set -e; config="$${CODEX_LINUX_FEATURES_CONFIG:-linux-features/features.json}"; \
@@ -120,6 +126,11 @@ run-app:
 	"$(APP_DIR)/start.sh"
 
 deb: maybe-build-updater
+	@# GATEWAY_MARKER single deb ships desktop app + browser gateway: auto-build the gateway tree when missing
+	@if [ ! -f opencodex/gateway/dist/modification/catalog.js ] || [ ! -x opencodex/.build/node/bin/node ] || [ ! -d opencodex/.build/node_modules ]; then \
+	  echo '[make] gateway build tree missing, running make gateway-build'; \
+	  $(MAKE) gateway-build; \
+	fi
 	MAX_BUILD_THREADS="$(MAX_BUILD_THREADS)" PACKAGE_VERSION="$(or $(PACKAGE_VERSION),)" PACKAGE_WITH_UPDATER="$(PACKAGE_WITH_UPDATER)" ./scripts/build-deb.sh
 
 rpm: maybe-build-updater

@@ -1,0 +1,18 @@
+# codex-desktop 网关段：移除/清除后的收尾；purge 时连同状态目录与服务账户一起清理。
+STATE_DIR=/var/lib/codex-desktop
+LOG_DIR=/var/log/codex-desktop
+case "${1:-}" in
+    remove|deconfigure|disappear)
+        systemctl disable codex-desktop-gateway.service codex-desktop-xvfb.service >/dev/null 2>&1 || true
+        ;;
+    purge)
+        rm -rf "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
+        if getent passwd codex-desktop >/dev/null 2>&1; then
+            deluser codex-desktop >/dev/null 2>&1 || true
+        fi
+        if getent group codex-desktop >/dev/null 2>&1; then
+            delgroup codex-desktop >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+systemctl daemon-reload >/dev/null 2>&1 || true

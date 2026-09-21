@@ -1,0 +1,4 @@
+{
+  "plugin.iosFix.label": "iOS compatibility fix",
+  "plugin.iosFix.desc": "Fixes iOS viewport height, bottom chrome overlap, and duplicate soft-keyboard avoidance."
+}

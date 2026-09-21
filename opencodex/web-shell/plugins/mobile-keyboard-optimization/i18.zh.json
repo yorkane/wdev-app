@@ -1,0 +1,4 @@
+{
+  "plugin.mobileKeyboardOptimization.label": "移动端软键盘优化",
+  "plugin.mobileKeyboardOptimization.desc": "优化移动端输入框聚焦和视口高度，减少软键盘遮挡。"
+}
