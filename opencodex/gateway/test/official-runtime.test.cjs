@@ -20,6 +20,7 @@ const {
   __test: statsigNetTest,
   installOfficialNetFetchStatsigHook,
 } = require("../runtime/electron/official-net-fetch-statsig-hook.cjs");
+const { clearSiteConfigCache, getSiteConfig } = require("../runtime/core/site-config.cjs");
 
 test("Statsig net.fetch hook answers control-plane URLs locally and passes others through", () => {
   const { statsigLocalResponseBodyForUrl, buildStatsigInitializeNetResponse } = statsigNetTest;

@@ -99,7 +99,21 @@ function inlinedStatsig() {
 
 function inlinedHostMatch() {
   const source = cjsSource("lib/host-match.js");
-  return ["hostMatchesPattern", "isBlockedUrl"].map((name) => extractDeclaration(source, name)).join("\n\n");
+  // Keep in sync with the hostMatch list in main-runtime.js: a missing entry
+  // is a ReferenceError at runtime install (BRAND_NAME_MAX_LENGTH regression).
+  return [
+    "hostMatchesPattern",
+    "normalizeHostPattern",
+    "isBlockedUrl",
+    "parseAllowPathRule",
+    "normalizeAllowPathList",
+    "UNSAFE_GLOB_CHARS",
+    "escapeGlobChar",
+    "pathMatchesGlob",
+    "hostPathMatchesAllowPath",
+    "urlMatchesAllowPath",
+    "urlPolicy",
+  ].map((name) => extractDeclaration(source, name)).join("\n\n");
 }
 
 function normalizeConfig(manifestDefaults, settings) {

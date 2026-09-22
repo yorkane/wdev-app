@@ -63,6 +63,11 @@ const { createWsHub } = require("./ipc/ws-hub.cjs");
 const { workspaceRootsFromIpcPayload } = require("./ipc/workspace-root-context.cjs");
 const { createWorkspaceRootsService } = require("./ipc/workspace-roots.cjs");
 const { diagnosticError, diagnosticLog, diagnosticWarn, sanitizeDiagnosticValue, shortId } = require("./core/diagnostics.cjs");
+const {
+  appendAuditEvent,
+  rotateAuditLog,
+} = require("./core/network-audit.cjs");
+const { getSiteConfig } = require("./core/site-config.cjs");
 const { markGatewaySilentQuit } = require("./lifecycle/quit-confirmation-suppressor.cjs");
 const { createGatewayPluginService } = require("./plugins/service.cjs");
 const { createCompatibilityService } = require("./compatibility/service.cjs");
@@ -835,6 +840,23 @@ async function createGateway() {
    * 4. 把 WebSocket hub 注入 runtime，用于官方异步回包转发。
   */
   ensureDir(REPORTS_DIR);
+  // 审计日志启动轮转：超过 8 MiB 时 network-audit.jsonl -> .1（覆盖旧的）；
+  // 同时把本次启动生效的出站策略记一条 config 审计事件，供升级后回溯「当时拦了什么」。
+  try {
+    const { auditLogPathFromEnv } = require("./core/network-audit.cjs");
+    const siteConfig = getSiteConfig();
+    rotateAuditLog(auditLogPathFromEnv());
+    appendAuditEvent("config", "gateway-net-fetch", {
+      host: "",
+      path: "",
+      method: "",
+      blocked: siteConfig.network.blockedHosts.length,
+      allowed: siteConfig.network.allowedHosts.length,
+      allowedPaths: siteConfig.network.allowedPaths.length,
+    });
+  } catch {
+    // 审计是旁路能力：任何异常都不能阻断网关启动。
+  }
   let compatibilityService = null;
   try {
     compatibilityService = createGatewayCompatibilityService();

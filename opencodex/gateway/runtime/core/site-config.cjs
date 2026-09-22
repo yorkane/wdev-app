@@ -232,6 +232,100 @@ function normalizeHostList(value) {
   return result;
 }
 
+/**
+ * 解析一条 allowPaths 规则。
+ * 规范：一条规则 = <hostPattern>/<pathGlob>，按**第一个** / 切分；
+ * 没有 / 的条目视为 host-only（等价 allow，path 为 null）。
+ * host 复用 normalizeHostPattern 的归一化（剥 scheme/端口/路径、小写）；
+ * path 剥掉 query/fragment 后仍为空则整条规则丢弃（返回 null），配置写坏不影响启动。
+ */
+function parseAllowPathRule(value) {
+  const raw = String(value == null ? "" : value).trim();
+  if (!raw) return null;
+  const slashIndex = raw.indexOf("/");
+  const hostPart = slashIndex === -1 ? raw : raw.slice(0, slashIndex);
+  const pathPart = slashIndex === -1 ? "" : raw.slice(slashIndex + 1);
+  const host = normalizeHostPattern(hostPart);
+  if (!host) return null;
+  // path 只匹配 URL 的 pathname：配置里误带的 query/fragment 直接剥掉。
+  const path = pathPart.replace(/[?#].*$/, "").trim();
+  if (slashIndex !== -1 && !path) return null;
+  return Object.freeze({ host, path: path || null });
+}
+
+/** 归一化 allowPaths 列表：逐条解析、非法丢弃、按 host|path 去重保序。 */
+function normalizeAllowPathList(value) {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const result = [];
+  for (const item of source) {
+    const rule = parseAllowPathRule(item);
+    if (!rule) continue;
+    const key = rule.host + "|" + (rule.path || "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(rule);
+  }
+  return result;
+}
+
+// 这些字符出现在 glob 里必须转义，否则会被 RegExp 当成元字符。
+const UNSAFE_GLOB_CHARS = new Set([".", "*", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);
+
+function escapeGlobChar(char) {
+  return UNSAFE_GLOB_CHARS.has(char) ? "\\" + char : char;
+}
+
+/**
+ * pathGlob 匹配 URL pathname：大小写敏感、只看 pathname（天然忽略 query）。
+ * * 匹配任意长度字符（含 /），其余按字面量；实现是「逐字符转义后拼正则」。
+ */
+function pathMatchesGlob(pathname, pathGlob) {
+  // URL pathname 带前导 /（如 /backend-api/x），配置 glob 可能带也可能不带（backend-api/* 与
+  // /backend-api/* 等价）；两边统一剥掉前导 / 再比较，避免同一规则因写法不同行为分叉。
+  const path = String(pathname == null ? "" : pathname).replace(/^\//, "");
+  const glob = String(pathGlob == null ? "" : pathGlob).replace(/^\//, "");
+  if (!glob) return false;
+  let source = "";
+  for (let i = 0; i < glob.length; i += 1) {
+    source += glob[i] === "*" ? ".*" : escapeGlobChar(glob[i]);
+  }
+  try {
+    return new RegExp("^" + source + "$").test(path);
+  } catch {
+    return false;
+  }
+}
+
+/** host+pathname 是否命中某条 allowPaths 规则；host 匹配大小写不敏感，path 匹配大小写敏感。 */
+function hostPathMatchesAllowPath(host, pathname, allowedPaths) {
+  const rules = Array.isArray(allowedPaths) ? allowedPaths : [];
+  const value = String(host || "").toLowerCase();
+  if (!value) return false;
+  // URL pathname 带前导 /（如 /backend-api/x），而配置 glob 通常不带（backend-api/*）；
+  // 匹配前剥掉前导 /，两者在同一形状下比较。
+  const barePath = String(pathname || "").replace(/^\//, "");
+  return rules.some(
+    (rule) =>
+      rule &&
+      hostMatchesPattern(value, rule.host) &&
+      (!rule.path || pathMatchesGlob(barePath, rule.path))
+  );
+}
+
+/** URL 是否命中 allowPaths 清单；解析不出 http(s) URL 的输入一律 false。 */
+function urlMatchesAllowPath(rawUrl, allowedPaths) {
+  if (!Array.isArray(allowedPaths) || !allowedPaths.length) return false;
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  return hostPathMatchesAllowPath(parsed.hostname, parsed.pathname, allowedPaths);
+}
+
 const EXPECTED_BLOCKS = ["brand", "network"];
 // 进程内缓存：config.yaml 只在启动时读一次，热路径（每个出站请求）不能反复读盘。
 let cachedSiteConfig = null;
@@ -266,6 +360,8 @@ function loadSiteConfig(options = {}) {
 
   const blockedHosts = normalizeHostList(parsed.network && parsed.network.block);
   const allowedHosts = normalizeHostList(parsed.network && parsed.network.allow);
+  // allowPaths 是 URL 级临时放行清单：升级后新端点被误伤时在 config.yaml 里开洞，命中即放行。
+  const allowedPaths = normalizeAllowPathList(parsed.network && parsed.network.allowPaths);
 
   return Object.freeze({
     brand: Object.freeze({
@@ -278,7 +374,10 @@ function loadSiteConfig(options = {}) {
       blockedHosts: Object.freeze(blockedHosts),
       // allow 用于在被 block 的域族里开洞，例如拦截某个域族时放行其中一条子域。
       allowedHosts: Object.freeze(allowedHosts),
-      configured: blockedHosts.length > 0 || allowedHosts.length > 0,
+      // allowedPaths 是 URL 级放行（hostPattern/pathGlob）；只有 allowPaths 时 configured 也必须是
+      // true，否则 IPC 链路（official-runtime.cjs 以 configured 为闸门）会跳过清单判定。
+      allowedPaths: Object.freeze(allowedPaths),
+      configured: blockedHosts.length > 0 || allowedHosts.length > 0 || allowedPaths.length > 0,
     }),
   });
 }
@@ -296,25 +395,58 @@ function hostMatchesPattern(hostname, pattern) {
 }
 
 /**
- * 是否应拦截该出站 URL。语义：命中 allow 直接放行，否则命中 block 即拦截。
+ * 是否应拦截该出站 URL。语义：命中 allowPaths（URL 级）直接放行，其次命中 allow（host 级）
+ * 直接放行，否则命中 block 即拦截。
  * 解析不出 hostname 的输入（相对路径、私有协议、非 http(s)）一律不拦，交给原实现处理。
  */
 function isBlockedUrl(rawUrl, network) {
   const policy = network && typeof network === "object" ? network : {};
   const blocked = Array.isArray(policy.blockedHosts) ? policy.blockedHosts : [];
   const allowed = Array.isArray(policy.allowedHosts) ? policy.allowedHosts : [];
+  const allowedPaths = Array.isArray(policy.allowedPaths) ? policy.allowedPaths : [];
   if (!blocked.length) return false;
   let host = "";
+  let pathname = "";
   try {
     const parsed = new URL(String(rawUrl || ""));
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
     host = parsed.hostname.toLowerCase();
+    pathname = parsed.pathname;
   } catch {
     return false;
   }
   if (!host) return false;
+  // allowPaths 优先于 block：升级后临时放行就是给被误伤的 URL 开洞，不能被同域族的 block 顶回去。
+  if (hostPathMatchesAllowPath(host, pathname, allowedPaths)) return false;
   if (allowed.some((pattern) => hostMatchesPattern(host, pattern))) return false;
   return blocked.some((pattern) => hostMatchesPattern(host, pattern));
+}
+
+/**
+ * 出站 URL 策略判定（供拦截点写审计日志使用）：
+ *  - "allow-path"  命中 allowPaths，按放行处理（调用方应记 allow-path 审计事件）；
+ *  - "block"       命中 block 且未放行，应拦截（调用方应记 block 审计事件）；
+ *  - "passthrough" 与策略无关（非 http(s)、解析失败、未命中任何清单），原样透传。
+ * 语义与 isBlockedUrl 完全一致，isBlockedUrl 等价于 urlPolicy(url) === "block"。
+ */
+function urlPolicy(rawUrl, network) {
+  const policy = network && typeof network === "object" ? network : {};
+  const blocked = Array.isArray(policy.blockedHosts) ? policy.blockedHosts : [];
+  const allowed = Array.isArray(policy.allowedHosts) ? policy.allowedHosts : [];
+  const allowedPaths = Array.isArray(policy.allowedPaths) ? policy.allowedPaths : [];
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return "passthrough";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "passthrough";
+  const host = parsed.hostname.toLowerCase();
+  if (!host) return "passthrough";
+  if (hostPathMatchesAllowPath(host, parsed.pathname, allowedPaths)) return "allow-path";
+  if (allowed.some((pattern) => hostMatchesPattern(host, pattern))) return "passthrough";
+  if (blocked.length && blocked.some((pattern) => hostMatchesPattern(host, pattern))) return "block";
+  return "passthrough";
 }
 
 module.exports = {
@@ -326,10 +458,16 @@ module.exports = {
   hostMatchesPattern,
   isBlockedUrl,
   loadSiteConfig,
+  parseAllowPathRule,
+  pathMatchesGlob,
+  urlPolicy,
+  urlMatchesAllowPath,
   __test: {
     normalizeBrandName,
     normalizeHostList,
     normalizeHostPattern,
+    normalizeAllowPathList,
+    hostPathMatchesAllowPath,
     parseBlockSubset,
     parseInlineList,
     parseScalar,

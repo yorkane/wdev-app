@@ -34,6 +34,10 @@ usage() {
   open       用默认浏览器打开访问地址
   config     编辑站点配置 /etc/codex-desktop/config.yaml
   env        编辑环境配置 /etc/codex-desktop/gateway.env
+  doctor     出站拦截自检：服务健康、配置、拦截活动榜、升级自检判据与临时放行建议
+             （--since 1h / --top 15 / --min-count 3 / --json / --strict）
+  audit [n]  查看网络审计日志最后 n 行（默认 20；审计文件路径由
+             CODEX_DESKTOP_NETWORK_AUDIT_LOG 决定，缺省 /var/log/codex-desktop/network-audit.jsonl）
   version    打印已安装网关版本
 USAGE
 }
@@ -86,6 +90,27 @@ case "$command" in
     ;;
   env)
     exec "${EDITOR:-vi}" /etc/codex-desktop/gateway.env
+    ;;
+  doctor)
+    # doctor 是只读自检：用包内 node 直跑 gateway/dev/network-doctor.cjs，透传全部参数。
+    if [ ! -x "$APP_DIR/node/bin/node" ]; then
+      echo "codex-desktop-gateway: 找不到捆绑 node ($APP_DIR/node/bin/node)" >&2
+      exit 1
+    fi
+    exec "$APP_DIR/node/bin/node" "$APP_DIR/gateway/dev/network-doctor.cjs" "$@"
+    ;;
+  audit)
+    # tail 审计 JSONL；审计关闭（off/0/none）或变量缺失时回落到默认路径。
+    audit_file=$(env_value CODEX_DESKTOP_NETWORK_AUDIT_LOG || true)
+    case "${audit_file:-}" in
+      0|off|none|"") audit_file=/var/log/codex-desktop/network-audit.jsonl ;;
+    esac
+    if [ -r "$audit_file" ]; then
+      tail -n "${1:-20}" "$audit_file"
+    else
+      echo "codex-desktop-gateway: 审计文件不存在或不可读: $audit_file" >&2
+      exit 1
+    fi
     ;;
   version)
     cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown

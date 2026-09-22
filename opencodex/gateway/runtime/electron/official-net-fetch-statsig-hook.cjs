@@ -2,7 +2,8 @@ const {
   registerOfficialElectronModuleOverride,
 } = require("./official-electron-module-hook.cjs");
 const { diagnosticLog } = require("../core/diagnostics.cjs");
-const { isBlockedUrl } = require("../core/site-config.cjs");
+const { urlPolicy } = require("../core/site-config.cjs");
+const { appendAuditEvent } = require("../core/network-audit.cjs");
 
 // Electron main 的 net.fetch 是官方隐藏 renderer 所有 Statsig/遥测请求的最终出口。
 // 无外网出口的服务器上，对 ab.chatgpt.com / chatgpt.com 遥测的 TCP 连接会一直黑洞挂起，
@@ -93,6 +94,27 @@ function extractUrlFromNetFetchArgs(args) {
   return "";
 }
 
+// 审计只允许 host + pathname + method；这里把 URL 拆成最小定位字段。
+// net.fetch 的第二参数可能是 Request（有 .method）或 init 对象（有 .method），其余形态拿不到方法就留空。
+function auditFieldsFromNetFetchArgs(args) {
+  const url = extractUrlFromNetFetchArgs(args);
+  let host = "";
+  let path = "";
+  try {
+    const parsed = new URL(url);
+    host = parsed.hostname.toLowerCase();
+    path = parsed.pathname;
+  } catch {
+    host = "";
+    path = "";
+  }
+  let method = "";
+  if (args && args.length > 1 && args[1] && typeof args[1] === "object") {
+    if (typeof args[1].method === "string") method = args[1].method;
+  }
+  return { host, path, method };
+}
+
 // 构造官方 httpFetch 能消费的响应；优先用全局 Response，缺失时退回最小鸭子类型形状。
 function buildStatsigNetResponse(bodyJson, url, ResponseCtor) {
   if (ResponseCtor) {
@@ -139,6 +161,8 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
         // 若 block 先命中，initialize 会被回裸 {}，官方 SDK 的 _typedJsonParse 解析失败落 NoValues，
         // enable_i18n 门控回落 false，官方 web UI 的 i18n 消息表整段不加载（界面停留英文）。
         if (onIntercept) onIntercept(url);
+        // 审计：Statsig 控制面本地应答。initialize 的「本地应答 vs 被 block」是 doctor 升级自检判据。
+        appendAuditEvent("statsig-local", "gateway-net-fetch", auditFieldsFromNetFetchArgs(args));
         diagnosticLog("statsig-net-fetch", "net_fetch_served_local", { url: String(url).split("?")[0] });
         const deliver = () => buildStatsigNetResponse(bodyJson, url, ResponseCtor);
         // 仅初始化响应加延迟以复刻真实往返、规避官方模块初始化竞态；遥测/异常上报保持即时。
@@ -149,10 +173,17 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
       }
       // 非 Statsig 控制面的请求才按配置清单判定：被拦截的域名回 200 空对象，等价于「请求已完成」，
       // 既避免真实出网泄露信息，也避免连接挂起拖垮调用方。
-      if (network && isBlockedUrl(url, network)) {
-        if (onBlocked) onBlocked(url);
-        diagnosticLog("network-guard", "net_fetch_blocked_by_config", { url: String(url).split("?")[0] });
-        return Promise.resolve(buildStatsigNetResponse("{}", url, ResponseCtor));
+      if (network) {
+        const decision = urlPolicy(url, network);
+        if (decision === "allow-path") {
+          // 命中 allowPaths：临时放行，记审计后原样透传，让真实请求发出去。
+          appendAuditEvent("allow-path", "gateway-net-fetch", auditFieldsFromNetFetchArgs(args));
+        } else if (decision === "block") {
+          if (onBlocked) onBlocked(url);
+          appendAuditEvent("block", "gateway-net-fetch", auditFieldsFromNetFetchArgs(args));
+          diagnosticLog("network-guard", "net_fetch_blocked_by_config", { url: String(url).split("?")[0] });
+          return Promise.resolve(buildStatsigNetResponse("{}", url, ResponseCtor));
+        }
       }
       return nativeFetch(...args);
     },

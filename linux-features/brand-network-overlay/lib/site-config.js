@@ -21,7 +21,7 @@
 
 "use strict";
 
-const { hostMatchesPattern, isBlockedUrl } = require("./host-match.js");
+const { hostMatchesPattern, isBlockedUrl, normalizeAllowPathList } = require("./host-match.js");
 
 const DEFAULT_BRAND_NAME = "OpenCodex";
 const BRAND_NAME_ENV = "CODEX_DESKTOP_BRAND_NAME";
@@ -270,9 +270,17 @@ function loadSiteConfig(options = {}) {
 
   const fileBlocked = normalizeHostList(parsed.network && parsed.network.block);
   const fileAllowed = normalizeHostList(parsed.network && parsed.network.allow);
+  // URL-level temporary allows (config.yaml network.allowPaths): a hole for
+  // newly required endpoints inside a blocked host family; evaluated before
+  // block. Entries are normalized in host-match.js (invalid dropped, deduped,
+  // order kept).
+  const fileAllowedPaths = normalizeAllowPathList(parsed.network && parsed.network.allowPaths);
   // config.yaml wins over the baked-in feature defaults for network lists.
   const blockedHosts = fileBlocked.length ? fileBlocked : normalizeHostList(options.bakedBlockedHosts || []);
   const allowedHosts = fileAllowed.length ? fileAllowed : normalizeHostList(options.bakedAllowedHosts || []);
+  const allowedPaths = fileAllowedPaths.length
+    ? fileAllowedPaths
+    : normalizeAllowPathList(options.bakedAllowedPaths || []);
 
   return Object.freeze({
     configPath,
@@ -285,7 +293,11 @@ function loadSiteConfig(options = {}) {
     network: Object.freeze({
       blockedHosts: Object.freeze(blockedHosts),
       allowedHosts: Object.freeze(allowedHosts),
-      configured: blockedHosts.length > 0 || allowedHosts.length > 0,
+      // allowedPaths is the URL-level allow list (hostPattern/pathGlob rules,
+      // see host-match.js); configured must stay true when only allowPaths is
+      // set, otherwise the IPC/overlay gate would skip the policy check.
+      allowedPaths: Object.freeze(allowedPaths.map((rule) => Object.freeze(rule))),
+      configured: blockedHosts.length > 0 || allowedHosts.length > 0 || allowedPaths.length > 0,
     }),
   });
 }
@@ -298,11 +310,14 @@ module.exports = {
   configPathFromEnv,
   hostMatchesPattern,
   isBlockedUrl,
+  normalizeAllowPathList,
   loadSiteConfig,
   __test: {
     normalizeBrandName,
     normalizeHostList,
-    normalizeHostPattern,
+    // normalizeHostPattern moved to lib/host-match.js (parseAllowPathRule
+    // depends on it); re-exported for backwards compatibility.
+    normalizeHostPattern: require("./host-match.js").__test.normalizeHostPattern,
     parseBlockSubset,
     parseInlineList,
     parseScalar,

@@ -22,3 +22,13 @@ network:
     - "*.statsig.com"
     - "statsigapi.net"
   allow: []
+# URL 级临时放行：升级后如出现新端点被误伤（表现为载入慢、功能静默失效、界面回退英文），
+# 可在此按 <hostPattern>/<pathGlob> 加一条规则做临时放行，命中即放行、优先于 block。
+# 规则语义：按第一个 / 切分 host 与 path；无 / 的条目等价于 allow（host 级）；
+# path 对 URL 的 pathname 做 glob 匹配（大小写敏感、忽略 query），* 匹配任意长度（含 /）。
+# 放行是临时手段：放行后执行 codex-desktop-gateway doctor 复核，确认无异常后尽快收窄或移除。
+# 示例：
+#   allowPaths:
+#     - "ab.chatgpt.com/v1/initialize"   # 精确 path
+#     - "chatgpt.com/backend-api/*"      # 前缀通配
+  allowPaths: []

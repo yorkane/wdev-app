@@ -43,6 +43,96 @@ result into the webview at document start. Parse/read failures fall back to
 the baked defaults. Matching semantics: `*.example.com` matches subdomains
 only, allow wins over block, only http(s) URLs are ever blocked.
 
+### URL-level temporary allows (`network.allowPaths`)
+
+Official upgrades can introduce newly required endpoints that fall inside a
+blocked host family and get short-circuited to a local 200. `allowPaths`
+opens URL-level holes for exactly those endpoints (temporary by design -
+narrow them back down once the new version settles):
+
+```yaml
+network:
+  block: [ "*.chatgpt.com", "chatgpt.com" ]
+  allow: []
+  allowPaths:            # URL-level allow, outranks block
+    - "ab.chatgpt.com/v1/initialize"   # exact path
+    - "chatgpt.com/backend-api/*"      # prefix glob
+```
+
+Rule semantics (kept word-for-word identical to the bundled OpenCodex
+gateway `site-config.cjs`):
+
+- one rule is `<hostPattern>/<pathGlob>`, split at the **first** `/`; an
+  entry without `/` is host-only (equivalent to an `allow` entry);
+- `hostPattern` uses the usual host semantics (case-insensitive, `*.x.com`
+  matches subdomains only, never the bare domain);
+- `pathGlob` matches the URL **pathname** only (query ignored),
+  **case-sensitive**; `*` matches any run of characters including `/`,
+  every other character is literal (escaped into a regex); a leading `/` is
+  stripped on both sides, so `backend-api/*` and `/backend-api/*` are the
+  same rule;
+- invalid entries (illegal host, empty path) are dropped, duplicates
+  deduped, original order kept - a broken config can never break the app;
+- evaluation order: **allowPaths hit -> pass** (real request goes out); else
+  `allow`(host) hit -> pass; else `block`(host) hit -> block. Non-http(s)
+  or unparseable URLs are never blocked.
+
+The config object exposes the normalized rules as
+`network.allowedPaths`; `network.configured` is also true when *only*
+allowPaths is set. All interception layers (main `net.fetch`, main
+`webRequest`, renderer fetch/XHR/sendBeacon) share the same
+`urlPolicy()`-style decision, so a hole opens at every layer at once.
+
+## Audit log
+
+Every interception layer appends one JSON line per event:
+
+- path: env `CODEX_DESKTOP_NETWORK_AUDIT_LOG`, default
+  `/var/log/codex-desktop/network-audit.jsonl`. Read **at write time**
+  (never baked), so the app can be pointed at a new path (or disabled)
+  without reinstalling.
+- disabled: set the env value to `0` / `off` / `none` (case-insensitive).
+- append-only; rotation (8 MiB -> `.1`) is the **gateway's** job, the
+  desktop never truncates or deletes the file.
+
+Line shape (fixed fields; **never** query/cookie/header/body - `path` is
+the pathname without query):
+
+```json
+{"ts":"2026-09-21T17:00:00.000Z","event":"block","layer":"desktop-net-fetch","host":"chatgpt.com","path":"/ces/v1/rgstr","method":"POST"}
+{"ts":"2026-09-21T17:00:01.000Z","event":"allow-path","layer":"desktop-net-fetch","host":"ab.chatgpt.com","path":"/v1/initialize","method":"GET"}
+{"ts":"2026-09-21T17:00:02.000Z","event":"statsig-local","layer":"desktop-net-fetch","host":"ab.chatgpt.com","path":"/v1/initialize","method":"POST"}
+{"ts":"2026-09-21T17:00:03.000Z","event":"config","layer":"desktop-net-fetch","version":"26.908.40834","blockedCount":6,"allowedCount":0,"allowedPathsCount":1,"blockedHosts":["chatgpt.com","*.chatgpt.com"],"allowedHosts":[],"allowedPathRules":["ab.chatgpt.com/v1/initialize"]}
+```
+
+- `event`: `block` (intercepted), `allow-path` (a blocked host passed
+  through because of allowPaths - proof the temporary allow took effect),
+  `statsig-local` (Statsig control plane answered locally), `config`
+  (written once after a successful main-runtime install: the policy in
+  effect at that (re)start, so every upgrade leaves a timestamped record).
+- `layer`: `desktop-net-fetch` (main `net.fetch`), `desktop-webrequest`
+  (main `webRequest` cancel), `desktop-webview` (renderer guard, see
+  below). The gateway writes `gateway-net-fetch` / `gateway-ipc` into the
+  same file; `codex-desktop-gateway doctor` aggregates all of them.
+- best-effort: a write failure falls back to a deduped `console.warn`
+  and never touches interception. The existing
+  `"[brand-network-overlay] ... blocked by config: <host><path>"`
+  `console.warn` lines stay in place (URL already query-stripped) so
+  `gateway.log` remains grep-able.
+
+### Renderer (webview guard) audit path
+
+The renderer guard runs inside the Electron webview and **cannot write
+files**. On every block / allow-path decision it emits one compact JSON
+`console.info` line prefixed `[bnov-audit]`; the main runtime listens on
+`webContents.on("console-message")` (hooked from the existing
+`browser-window-created` path) and persists those lines as
+`layer:"desktop-webview"` records. Limitations: if the console-message
+bridge is unavailable (or a window loads a non-local entry the hook never
+sees), the line is still visible in the app log / `gateway.log` but no
+`desktop-webview` audit record is written for it.
+
+
 ## Files
 
 - `feature.json` - feature manifest + baked defaults.

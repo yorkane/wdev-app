@@ -31,3 +31,4 @@ graphify-out/
 opencodex/node_modules/
 opencodex/gateway/dist/
 opencodex/.build/
+opencodex/.data/

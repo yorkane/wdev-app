@@ -22,6 +22,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const fs = require("node:fs");
+const os = require("node:os");
 const vm = require("node:vm");
 
 const FEATURE_DIR = __dirname;
@@ -423,7 +424,15 @@ function runWebviewRuntimesInSandbox(options = {}) {
   // The sandbox object itself plays `window`: the vm global proxy is built
   // from it, so the runtimes patch the exact properties the tests call.
   const sandbox = {
-    console: { warn() {}, error() {} },
+    console: {
+      warn() {},
+      error() {},
+      // The network guard emits "[bnov-audit]" console.info lines for the
+      // main-process capture hook; collect them when the caller asks.
+      info: (m) => {
+        if (Array.isArray(options.auditLines)) options.auditLines.push(String(m));
+      },
+    },
     URL,
     Event: class Event {
       constructor(type) { this.type = type; }
@@ -1124,5 +1133,352 @@ test("patch: real upstream bundles (26.908.40834) accept all five descriptors", 
     done();
   } catch (error) {
     done(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// allowPaths (URL-level temporary allow) + structured audit log
+//---------------------------------------------------------------------------
+
+test("host-match: parseAllowPathRule splits at the first slash, drops invalid, dedupes", () => {
+  const m = require("./lib/host-match.js");
+  assert.deepEqual(m.parseAllowPathRule("ab.chatgpt.com/v1/initialize"), { host: "ab.chatgpt.com", path: "v1/initialize" });
+  // host-only entry (no "/") == allow entry
+  assert.deepEqual(m.parseAllowPathRule("ok.host"), { host: "ok.host", path: null });
+  // a full pasted URL in the host part is NOT a legal rule (host would be "https:") -> dropped; the host itself still tolerates port/query junk via normalizeHostPattern
+  assert.equal(m.parseAllowPathRule("https://a.b.com:443/x/y"), null);
+  assert.deepEqual(m.parseAllowPathRule("a.b.com:443/x/y"), { host: "a.b.com", path: "x/y" });
+  // path keeps case; a stray query/fragment in the config is stripped
+  assert.deepEqual(m.parseAllowPathRule("c.com/API/Path?x=1"), { host: "c.com", path: "API/Path" });
+  // invalid entries drop
+  assert.equal(m.parseAllowPathRule("bad host!/x"), null);
+  assert.equal(m.parseAllowPathRule("x/"), null);
+  assert.equal(m.parseAllowPathRule("x/?q=1"), null);
+  assert.equal(m.parseAllowPathRule(""), null);
+  // normalize: drop + dedupe (case-insensitive host) + keep order
+  const rules = m.normalizeAllowPathList(["a.com/x", "A.com/x", "bad!", "b.com", "a.com/y"]);
+  assert.equal(rules.length, 3);
+  assert.deepEqual(rules[0], { host: "a.com", path: "x" });
+  assert.deepEqual(rules[1], { host: "b.com", path: null });
+  assert.deepEqual(rules[2], { host: "a.com", path: "y" });
+});
+
+test("host-match: pathMatchesGlob is case-sensitive, * crosses /, leading slash ignored", () => {
+  const { pathMatchesGlob } = require("./lib/host-match.js");
+  assert.equal(pathMatchesGlob("v1/initialize", "v1/initialize"), true); // exact
+  assert.equal(pathMatchesGlob("v1/initialize2", "v1/initialize"), false);
+  assert.equal(pathMatchesGlob("backend-api/a/b", "backend-api/*"), true); // * crosses /
+  assert.equal(pathMatchesGlob("backend-api2/x", "backend-api/*"), false); // . stays literal
+  assert.equal(pathMatchesGlob("Backend-api/x", "backend-api/*"), false); // case-sensitive
+  assert.equal(pathMatchesGlob("backend-api/x", "/backend-api/*"), true); // leading slash equivalent
+  assert.equal(pathMatchesGlob("x", ""), false);
+  assert.equal(pathMatchesGlob("a.b", "a.b"), true);
+  assert.equal(pathMatchesGlob("axb", "a.b"), false);
+});
+
+test("host-match: isBlockedUrl allowPaths outrank block; urlPolicy audit decisions", () => {
+  const m = require("./lib/host-match.js");
+  const allowedPaths = m.normalizeAllowPathList([
+    "ab.chatgpt.com/v1/initialize",
+    "chatgpt.com/backend-api/*",
+    "loose.host",
+  ]);
+  const network = {
+    blockedHosts: ["chatgpt.com", "*.chatgpt.com"],
+    allowedHosts: ["ok.chatgpt.com"],
+    allowedPaths: allowedPaths,
+  };
+  // allowPaths hit on a blocked host family -> not blocked (real request goes out)
+  assert.equal(m.isBlockedUrl("https://ab.chatgpt.com/v1/initialize", network), false);
+  assert.equal(m.isBlockedUrl("https://chatgpt.com/backend-api/wham/usage?x=1", network), false); // query ignored
+  assert.equal(m.isBlockedUrl("https://loose.host/whatever", network), false); // host-only rule
+  // same host, non-matching path -> still blocked
+  assert.equal(m.isBlockedUrl("https://chatgpt.com/ces/v1/other", network), true);
+  // allow(host) still passes without allowPaths involvement
+  assert.equal(m.isBlockedUrl("https://ok.chatgpt.com/x", network), false);
+  // allowPaths without any block -> trivially not blocked
+  assert.equal(m.isBlockedUrl("https://ab.chatgpt.com/v1/initialize", { blockedHosts: [], allowedPaths }), false);
+  // non-http(s) / junk never blocked
+  assert.equal(m.isBlockedUrl("sentry-ipc://local", network), false);
+  assert.equal(m.isBlockedUrl("/relative", network), false);
+  // urlPolicy is the audit-oriented view of the same decision
+  assert.equal(m.urlPolicy("https://chatgpt.com/backend-api/x", network), "allow-path");
+  assert.equal(m.urlPolicy("https://chatgpt.com/ces/v1/other", network), "block");
+  assert.equal(m.urlPolicy("https://api.github.com/x", network), "passthrough");
+  assert.equal(m.urlPolicy("not a url", network), "passthrough");
+  assert.equal(m.urlPolicy("file:///x", network), "passthrough");
+  // urlMatchesAllowPath standalone
+  assert.equal(m.urlMatchesAllowPath("https://chatgpt.com/backend-api/x?y=1", allowedPaths), true);
+  assert.equal(m.urlMatchesAllowPath("https://chatgpt.com/other", allowedPaths), false);
+  assert.equal(m.urlMatchesAllowPath("https://loose.host/deep/path", allowedPaths), true);
+  assert.equal(m.urlMatchesAllowPath("file:///x", allowedPaths), false);
+});
+
+test("site-config: parses network.allowPaths (block list, junk dropped, deduped); configured with only allowPaths", () => {
+  const yaml = [
+    "network:",
+    "  block:",
+    '    - "*.chatgpt.com"',
+    "  allow: []",
+    "  allowPaths:",
+    '    - "ab.chatgpt.com/v1/initialize"',
+    '    - "chatgpt.com/backend-api/*"',
+    "    - loose.host",
+    '    - "bad! host"',
+    '    - "x/"',
+    '    - "ab.chatgpt.com/v1/initialize"',
+  ].join("\n");
+  const config = siteConfig.loadSiteConfig({ readText: () => yaml, env: {} });
+  assert.deepEqual(config.network.allowedPaths, [
+    { host: "ab.chatgpt.com", path: "v1/initialize" },
+    { host: "chatgpt.com", path: "backend-api/*" },
+    { host: "loose.host", path: null },
+  ]);
+  assert.equal(config.network.configured, true);
+
+  const only = siteConfig.loadSiteConfig({ readText: () => "network:\n  allowPaths:\n    - a.com/x", env: {} });
+  assert.equal(only.network.configured, true, "configured must be true when only allowPaths is set");
+  assert.deepEqual(only.network.blockedHosts, []);
+  assert.deepEqual(only.network.allowedPaths, [{ host: "a.com", path: "x" }]);
+
+  const none = siteConfig.loadSiteConfig({ readText: () => "", env: {} });
+  assert.deepEqual(none.network.allowedPaths, []);
+  assert.equal(none.network.configured, false);
+});
+
+test("main runtime: allowPaths opens the hole (no local {}) + audit file fields, no query", async () => {
+  const { buildMainRuntime } = require("./runtime/main-runtime.js");
+  const manifest = {
+    brandNetworkOverlay: {
+      brand: { name: "wdev" },
+      network: { block: ["chatgpt.com", "*.chatgpt.com"], allow: [], allowPaths: ["chatgpt.com/backend-api/*"] },
+      statsig: { initializeDelayMs: 0 },
+    },
+  };
+  const source = buildMainRuntime({ manifest, settings: {} });
+  const auditFile = fs.mkdtempSync(path.join(os.tmpdir(), "bnov-audit-")) + "/audit.jsonl";
+  const warns = [];
+  const electronStub = {
+    net: { fetch: async () => ({ ok: true, status: 200, marker: "native" }) },
+    session: {},
+    app: { on() {}, getAllWindows() { return []; }, getVersion() { return "9.9.9-test"; } },
+  };
+  const req = (n) => {
+    if (n === "electron") return electronStub;
+    if (n === "node:fs") return fs;
+    if (n === "node:path") return path;
+    if (n === "node:url") return require("node:url");
+    throw new Error("unexpected require: " + n);
+  };
+  const sandbox = {
+    console: { warn: (m) => warns.push(String(m)), log() {}, info() {}, error() {} },
+    process: { env: { CODEX_DESKTOP_CONFIG: "/nonexistent/config.yaml", CODEX_DESKTOP_NETWORK_AUDIT_LOG: auditFile } },
+    Buffer,
+    setTimeout,
+    clearTimeout,
+    URL,
+    require: req,
+  };
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(source, sandbox, { filename: "bnov-main-runtime-allowpath.js" });
+  assert.equal(sandbox.__bnovMainRuntimeInstalled, true);
+
+  // allowPaths hit inside the blocked family -> native fetch, NOT the local {}
+  const allowed = await electronStub.net.fetch("https://chatgpt.com/backend-api/wham/usage?token=SECRET", { method: "post" });
+  assert.equal(allowed.marker, "native", "allowPaths hit must pass through to the native fetch");
+  // same family, non-matching path -> local {} short-circuit
+  const blocked = await electronStub.net.fetch("https://assets.chatgpt.com/app.js", { method: "GET" });
+  assert.equal(blocked.status, 200);
+  assert.equal(await blocked.text(), "{}");
+
+  const lines = fs.readFileSync(auditFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  // startup config line: policy snapshot with version + counts + lists
+  const configLine = lines.find((l) => l.event === "config");
+  assert.ok(configLine, "a config line must be written on install");
+  assert.equal(configLine.layer, "desktop-net-fetch");
+  assert.equal(configLine.version, "9.9.9-test");
+  assert.equal(configLine.blockedCount, 2);
+  assert.equal(configLine.allowedCount, 0);
+  assert.equal(configLine.allowedPathsCount, 1);
+  assert.deepEqual(configLine.blockedHosts, ["chatgpt.com", "*.chatgpt.com"]);
+  assert.deepEqual(configLine.allowedPathRules, ["chatgpt.com/backend-api/*"]);
+  // allow-path + block lines: host + pathname only, method upper-cased, NO query
+  const allowLine = lines.find((l) => l.event === "allow-path");
+  assert.ok(allowLine, "allow-path line present");
+  assert.equal(allowLine.host, "chatgpt.com");
+  assert.equal(allowLine.path, "/backend-api/wham/usage");
+  assert.equal(allowLine.method, "POST");
+  const blockLine = lines.find((l) => l.event === "block");
+  assert.ok(blockLine, "block line present");
+  assert.equal(blockLine.layer, "desktop-net-fetch");
+  assert.equal(blockLine.host, "assets.chatgpt.com");
+  assert.equal(blockLine.path, "/app.js");
+  assert.ok(!JSON.stringify(lines).includes("token=SECRET"), "query must never be written");
+  // every line has the fixed field set and a valid ts
+  for (const l of lines) {
+    assert.ok(typeof l.ts === "string" && !Number.isNaN(Date.parse(l.ts)), "ts is ISO8601");
+    assert.ok(["block", "allow-path", "statsig-local", "config"].includes(l.event));
+    assert.ok(["desktop-net-fetch", "desktop-webrequest", "desktop-webview"].includes(l.layer));
+  }
+});
+
+test("main runtime: CODEX_DESKTOP_NETWORK_AUDIT_LOG 0/off/none disable the file (case-insensitive)", async () => {
+  const { buildMainRuntime } = require("./runtime/main-runtime.js");
+  const manifest = {
+    brandNetworkOverlay: {
+      brand: { name: "wdev" },
+      network: { block: ["*.example.com"], allow: [], allowPaths: [] },
+      statsig: { initializeDelayMs: 0 },
+    },
+  };
+  const source = buildMainRuntime({ manifest, settings: {} });
+  for (const offValue of ["off", "OFF", "0", "none"]) {
+    const auditFile = fs.mkdtempSync(path.join(os.tmpdir(), "bnov-audit-off-")) + "/audit.jsonl";
+    const warns = [];
+    const electronStub = {
+      net: { fetch: async () => ({ ok: true, status: 200, marker: "native" }) },
+      session: {},
+      app: { on() {}, getAllWindows() { return []; } },
+    };
+    const req = (n) => {
+      if (n === "electron") return electronStub;
+      if (n === "node:fs") return fs;
+      if (n === "node:path") return path;
+      if (n === "node:url") return require("node:url");
+      throw new Error("unexpected require: " + n);
+    };
+    const sandbox = {
+      console: { warn: (m) => warns.push(String(m)), log() {}, info() {}, error() {} },
+      process: { env: { CODEX_DESKTOP_CONFIG: "/nonexistent/config.yaml", CODEX_DESKTOP_NETWORK_AUDIT_LOG: offValue } },
+      Buffer,
+      setTimeout,
+      clearTimeout,
+      URL,
+      require: req,
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, sandbox, { filename: "bnov-main-runtime-audit-off.js" });
+    assert.equal(sandbox.__bnovMainRuntimeInstalled, true);
+    // trigger one block so a disabled writer would have written the file
+    const blocked = await electronStub.net.fetch("https://cdn.example.com/a.js");
+    assert.equal(await blocked.text(), "{}");
+    assert.ok(!fs.existsSync(auditFile), "no file may be created for value: " + offValue);
+    assert.deepEqual(
+      warns.filter((m) => m.includes("audit write failed")),
+      [],
+      "a disabled audit log must not fall back to console warnings",
+    );
+  }
+});
+
+test("main runtime: [bnov-audit] console-message lines persist as desktop-webview records", async () => {
+  const { buildMainRuntime } = require("./runtime/main-runtime.js");
+  const manifest = {
+    brandNetworkOverlay: {
+      brand: { name: "wdev" },
+      network: { block: ["*.example.com"], allow: [], allowPaths: [] },
+      statsig: { initializeDelayMs: 0 },
+    },
+  };
+  const source = buildMainRuntime({ manifest, settings: {} });
+  const auditFile = fs.mkdtempSync(path.join(os.tmpdir(), "bnov-audit-wv-")) + "/audit.jsonl";
+  const handlers = {};
+  const win = {
+    webContents: {
+      on(name, fn) {
+        (handlers[name] = handlers[name] || []).push(fn);
+      },
+      executeJavaScript: () => Promise.resolve(),
+    },
+  };
+  const electronStub = {
+    net: { fetch: async () => ({ ok: true, status: 200, marker: "native" }) },
+    session: {},
+    app: { on() {}, getAllWindows() { return [win]; } },
+  };
+  const req = (n) => {
+    if (n === "electron") return electronStub;
+    if (n === "node:fs") return fs;
+    if (n === "node:path") return path;
+    if (n === "node:url") return require("node:url");
+    throw new Error("unexpected require: " + n);
+  };
+  const sandbox = {
+    console: { warn() {}, log() {}, info() {}, error() {} },
+    process: { env: { CODEX_DESKTOP_CONFIG: "/nonexistent/config.yaml", CODEX_DESKTOP_NETWORK_AUDIT_LOG: auditFile } },
+    Buffer,
+    setTimeout,
+    clearTimeout,
+    URL,
+    require: req,
+  };
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(source, sandbox, { filename: "bnov-main-runtime-wv.js" });
+
+  const cm = handlers["console-message"];
+  assert.ok(cm && cm.length, "console-message handler must be installed");
+  cm[0]({}, 1, '[bnov-audit] {"event":"block","host":"cdn.example.com","path":"/a.js?secret=1","method":"get"}');
+  cm[0]({}, 1, '[bnov-audit] {"event":"allow-path","host":"cdn.example.com","path":"/api/v2"}');
+  // noise must be ignored without throwing
+  cm[0]({}, 1, "unrelated console noise");
+  cm[0]({}, 1, "[bnov-audit] {not json");
+  cm[0]({}, 1, '[bnov-audit] {"event":"weird","host":"x.com","path":"/"}');
+
+  const lines = fs.readFileSync(auditFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const webviewLines = lines.filter((l) => l.layer === "desktop-webview");
+  assert.equal(webviewLines.length, 2, "only the two valid renderer lines are persisted");
+  assert.equal(webviewLines[0].event, "block");
+  assert.equal(webviewLines[0].host, "cdn.example.com");
+  assert.equal(webviewLines[0].path, "/a.js"); // query stripped on persist
+  assert.equal(webviewLines[0].method, "GET");
+  assert.equal(webviewLines[1].event, "allow-path");
+  assert.equal(webviewLines[1].method, "");
+});
+
+test("webview: allowPaths passes through at the renderer and emits [bnov-audit] lines", async () => {
+  const auditLines = [];
+  const env = runWebviewRuntimesInSandbox({
+    auditLines,
+    manifest: {
+      brandNetworkOverlay: {
+        brand: { name: "wdev" },
+        network: { block: ["*.example.com", "chatgpt.com"], allow: [], allowPaths: ["*.example.com/api/*"] },
+        statsig: { initializeDelayMs: 0 },
+      },
+    },
+  });
+  // allowPaths hit inside the blocked family -> native fetch (the hole opened)
+  const allowed = await env.sandbox.fetch("https://cdn.example.com/api/v2?token=SECRET");
+  assert.equal(allowed.native, true, "renderer allowPaths hit must reach the native fetch");
+  // same family, non-matching path -> local 200
+  const blocked = await env.sandbox.fetch("https://cdn.example.com/assets/app.js");
+  assert.equal(await blocked.text(), "{}");
+
+  // audit lines: compact JSON behind the fixed prefix, no query, host+path only
+  const audit = auditLines
+    .filter((l) => l.startsWith("[bnov-audit] "))
+    .map((l) => JSON.parse(l.slice("[bnov-audit] ".length)));
+  assert.deepEqual(audit.map((l) => l.event), ["allow-path", "block"]);
+  assert.equal(audit[0].host, "cdn.example.com");
+  assert.equal(audit[0].path, "/api/v2");
+  assert.equal(audit[1].host, "cdn.example.com");
+  assert.equal(audit[1].path, "/assets/app.js");
+  assert.ok(!auditLines.join("\n").includes("SECRET"), "query must never reach the audit line");
+});
+
+test("generated runtime sources: main + all five webview IIFEs parse (syntax self-check)", () => {
+  const { buildMainRuntime } = require("./runtime/main-runtime.js");
+  const { buildWebviewRuntimes } = require("./runtime/webview-runtime.js");
+  const manifest = {
+    brandNetworkOverlay: {
+      brand: { name: "wdev" },
+      network: { block: ["*.example.com"], allow: [], allowPaths: ["*.example.com/api/*"] },
+      statsig: { initializeDelayMs: 400 },
+    },
+  };
+  const main = buildMainRuntime({ manifest, settings: {} });
+  new Function(main); // throws on syntax error
+  for (const [name, source] of Object.entries(buildWebviewRuntimes({ manifest, settings: {} }))) {
+    new Function(source);
   }
 });

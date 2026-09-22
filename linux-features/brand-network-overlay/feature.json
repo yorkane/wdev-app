@@ -19,7 +19,8 @@
         "*.statsig.com",
         "statsigapi.net"
       ],
-      "allow": []
+      "allow": [],
+      "allowPaths": []
     },
     "statsig": {
       "initializeDelayMs": 400

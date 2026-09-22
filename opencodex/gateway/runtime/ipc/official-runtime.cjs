@@ -41,7 +41,8 @@ const {
 } = require("../electron/official-electron-module-hook.cjs");
 const { hiddenTrayHookStatus, installOfficialTrayHook } = require("../electron/official-tray-hook.cjs");
 const { installOfficialNetFetchStatsigHook } = require("../electron/official-net-fetch-statsig-hook.cjs");
-const { getSiteConfig, isBlockedUrl } = require("../core/site-config.cjs");
+const { getSiteConfig, urlPolicy } = require("../core/site-config.cjs");
+const { appendAuditEvent } = require("../core/network-audit.cjs");
 const { createOfficialLiveObserver } = require("./official-live-observer.cjs");
 const {
   gateway: gatewayPointRefs,
@@ -1508,6 +1509,12 @@ function maybeHandleStatsigTelemetryFetchNoop(channel, args) {
   if (channel !== MESSAGE_FROM_VIEW_CHANNEL) return false;
   const message = fetchMessageFromIpcArgs(args);
   if (!message || !isStatsigTelemetryFetchUrl(message.url)) return false;
+  // 审计：IPC 通道本地应答的 Statsig 遥测（rgstr/log_event）。
+  appendAuditEvent("statsig-local", "gateway-ipc", {
+    host: auditHostFromUrl(message.url),
+    path: auditPathFromUrl(message.url),
+    method: message.method || "",
+  });
   diagnosticLog("statsig-telemetry", "fetch_blocked_local", {
     method: message.method || "",
     url: String(message.url).split("?")[0],
@@ -1603,6 +1610,14 @@ function maybeHandleStatsigControlPlaneFetchNoop(channel, args) {
   if (!message) return false;
   const kind = classifyStatsigControlPlaneFetchUrl(message.url);
   if (!kind) return false;
+  // 审计：Statsig 控制面（v1/initialize、v1/sdk_exception）本地应答。
+  // initialize 的「statsig-local 而非 block」是 doctor 升级自检判据的核心事件，
+  // 隐藏运行时的 initialize 实际走这条 IPC 通道（不是 net.fetch hook），这里必须落盘。
+  appendAuditEvent("statsig-local", "gateway-ipc", {
+    host: auditHostFromUrl(message.url),
+    path: auditPathFromUrl(message.url),
+    method: message.method || "",
+  });
   diagnosticLog("statsig-telemetry", "fetch_blocked_local", {
     method: message.method || "",
     url: String(message.url).split("?")[0],
@@ -1619,12 +1634,47 @@ function maybeHandleConfiguredNetworkBlockNoop(channel, args) {
   const message = fetchMessageFromIpcArgs(args);
   if (!message) return false;
   const network = getSiteConfig().network;
-  if (!network.configured || !isBlockedUrl(message.url, network)) return false;
+  // 策略判定统一走 urlPolicy：allowPaths（URL 级）优先于 block，命中即透传真实请求；
+  // allow（host 级）命中也透传，只有真正要拦的才本地 noop 应答。
+  if (!network.configured) return false;
+  const decision = urlPolicy(message.url, network);
+  if (decision === "allow-path") {
+    // 审计：URL 级临时放行。放行后请求会真实出网，不在此处应答。
+    appendAuditEvent("allow-path", "gateway-ipc", {
+      host: auditHostFromUrl(message.url),
+      path: auditPathFromUrl(message.url),
+      method: message.method || "",
+    });
+    return false;
+  }
+  if (decision !== "block") return false;
+  appendAuditEvent("block", "gateway-ipc", {
+    host: auditHostFromUrl(message.url),
+    path: auditPathFromUrl(message.url),
+    method: message.method || "",
+  });
   diagnosticLog("network-guard", "fetch_blocked_by_config", {
     method: message.method || "",
     url: String(message.url).split("?")[0],
   });
   return sendStatsigTelemetryNoopResponse(message);
+}
+
+// 审计只落 host + pathname（剥 query）；解析失败返回空串，不影响拦截逻辑。
+function auditHostFromUrl(rawUrl) {
+  try {
+    return new URL(String(rawUrl || "")).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function auditPathFromUrl(rawUrl) {
+  try {
+    return new URL(String(rawUrl || "")).pathname;
+  } catch {
+    return "";
+  }
 }
 
 function parseJsonLike(value) {
@@ -2962,5 +3012,10 @@ module.exports = {
     threadListInvalidationRequest,
     classifyStatsigControlPlaneFetchUrl,
     buildStatsigInitializeGatewayResponse,
+    // 测试专用：暴露配置化网络拦截 handler，验证 allowPaths 放行 / block 拦截 / 审计落盘。
+    // 生产路径通过 invokeOfficialIpc 间接调用，这里直接导出以便单测注入受控配置与审计文件。
+    maybeHandleConfiguredNetworkBlockNoop,
+    maybeHandleStatsigControlPlaneFetchNoop,
+    maybeHandleStatsigTelemetryFetchNoop,
   },
 };

@@ -26,6 +26,9 @@
   if (!network || network.configured !== true) return;
   const blockedHosts = Array.isArray(network.blockedHosts) ? network.blockedHosts : [];
   const allowedHosts = Array.isArray(network.allowedHosts) ? network.allowedHosts : [];
+  // URL 级临时放行清单（config.yaml 的 network.allowPaths）：与 gateway site-config.cjs 同规范，
+  // 每条 { host, path }，path 为 null 时等价 host 级放行；命中即放行，优先于 block。
+  const allowedPaths = Array.isArray(network.allowedPaths) ? network.allowedPaths : [];
   // 没有 block 清单时没有任何可拦截目标，同样不安装。
   if (!blockedHosts.length) return;
 
@@ -117,6 +120,37 @@
     return value === rule;
   }
 
+  /** pathGlob 匹配 pathname：大小写敏感、只看 pathname；* 匹配任意长度（含 /），其余字面量。 */
+  function pathMatchesGlob(pathname, pathGlob) {
+    // URL pathname 带前导 /，配置 glob 可能带也可能不带：两边统一剥掉前导 / 再比较，
+    // 与 gateway site-config.cjs 的 pathMatchesGlob 行为一致。
+    const path = String(pathname || "").replace(/^\//, "");
+    const glob = String(pathGlob || "").replace(/^\//, "");
+    if (!glob) return false;
+    let source = "";
+    for (let i = 0; i < glob.length; i += 1) {
+      const char = glob[i];
+      source += char === "*" ? ".*" : char.replace(/[.*+?^{=([\]\\]/g, "\\$&");
+    }
+    try {
+      return new RegExp("^" + source + "$").test(path);
+    } catch {
+      return false;
+    }
+  }
+
+  function urlMatchesAllowPath(parsed) {
+    const host = (parsed.hostname || "").toLowerCase();
+    if (!host) return false;
+    return allowedPaths.some(
+      (rule) =>
+        rule &&
+        typeof rule === "object" &&
+        hostMatchesPattern(host, String(rule.host || "")) &&
+        (!rule.path || pathMatchesGlob(parsed.pathname, String(rule.path)))
+    );
+  }
+
   /** 解析 fetch/XHR/Beacon 的目标 URL；解析不出（私有协议、非法串）返回 null 交给原实现。 */
   function parseUrl(raw) {
     try {
@@ -141,6 +175,8 @@
     }
     const host = (parsed.hostname || "").toLowerCase();
     if (!host) return false;
+    // allowPaths 优先于 block：与 gateway isBlockedUrl/urlPolicy 的判定顺序一致。
+    if (allowedPaths.length && urlMatchesAllowPath(parsed)) return false;
     if (allowedHosts.some((pattern) => hostMatchesPattern(host, pattern))) return false;
     return blockedHosts.some((pattern) => hostMatchesPattern(host, pattern));
   }

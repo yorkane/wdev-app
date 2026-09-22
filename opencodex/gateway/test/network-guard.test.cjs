@@ -532,3 +532,52 @@ test("the gateway serves the guard and registers it in the aggregated runtime bo
   );
   assert.ok(String(enMessages[I18N_KEY] || "").trim(), "missing " + I18N_KEY + " for en-US");
 });
+
+test("allowPaths (URL-level) lets matching paths pass while other paths of the same host stay blocked", async () => {
+  // 与网关 site-config 同形状：allowedPaths 是归一化后的 { host, path } 数组（path 为 null 时等价 host 级放行）。
+  const harness = createHarness({
+    blockedHosts: ["*.chatgpt.com", "chatgpt.com"],
+    allowedHosts: [],
+    allowedPaths: [
+      { host: "chatgpt.com", path: "backend-api/*" },
+      { host: "ab.chatgpt.com", path: "v1/initialize" },
+    ],
+    configured: true,
+  });
+  harness.install();
+
+  // allowPaths 命中：透传原生 fetch，不回本地 200，也不上报命中。
+  const pass1 = await harness.window.fetch("https://chatgpt.com/backend-api/wham/usage?token=secret");
+  assert.equal(pass1.native, true, "allow-path 命中应透传真实请求");
+  const pass2 = await harness.window.fetch("https://ab.chatgpt.com/v1/initialize?k=client-x");
+  assert.equal(pass2.native, true, "精确 path 的 allow-path 应透传");
+  assert.equal(harness.scope.emits, 0, "放行不产生拦截命中");
+
+  // 同域未放行的 path：仍被本地拦截。
+  const blocked = await harness.window.fetch("https://chatgpt.com/other/path");
+  assert.equal(harness.calls.fetch.length, 2, "被拦请求不得到达原生 fetch");
+  assert.equal(blocked.status, 200);
+  assert.equal(blocked.body, "{}");
+  assert.equal(harness.scope.emits, 1);
+
+  // * 跨 / 匹配。
+  const passDeep = await harness.window.fetch("https://chatgpt.com/backend-api/a/b/c");
+  assert.equal(passDeep.native, true, "* 应匹配任意长度（含 /）");
+  // path 字面量大小写敏感：/Backend-api/... 不命中 backend-api/*，仍被拦。
+  const caseBlocked = await harness.window.fetch("https://chatgpt.com/Backend-api/x");
+  assert.equal(caseBlocked.status, 200, "path glob 大小写敏感：字面量大小写不符则不命中");
+});
+
+test("host-only allowPath (path null) behaves like an allow entry", async () => {
+  const harness = createHarness({
+    blockedHosts: ["*.chatgpt.com"],
+    allowedHosts: [],
+    allowedPaths: [{ host: "safe.chatgpt.com", path: null }],
+    configured: true,
+  });
+  harness.install();
+  const pass = await harness.window.fetch("https://safe.chatgpt.com/anything/here");
+  assert.equal(pass.native, true, "host-only 规则应放行该 host 全部 path");
+  const blocked = await harness.window.fetch("https://other.chatgpt.com/x");
+  assert.equal(blocked.status, 200);
+});

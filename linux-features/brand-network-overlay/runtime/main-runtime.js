@@ -23,6 +23,12 @@
 //      the page CSP, unlike inline <script>), so the webview runtime sees the
 //      live config; falls back to the baked config when the file is missing
 //      or unparsable.
+//   5. append structured audit lines (block / allow-path / statsig-local /
+//      config) to $CODEX_DESKTOP_NETWORK_AUDIT_LOG (default
+//      /var/log/codex-desktop/network-audit.jsonl; 0/off/none disables the
+//      file, read at write time, never baked) and capture the renderer
+//      guard's "[bnov-audit]" console lines as layer "desktop-webview".
+//      Best-effort: a write failure never touches the interception path.
 //
 // Everything is wrapped in try/catch: this feature must never crash the app
 // startup. A console.warn marker line is emitted once per category so the
@@ -45,7 +51,25 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
   const statsigSource = cjsSource("lib/statsig.js");
   const siteConfigSource = cjsSource("lib/site-config.js");
 
-  const hostMatch = ["hostMatchesPattern", "isBlockedUrl"]
+  // host-match.js is the single source of the matching semantics: it also
+  // holds normalizeHostPattern (moved there from site-config.js because
+  // parseAllowPathRule depends on it) and the allowPaths rule functions.
+  // Keep this list in sync with inlinedHostMatch() in webview-runtime.js:
+  // a missing entry is a ReferenceError at install time (the
+  // BRAND_NAME_MAX_LENGTH regression - see test.js).
+  const hostMatch = [
+    "hostMatchesPattern",
+    "normalizeHostPattern",
+    "isBlockedUrl",
+    "parseAllowPathRule",
+    "normalizeAllowPathList",
+    "UNSAFE_GLOB_CHARS",
+    "escapeGlobChar",
+    "pathMatchesGlob",
+    "hostPathMatchesAllowPath",
+    "urlMatchesAllowPath",
+    "urlPolicy",
+  ]
     .map((name) => extractDeclaration(hostMatchSource, name))
     .join("\n\n");
   const statsig = [
@@ -65,7 +89,8 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
   ].map((name) => extractDeclaration(statsigSource, name)).join("\n\n");
 
   // site-config internals needed by the config reader (no node:fs require:
-  // the injected code provides readText itself).
+  // the injected code provides readText itself). normalizeHostPattern is
+  // inlined from host-match.js above, not here anymore.
   const siteConfigParts = [
     "stripYamlComment",
     "leadingIndent",
@@ -73,7 +98,6 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
     "parseInlineList",
     "parseBlockSubset",
     "normalizeBrandName",
-    "normalizeHostPattern",
     "normalizeHostList",
     "configPathFromEnv",
   ].map((name) => extractDeclaration(siteConfigSource, name)).join("\n\n");
@@ -126,6 +150,12 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
     const bakedAllowed = normalizeHostList(BAKED_DEFAULTS.network && BAKED_DEFAULTS.network.allow);
     const blockedHosts = fileBlocked.length ? fileBlocked : bakedBlocked;
     const allowedHosts = fileAllowed.length ? fileAllowed : bakedAllowed;
+    // URL-level temporary allows: config.yaml network.allowPaths wins over
+    // the baked list; entries are normalized rules {host, path|null}
+    // (invalid dropped, deduped, order kept).
+    const fileAllowedPaths = normalizeAllowPathList(parsed.network && parsed.network.allowPaths);
+    const bakedAllowedPaths = normalizeAllowPathList(BAKED_DEFAULTS.network && BAKED_DEFAULTS.network.allowPaths);
+    const allowedPaths = fileAllowedPaths.length ? fileAllowedPaths : bakedAllowedPaths;
 
     const delayRaw =
       process.env[INITIALIZE_DELAY_ENV] !== undefined
@@ -140,10 +170,116 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
       network: {
         blockedHosts: blockedHosts,
         allowedHosts: allowedHosts,
-        configured: blockedHosts.length > 0 || allowedHosts.length > 0,
+        allowedPaths: allowedPaths,
+        // configured must stay true when only allowPaths is set: the
+        // interception gate keys off the policy lists and the webview
+        // runtime keys off this flag.
+        configured: blockedHosts.length > 0 || allowedHosts.length > 0 || allowedPaths.length > 0,
       },
       statsig: { initializeDelayMs: normalizeInitializeDelayMs(delayRaw) },
     };
+  }
+
+  // ---- Structured audit log (JSONL, best-effort) --------------------------
+  // One line per interception / allow / Statsig local answer / startup:
+  //   {"ts","event":"block|allow-path|statsig-local|config","layer",
+  //    "host","path","method"}
+  // Never query/cookie/header/body: fields are sanitized down to host +
+  // pathname + method, structurally. The log path is read at WRITE time
+  // (never baked) from $CODEX_DESKTOP_NETWORK_AUDIT_LOG; 0/off/none
+  // (case-insensitive) disables the file. Append-only: rotation is the
+  // gateway's job. Write failures fall back to a deduped console.warn and
+  // never touch the interception path.
+  const AUDIT_LOG_ENV = "CODEX_DESKTOP_NETWORK_AUDIT_LOG";
+  const DEFAULT_AUDIT_LOG = "/var/log/codex-desktop/network-audit.jsonl";
+  const AUDIT_FALLBACK_WARNED = new Set();
+
+  function auditLogPathNow() {
+    const raw = String(process.env[AUDIT_LOG_ENV] == null ? "" : process.env[AUDIT_LOG_ENV]).trim();
+    if (!raw) return DEFAULT_AUDIT_LOG;
+    const lower = raw.toLowerCase();
+    if (lower === "0" || lower === "off" || lower === "none") return null;
+    return raw;
+  }
+
+  function sanitizeAuditFields(host, path, method) {
+    const h = String(host == null ? "" : host).toLowerCase().replace(/[?#].*$/, "");
+    const p = String(path == null ? "" : path).replace(/[?#].*$/, "");
+    const m = String(method == null ? "" : method).trim().toUpperCase();
+    return {
+      host: /^[a-z0-9.*-]{0,255}$/.test(h) ? h : "",
+      path: p.slice(0, 2048),
+      method: /^[A-Z]{0,16}$/.test(m) ? m : "",
+    };
+  }
+
+  function auditFields(rawUrl, method) {
+    let host = "";
+    let path = "";
+    try {
+      const parsed = new URL(String(rawUrl == null ? "" : rawUrl));
+      host = parsed.hostname;
+      path = parsed.pathname;
+    } catch (err) {}
+    return sanitizeAuditFields(host, path, method);
+  }
+
+  function fetchMethodFromArgs(args) {
+    const init = args && args.length > 1 ? args[1] : null;
+    return init && typeof init === "object" && typeof init.method === "string" ? init.method : "";
+  }
+
+  function appendAuditLine(event, layer, details) {
+    let filePath = null;
+    try {
+      filePath = auditLogPathNow();
+    } catch (err) {
+      filePath = null;
+    }
+    if (!filePath) return;
+    const fields = sanitizeAuditFields(details.host, details.path, details.method);
+    const record = {
+      ts: new Date().toISOString(),
+      event: event,
+      layer: layer,
+      host: fields.host,
+      path: fields.path,
+      method: fields.method,
+    };
+    if (event === "config") {
+      // Startup snapshot: the policy in effect at this (re)start, so every
+      // upgrade leaves one timestamped record of what was active.
+      const toRules = (list) =>
+        (Array.isArray(list) ? list : []).map((item) =>
+          item && typeof item === "object"
+            ? String(item.host || "") + (item.path ? "/" + String(item.path) : "")
+            : String(item == null ? "" : item)
+        );
+      record.version = String(details.version == null ? "" : details.version);
+      record.blockedCount = Array.isArray(details.blocked) ? details.blocked.length : 0;
+      record.allowedCount = Array.isArray(details.allowed) ? details.allowed.length : 0;
+      record.allowedPathsCount = Array.isArray(details.allowedPaths) ? details.allowedPaths.length : 0;
+      record.blockedHosts = toRules(details.blocked);
+      record.allowedHosts = toRules(details.allowed);
+      record.allowedPathRules = toRules(details.allowedPaths);
+    }
+    let line = "";
+    try {
+      line = JSON.stringify(record);
+    } catch (err) {
+      return;
+    }
+    try {
+      require("node:fs").appendFileSync(filePath, line + "\\n", "utf-8");
+    } catch (err) {
+      // Best-effort: dedupe the fallback warning per combo so a broken log
+      // path never spams the console.
+      const key = event + "|" + layer + "|" + fields.host + "|" + fields.path;
+      if (!AUDIT_FALLBACK_WARNED.has(key)) {
+        AUDIT_FALLBACK_WARNED.add(key);
+        console.warn("[brand-network-overlay] audit write failed (layer=" + layer + "); same combo not repeated this session: " + line);
+      }
+    }
   }
 
   function localStatsigBodyForUrl(rawUrl) {
@@ -223,6 +359,12 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
             const deliver = function () {
               return buildLocalResponse(statsigBody.body, url, ResponseCtor);
             };
+            // Audit: the Statsig control plane is answered locally. The
+            // doctor's upgrade self-check keys on "initialize must be
+            // statsig-local, never block".
+            try {
+              appendAuditLine("statsig-local", "desktop-net-fetch", auditFields(url, fetchMethodFromArgs(args)));
+            } catch (err) {}
             // Pace only the initialize response to replay a real network
             // round-trip and keep the official authed-route module init from
             // racing the side-effect export registration.
@@ -233,8 +375,21 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
             }
             return Promise.resolve(deliver());
           }
-          if (config.network.blockedHosts.length && isBlockedUrl(url, config.network)) {
+          const policyDecision = urlPolicy(url, config.network);
+          if (policyDecision === "allow-path") {
+            // Temporary allowPaths hit on an otherwise blocked host family:
+            // pass through to the real fetch and audit so the operator can
+            // see the temporary allow actually took effect.
+            try {
+              appendAuditLine("allow-path", "desktop-net-fetch", auditFields(url, fetchMethodFromArgs(args)));
+            } catch (err) {}
+            return nativeFetch.apply(null, args);
+          }
+          if (policyDecision === "block") {
             console.warn("[brand-network-overlay] net.fetch blocked by config: " + String(url).split("?")[0]);
+            try {
+              appendAuditLine("block", "desktop-net-fetch", auditFields(url, fetchMethodFromArgs(args)));
+            } catch (err) {}
             return Promise.resolve(buildLocalResponse("{}", url, ResponseCtor));
           }
           return nativeFetch.apply(null, args);
@@ -262,8 +417,12 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
       if (typeof session.webRequest.onBeforeRequest === "function" && !session.__bnovWebRequestHooked) {
         session.__bnovWebRequestHooked = true;
         session.webRequest.onBeforeRequest(function (details, callback) {
-          if (config.network.blockedHosts.length && isBlockedUrl(details.url, config.network)) {
+          const decision = urlPolicy(details.url, config.network);
+          if (decision === "block") {
             console.warn("[brand-network-overlay] webRequest blocked by config: " + String(details.url).split("?")[0]);
+            try {
+              appendAuditLine("block", "desktop-webrequest", auditFields(details.url, details.method || ""));
+            } catch (err) {}
             return callback({ cancel: true });
           }
           callback({});
@@ -285,7 +444,12 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
     })();
     const configJson = JSON.stringify({
       brand: config.brand,
-      network: { blockedHosts: config.network.blockedHosts, allowedHosts: config.network.allowedHosts, configured: config.network.configured },
+      network: {
+        blockedHosts: config.network.blockedHosts,
+        allowedHosts: config.network.allowedHosts,
+        allowedPaths: config.network.allowedPaths,
+        configured: config.network.configured,
+      },
       statsig: config.statsig,
     });
     const installWindowHook = function (win) {
@@ -313,6 +477,30 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
           if (!maybeInject(url)) return;
           webContents.executeJavaScript(injection, true).catch(function () {});
         });
+        // The renderer-side webview guard cannot write files; it logs its
+        // block / allow-path decisions as compact JSON lines prefixed with
+        // "[bnov-audit]". Capture those lines here and persist them as
+        // layer "desktop-webview" audit records. Best-effort: a parse or
+        // write failure must never affect the page (and the guard's own
+        // console line stays in gateway.log as the fallback trail).
+        try {
+          webContents.on("console-message", function (_event, _level, message) {
+            try {
+              const raw = String(message == null ? "" : message);
+              const prefix = "[bnov-audit]";
+              if (!raw.startsWith(prefix)) return;
+              const payload = JSON.parse(raw.slice(prefix.length).trim());
+              const record = {
+                event: String(payload.event == null ? "" : payload.event),
+                host: String(payload.host == null ? "" : payload.host),
+                path: String(payload.path == null ? "" : payload.path),
+                method: String(payload.method == null ? "" : payload.method),
+              };
+              if (record.event !== "block" && record.event !== "allow-path") return;
+              appendAuditLine(record.event, "desktop-webview", record);
+            } catch (err) {}
+          });
+        } catch (err) {}
       } catch (err) {}
     };
     try {
@@ -323,6 +511,21 @@ function buildMainRuntime({ manifest = {}, settings = {} } = {}) {
       // Hook windows created before this line (app is normally ready by the
       // time this IIFE runs at module load, but be defensive).
       for (const win of app.getAllWindows()) installWindowHook(win);
+    } catch (err) {}
+
+    // Startup audit: record the policy in effect at this (re)start so every
+    // upgrade leaves one timestamped "config" line the doctor can inspect.
+    try {
+      let version = "";
+      try {
+        version = require("electron").app.getVersion ? require("electron").app.getVersion() : "";
+      } catch (err) {}
+      appendAuditLine("config", "desktop-net-fetch", {
+        version: version,
+        blocked: config.network.blockedHosts,
+        allowed: config.network.allowedHosts,
+        allowedPaths: config.network.allowedPaths,
+      });
     } catch (err) {}
 
     console.warn("[brand-network-overlay] main runtime installed (config: " + config.configPath + ", brand: " + config.brand.name + ", blocked hosts: " + config.network.blockedHosts.length + ")");
