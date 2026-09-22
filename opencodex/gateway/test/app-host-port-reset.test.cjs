@@ -34,7 +34,7 @@ function extractFunction(source, anchor) {
   throw new Error("unbalanced braces for: " + anchor);
 }
 
-/** 装配沙箱：执行真实的 handleAppHostGatewayMessage + maybeReloadForAppHostPortReset，
+/** 装配沙箱：执行真实的 handleAppHostGatewayMessage + maybeReloadForAppHostFailure，
  * 注入假 sessionStorage / location.reload / clientDiagnostic。 */
 function createResetHarness(options = {}) {
   const diagnostics = [];
@@ -65,8 +65,24 @@ function createResetHarness(options = {}) {
       },
     },
     clientDiagnostic: (event, data) => diagnostics.push({ event, data }),
-    // reset 分支在执行到 appHostPortRelays 之前就已 return；其余分支用桩兜住。
-    appHostPortRelays: new Map(),
+    // reset 分支在执行到 appHostPortRelays 之前就已 return；error/close/message 分支需要
+    // 一个存在的 relay state。这里用 Proxy 自动补一个最小 state，模拟页面已建 relay 的情况。
+    appHostPortRelays: new Proxy(new Map(), {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target);
+        if (prop === "get") {
+          return (key) => {
+            let state = target.get(key);
+            if (!state) {
+              state = { portId: key, pending: [], closed: false, closing: false, port: { close() {} } };
+              target.set(key, state);
+            }
+            return state;
+          };
+        }
+        return value;
+      },
+    }),
     closeAppHostRelay() {},
     flushAppHostRelayMessages() {},
     decodeAppHostMessageData() {
@@ -83,6 +99,10 @@ function createResetHarness(options = {}) {
   vm.runInContext(extractConst(POLYFILL_SOURCE, "APP_HOST_RESET_RELOAD_STORAGE_KEY"), sandbox);
   vm.runInContext(
     extractFunction(POLYFILL_SOURCE, "function handleAppHostGatewayMessage("),
+    sandbox
+  );
+  vm.runInContext(
+    extractFunction(POLYFILL_SOURCE, "function maybeReloadForAppHostFailure("),
     sandbox
   );
   vm.runInContext(
@@ -154,4 +174,78 @@ test("unknown app-host control frames are still rejected by the whitelist", (t) 
   assert.equal(harness.dispatch({ type: "app-host-port-unknown", portId: "p" }), false);
   assert.equal(harness.dispatch(null), false);
   assert.equal(harness.reloadCount(), 0);
+});
+
+// ---- app-host-port-error 自愈（relay 判死后页面级 port 永久失效，只能重载）----
+
+test("app-host-port-error triggers a page reload with its own diagnostic names", (t) => {
+  const harness = createResetHarness();
+  const handled = harness.dispatch({
+    type: "app-host-port-error",
+    portId: "app-host-client-2",
+    error: "Maximum call stack size exceeded",
+  });
+  assert.equal(handled, true, "error frame must be consumed by the app-host dispatcher");
+  assert.equal(harness.reloadCount(), 1, "first app-host error reloads the page");
+  const errorDiag = harness.diagnostics.find((item) => item.event === "app-host-error");
+  assert.ok(errorDiag, "existing app-host-error diagnostic must be preserved");
+  assert.equal(errorDiag.data.error, "Maximum call stack size exceeded");
+  assert.equal(errorDiag.data.portId, "app-host-client-2");
+  const reloadDiag = harness.diagnostics.find((item) => item.event === "app-host-port-error-reload");
+  assert.ok(reloadDiag, "error-triggered reload must be diagnosable under its own event name");
+  assert.equal(reloadDiag.data.portId, "app-host-client-2");
+  assert.ok(harness.storage.get("codex_app_host_port_reset_at"), "error reload must write the shared cooldown timestamp");
+});
+
+test("a second app-host-port-error inside the cooldown window does not reload again", (t) => {
+  const harness = createResetHarness();
+  harness.dispatch({ type: "app-host-port-error", portId: "p", error: "boom" });
+  assert.equal(harness.reloadCount(), 1);
+  harness.dispatch({ type: "app-host-port-error", portId: "p", error: "boom" });
+  assert.equal(harness.reloadCount(), 1, "reload storm must be suppressed inside the cooldown window");
+  const suppressed = harness.diagnostics.find((item) => item.event === "app-host-port-error-reload-suppressed");
+  assert.ok(suppressed, "suppressed error reload must be diagnosable");
+  assert.ok(suppressed.data.sinceLastMs >= 0 && suppressed.data.sinceLastMs < 30_000);
+});
+
+test("port-error and port-reset share one cooldown window (error first, then reset)", (t) => {
+  const harness = createResetHarness();
+  harness.dispatch({ type: "app-host-port-error", portId: "p", error: "boom" });
+  assert.equal(harness.reloadCount(), 1);
+  harness.dispatch({ type: "app-host-port-reset", portId: "p", reason: "session-expired" });
+  assert.equal(harness.reloadCount(), 1, "reset inside the window opened by an error must not reload again");
+  const suppressed = harness.diagnostics.find((item) => item.event === "app-host-port-reset-reload-suppressed");
+  assert.ok(suppressed, "the second failure must be diagnosable as suppressed under the reset prefix");
+});
+
+test("port-error and port-reset share one cooldown window (reset first, then error)", (t) => {
+  const harness = createResetHarness();
+  harness.dispatch({ type: "app-host-port-reset", portId: "p", reason: "session-expired" });
+  assert.equal(harness.reloadCount(), 1);
+  harness.dispatch({ type: "app-host-port-error", portId: "p", error: "boom" });
+  assert.equal(harness.reloadCount(), 1, "error inside the window opened by a reset must not reload again");
+  const suppressed = harness.diagnostics.find((item) => item.event === "app-host-port-error-reload-suppressed");
+  assert.ok(suppressed, "the second failure must be diagnosable as suppressed under the error prefix");
+});
+
+test("an error after the shared cooldown window reloads again", (t) => {
+  const harness = createResetHarness();
+  harness.storage.set("codex_app_host_port_reset_at", String(Date.now() - 31_000));
+  harness.dispatch({ type: "app-host-port-error", portId: "p", error: "boom" });
+  assert.equal(harness.reloadCount(), 1, "cooldown expired: error reload is allowed again");
+});
+
+test("when sessionStorage is unavailable an app-host-port-error does not reload (diagnostic only)", (t) => {
+  const harness = createResetHarness({ sessionStorage: "throwing" });
+  const handled = harness.dispatch({
+    type: "app-host-port-error",
+    portId: "p",
+    error: "boom",
+  });
+  assert.equal(handled, true);
+  assert.equal(harness.reloadCount(), 0, "no storage: never reload, avoid unbounded loops");
+  assert.ok(
+    harness.diagnostics.find((item) => item.event === "app-host-port-error-reload-skipped"),
+    "skipped error reload must be diagnosable"
+  );
 });

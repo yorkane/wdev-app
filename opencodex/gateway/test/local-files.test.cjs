@@ -1,16 +1,25 @@
 const assert = require("node:assert/strict");
 const { once } = require("node:events");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { Writable } = require("node:stream");
 const test = require("node:test");
 const zlib = require("node:zlib");
-const { LOCAL_DOWNLOAD_ARCHIVE_MAX_BYTES, LOCAL_DOWNLOAD_ARCHIVE_MAX_FILES } = require("../runtime/core/config.cjs");
+const { CODEX_HOME, LOCAL_DOWNLOAD_ARCHIVE_MAX_BYTES, LOCAL_DOWNLOAD_ARCHIVE_MAX_FILES, PROJECT_ROOT } = require("../runtime/core/config.cjs");
 const { createLocalFileService } = require("../runtime/http/local-files.cjs");
 
+// 测试临时目录必须锚定在项目内，而不是 os.tmpdir()：官方运行时会把 TMPDIR
+// 指向官方隔离临时目录，若这里跟着 os.tmpdir() 走，临时文件可能恰好落在
+// officialRuntimeTempDir() 里，让“白名单外仍 404”的负例被环境带偏。
+function testTempRoot() {
+  // 复用 config 的 PROJECT_ROOT（opencodex/），.data 是既有的项目内运行数据目录。
+  const root = path.join(PROJECT_ROOT, ".data", "test-tmp");
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
 function makeTempFile(t, fileName, content) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencodex-local-file-test-"));
+  const dir = fs.mkdtempSync(path.join(testTempRoot(), "opencodex-local-file-test-"));
   t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
   const filePath = path.join(dir, fileName);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -19,7 +28,7 @@ function makeTempFile(t, fileName, content) {
 }
 
 function makeTempDir(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencodex-local-file-test-"));
+  const dir = fs.mkdtempSync(path.join(testTempRoot(), "opencodex-local-file-test-"));
   t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
   return dir;
 }
@@ -281,4 +290,99 @@ test("ignores an unregistered requested workspace root", (t) => {
   t.after(() => service.dispose());
 
   assert.equal(service.resolveLocalDownloadPath("package.json", { workspaceRoot }), "");
+});
+
+test("serves official-runtime clipboard images through app-fs", async (t) => {
+  // 用临时目录冒充官方运行时 TMPDIR（CODEX_WEB_OFFICIAL_TMPDIR 覆盖），
+  // 模拟官方 renderer 把粘贴/拖放图片写成 codex-clipboard-<uuid>.jpg。
+  const officialTempDir = makeTempDir(t);
+  const originalOverride = process.env.CODEX_WEB_OFFICIAL_TMPDIR;
+  process.env.CODEX_WEB_OFFICIAL_TMPDIR = officialTempDir;
+  t.after(() => {
+    if (originalOverride === undefined) delete process.env.CODEX_WEB_OFFICIAL_TMPDIR;
+    else process.env.CODEX_WEB_OFFICIAL_TMPDIR = originalOverride;
+  });
+
+  const service = createLocalFileService();
+  t.after(() => service.dispose());
+
+  const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03, 0x04]);
+  const imageFile = path.join(officialTempDir, "codex-clipboard-3b7203e4-3809-4ab2-ad9c-23e9a2074a71.jpg");
+  fs.writeFileSync(imageFile, imageBytes);
+
+  const response = createResponseRecorder();
+  await service.serveAppFsFile(`/api/app-fs/@fs/${encodeURIComponent(imageFile)}`, response);
+  const body = await waitForResponseBody(response);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers["content-type"], "image/jpeg");
+  assert.equal(response.headers["content-length"], String(imageBytes.length));
+  assert.equal(Buffer.compare(body, imageBytes), 0);
+});
+
+test("keeps app-fs 404 for files outside the official temp dir allowlist", async (t) => {
+  const officialTempDir = makeTempDir(t);
+  const originalOverride = process.env.CODEX_WEB_OFFICIAL_TMPDIR;
+  process.env.CODEX_WEB_OFFICIAL_TMPDIR = officialTempDir;
+  t.after(() => {
+    if (originalOverride === undefined) delete process.env.CODEX_WEB_OFFICIAL_TMPDIR;
+    else process.env.CODEX_WEB_OFFICIAL_TMPDIR = originalOverride;
+  });
+
+  const service = createLocalFileService();
+  t.after(() => service.dispose());
+
+  async function expectNotAllowed(fileOrPath) {
+    const response = createResponseRecorder();
+    await service.serveAppFsFile(`/api/app-fs/@fs/${encodeURIComponent(fileOrPath)}`, response);
+    const body = await waitForResponseBody(response);
+    assert.equal(response.status, 404);
+    // “File not allowed.” 表示是白名单拒绝，而不是文件不存在，保证负例没有走错分支。
+    assert.equal(body.toString("utf-8"), "File not allowed.");
+  }
+
+  // 官方临时目录内、但文件名不符合 codex-clipboard-<uuid>.<ext> 形态的文件：仍 404。
+  const notesFile = path.join(officialTempDir, "notes.txt");
+  fs.writeFileSync(notesFile, "secret notes");
+  const ipcSocketFile = path.join(officialTempDir, "ipc-1000.sock");
+  fs.writeFileSync(ipcSocketFile, "");
+  await expectNotAllowed(notesFile);
+  await expectNotAllowed(ipcSocketFile);
+
+  // /tmp 下白名单外的普通文件：仍 404。
+  const outsideFile = makeTempFile(t, "outside-clipboard.jpg", "x");
+  await expectNotAllowed(outsideFile);
+
+  // CODEX_HOME 下白名单外的文件：仍 404（生成图片目录是白名单，HOME 本身不是）。
+  const homeSecretFile = path.join(CODEX_HOME, "appfs-negative-secret.txt");
+  fs.writeFileSync(homeSecretFile, "s");
+  t.after(() => {
+    try {
+      fs.rmSync(homeSecretFile, { force: true });
+    } catch {}
+  });
+  await expectNotAllowed(homeSecretFile);
+
+  // 明显的越界路径：仍 404。
+  await expectNotAllowed("/etc/passwd");
+
+  // 官方临时目录里指向外部的符号链接，即使文件名匹配也必须被 realpath 边界拒绝。
+  const linkPath = path.join(officialTempDir, "codex-clipboard-deadbeef-0000-4000-8000-000000000000.png");
+  fs.symlinkSync("/etc/hostname", linkPath);
+  t.after(() => {
+    try {
+      fs.rmSync(linkPath, { force: true });
+    } catch {}
+  });
+  await expectNotAllowed(linkPath);
+
+  // 覆盖目录变更后白名单立即跟随：旧目录里的匹配文件失效，新目录里的文件生效。
+  const secondTempDir = makeTempDir(t);
+  process.env.CODEX_WEB_OFFICIAL_TMPDIR = secondTempDir;
+  await expectNotAllowed(path.join(officialTempDir, "codex-clipboard-3b7203e4-3809-4ab2-ad9c-23e9a2074a71.jpg"));
+  const movedFile = path.join(secondTempDir, "codex-clipboard-3b7203e4-3809-4ab2-ad9c-23e9a2074a71.jpg");
+  fs.writeFileSync(movedFile, "y");
+  const response = createResponseRecorder();
+  await service.serveAppFsFile(`/api/app-fs/@fs/${encodeURIComponent(movedFile)}`, response);
+  await waitForResponseBody(response);
+  assert.equal(response.status, 200);
 });

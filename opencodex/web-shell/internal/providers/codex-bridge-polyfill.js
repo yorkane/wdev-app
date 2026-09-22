@@ -2366,9 +2366,12 @@
 
   // 自动重载限流：同一页面（sessionStorage 随标签页会话保留）在冷却窗口内最多自动重载一次，
   // 防止服务端异常持续发 reset 造成无限刷新风暴。
+  // reset 与 error 共用这一把锁：冷却限制的是「页面多久可以被自动重载一次」，与失败原因无关；
+  // 若两者交替出现，共享同一时间戳才能避免在同一窗口内放大成两次重载。
+  // 历史原因 key 名仍叫 port_reset_at，实际语义是「上次 app-host 失败自动重载时间」。
   const APP_HOST_RESET_RELOAD_COOLDOWN_MS = 30_000;
   const APP_HOST_RESET_RELOAD_STORAGE_KEY = "codex_app_host_port_reset_at";
-  function maybeReloadForAppHostPortReset(portId) {
+  function maybeReloadForAppHostFailure(eventPrefix, portId) {
     try {
       const storage = w.sessionStorage;
       if (!storage) return;
@@ -2376,20 +2379,25 @@
       const lastRaw = storage.getItem(APP_HOST_RESET_RELOAD_STORAGE_KEY);
       const lastAt = lastRaw ? Number(lastRaw) : 0;
       if (Number.isFinite(lastAt) && now - lastAt < APP_HOST_RESET_RELOAD_COOLDOWN_MS) {
-        // 刚重载过：只记诊断不再重载；页面恢复后若仍错位，由用户手动刷新兜底。
-        clientDiagnostic("app-host-port-reset-reload-suppressed", {
+        // 刚重载过（无论上次是 reset 还是 error）：只记诊断不再重载；
+        // 页面恢复后若仍不可用，由用户手动刷新兜底。
+        clientDiagnostic(eventPrefix + "-reload-suppressed", {
           portId,
           sinceLastMs: now - lastAt,
         });
         return;
       }
       storage.setItem(APP_HOST_RESET_RELOAD_STORAGE_KEY, String(now));
+      clientDiagnostic(eventPrefix + "-reload", { portId });
       location.reload();
     } catch {
       // sessionStorage 取不到（注入上下文受限等）：兜底策略是不自动重载、只记诊断，
       // 宁可等用户手动刷新也不做可能无限循环的 location.reload。
-      clientDiagnostic("app-host-port-reset-reload-skipped", { portId });
+      clientDiagnostic(eventPrefix + "-reload-skipped", { portId });
     }
+  }
+  function maybeReloadForAppHostPortReset(portId) {
+    maybeReloadForAppHostFailure("app-host-port-reset", portId);
   }
 
   function closeAppHostRelay(state, reason, notifyGateway) {
@@ -2464,6 +2472,15 @@
         portId,
       });
       closeAppHostRelay(state, "gateway_error", false);
+      // 网关把整条 relay 判死后，该页面的 app-host RPC 永久失效：MessagePort 是页面级的，
+      // 只在 connect-app-host 事件一次性下发，页面自己造不出等价 port，换 session 也没用，
+      // 唯一自愈途径是重载页面让官方代码重建 port。
+      // 取舍：decode_failed 是可预期失败（拖放/粘贴大图），若用户反复拖同一张大图，
+      // 「重载→再拖→再 error」的每一轮都依赖一次用户拖拽动作，且被共享冷却限制在
+      // 每 30s 窗口内最多一次重载，不会形成无人工动作的无限循环；这里不额外做
+      // 「只自愈首次」的门控，因为它需要额外的持久状态，且会让窗口内后续真正坏掉的
+      // port 也无法自愈，超出最小改动范围。
+      maybeReloadForAppHostFailure("app-host-port-error", portId);
       return true;
     }
     if (message.type === "app-host-port-close") {

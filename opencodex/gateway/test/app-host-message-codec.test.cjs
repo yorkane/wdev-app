@@ -132,3 +132,64 @@ test("rejects cycles, unsupported objects, and malformed wire data", () => {
   assert.throws(() => codec.decode(["bytes", "Uint8Array"]), /Invalid app-host bytes node/);
   assert.throws(() => codec.decode(["unknown"]), /Unknown app-host wire tag/);
 });
+
+test("fails controlled (TypeError, never RangeError) on oversized and deep-nested payloads", () => {
+  // 深嵌套 wire 必须被深度守卫以可控 TypeError 拦截；绝不能以
+  // "Maximum call stack size exceeded" 这种 RangeError 形式泄漏到 ws-hub。
+  let deepWire = ["string", "x"];
+  for (let index = 0; index < 10_000; index += 1) deepWire = ["array", [deepWire]];
+  assert.throws(
+    () => codec.decode(deepWire),
+    (error) => error instanceof TypeError && /depth limit/.test(error.message) && !/Maximum call stack/.test(error.message)
+  );
+  assert.throws(
+    () => codec.encodeMessageData(deepWire),
+    (error) => error instanceof TypeError && /depth limit/.test(error.message) && !/Maximum call stack/.test(error.message)
+  );
+
+  // 多 MB 级 base64 曾经让 RegExp.test 递归回溯直至栈溢出（生产日志
+  // app_host_message_decode_failed: Maximum call stack size exceeded）。
+  // 修复后：合法大 payload 正常解码；非法大 payload 走既有 Invalid base64
+  // TypeError 路径，同样不允许出现 RangeError。
+  const bigValidBase64 = "QUJD".repeat((5 * 1024 * 1024) / 4);
+  assert.doesNotThrow(() => codec.decode(["bytes", "Uint8Array", bigValidBase64]));
+
+  // 对合法大串篡改一个字符：长度保持 4 的倍数（不被余数检查提前拦截），
+  // 非法字符深入字符串内部，确保走线性字符校验路径。
+  const corrupted = 4 * 1024 * 1024; // 离末尾 1MB 处
+  const bigInvalidBase64 = bigValidBase64.slice(0, corrupted) + "!" + bigValidBase64.slice(corrupted + 1);
+  assert.equal(bigInvalidBase64.length, bigValidBase64.length);
+  assert.throws(
+    () => codec.decode(["bytes", "Uint8Array", bigInvalidBase64]),
+    (error) => error instanceof TypeError && /Invalid app-host base64 payload/.test(error.message) && !/Maximum call stack/.test(error.message)
+  );
+});
+
+test("keeps a 250KB Uint8Array bytes round-trip working end to end", () => {
+  // 正常大文件路径不能被防守逻辑弄坏：250KB 图片字节走 bytes 分支，
+  // 必须经过真实 JSON stringify/parse 后完整还原。
+  const bytes = new Uint8Array(250 * 1024);
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = (index * 31 + 7) & 0xff;
+
+  const restored = codec.decodeMessageData(JSON.parse(JSON.stringify(codec.encodeMessageData({ image: bytes }))));
+  assert.deepEqual(Array.from(restored.image), Array.from(bytes));
+  assert.equal(restored.image.byteLength, bytes.byteLength);
+});
+
+test("base64 validation keeps the original acceptance language at the edges", () => {
+  // 线性校验必须与旧正则的接受语言一致：空串、合法 padding 位置通过，
+  // 错误 padding 位置与非法字符拒绝。
+  assert.doesNotThrow(() => codec.decode(["bytes", "Uint8Array", ""]));
+  assert.equal(codec.decode(["bytes", "Uint8Array", ""]).byteLength, 0);
+  assert.doesNotThrow(() => codec.decode(["bytes", "Uint8Array", "QQ=="]));
+  assert.doesNotThrow(() => codec.decode(["bytes", "Uint8Array", "QUE="]));
+  assert.doesNotThrow(() => codec.decode(["bytes", "Uint8Array", "QUFB"]));
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "A==="]), /Invalid app-host base64 payload/);
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "AB=C"]), /Invalid app-host base64 payload/);
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "A=BC"]), /Invalid app-host base64 payload/);
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "Q==B"]), /Invalid app-host base64 payload/);
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "===="]), /Invalid app-host base64 payload/);
+  // 长度不是 4 的倍数在进校验器之前就被拒。
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "AAA"]), /Invalid app-host base64 payload/);
+  assert.throws(() => codec.decode(["bytes", "Uint8Array", "AAAAA"]), /Invalid app-host base64 payload/);
+});

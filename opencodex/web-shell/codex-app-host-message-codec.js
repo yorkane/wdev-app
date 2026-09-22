@@ -55,6 +55,34 @@
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   }
 
+  function isValidBase64(value) {
+    // 等价的线性校验：原正则在多 MB 输入上会触发 V8 递归回溯栈溢出
+    //（RangeError: Maximum call stack size exceeded），且发生在任何守卫之前。
+    // 这里保持与旧正则完全相同的接受语言：长度 %4==0、纯 base64 字母表，
+    // 或末组为 xx==/xxx=（已通过调用方的长度/余数检查）。
+    if (value.length === 0) return true;
+    const last = value.length - 4;
+    const isB64 = (code) =>
+      (code >= 0x41 && code <= 0x5a) ||
+      (code >= 0x61 && code <= 0x7a) ||
+      (code >= 0x30 && code <= 0x39) ||
+      code === 0x2b ||
+      code === 0x2f;
+    for (let i = 0; i < last; i++) {
+      if (!isB64(value.charCodeAt(i))) {
+        return false;
+      }
+    }
+    const g0 = value.charCodeAt(last);
+    const g1 = value.charCodeAt(last + 1);
+    const g2 = value.charCodeAt(last + 2);
+    const g3 = value.charCodeAt(last + 3);
+    if (!isB64(g0) || !isB64(g1)) return false;
+    if (g2 === 0x3d) return g3 === 0x3d;
+    if (!isB64(g2)) return false;
+    return g3 === 0x3d || isB64(g3);
+  }
+
   function bytesToBase64(bytes) {
     if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {
       return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
@@ -68,7 +96,9 @@
   }
 
   function base64ToBytes(value) {
-    if (typeof value !== "string" || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    // 线性校验替代正则（等价接受语言）：大 base64（数 MB）在 V8 上会让 RegExp.test
+    // 递归回溯直到栈溢出（RangeError），且发生在节点/深度守卫之前，属不可控崩溃。
+    if (typeof value !== "string" || value.length % 4 !== 0 || !isValidBase64(value)) {
       throw new TypeError("Invalid app-host base64 payload");
     }
     if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {

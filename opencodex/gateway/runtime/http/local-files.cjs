@@ -12,6 +12,7 @@ const {
   ensureDir,
   isWithinRoot,
   mimeType,
+  officialRuntimeTempDir,
   workspaceRootsFromEnv,
 } = require("../core/config.cjs");
 const { createZipArchiveFromDirectory, safeArchiveBaseName } = require("./local-archive.cjs");
@@ -23,6 +24,12 @@ const DEFAULT_LOCAL_FILE_TOKEN_MAX_ENTRIES = 512;
 const DEFAULT_PLUGIN_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const PLUGIN_IMAGE_PATH_MAX_CHARS = 8192;
 const PLUGIN_IMAGE_EXTENSIONS = new Set([".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"]);
+// 官方 renderer 剪贴板图片落盘的唯一文件名形态（asar 证据，persistImageFileToTemp）：
+//   path.join(os.tmpdir(), `codex-clipboard-${randomUUID()}.${jpg|png|gif|webp}`)，flag "wx"、mode 0600。
+// 官方在该 TMPDIR 下还会产生其它临时产物（codex-ipc socket、codex-app-icon-/codex-file-preview-
+// 等 mkdtemp 目录、codex-trace-* 追踪文件、codex_chronicle/ pid 等），但这些都不会以 app://fs
+// 引用，所以白名单只放行上面这一种文件名形态，避免把整个 0700 私有目录的内容暴露出去。
+const OFFICIAL_TEMP_FILE_NAME_PATTERN = /^codex-clipboard-[0-9a-fA-F-]+\.(?:png|jpe?g|gif|webp)$/;
 
 // 本模块只处理“浏览器临时预览本机文件”，所有入口都必须有 allowlist 或短期 token。
 /** Content-Disposition 文件名兜底，避免特殊字符破坏 inline 预览 header。 */
@@ -69,7 +76,21 @@ function isAllowedAppFsFile(filePath, extraWorkspaceRoots = []) {
     ...workspaceRootsFromEnv(),
     ...extraWorkspaceRoots,
   ];
-  return roots.some((root) => typeof root === "string" && root.length > 0 && isWithinRoot(filePath, root));
+  if (roots.some((root) => typeof root === "string" && root.length > 0 && isWithinRoot(filePath, root))) {
+    return true;
+  }
+  // 官方运行时把 TMPDIR 指向隔离目录（config.officialRuntimeTempDir，可用
+  // CODEX_WEB_OFFICIAL_TMPDIR / CODEX_WEB_OFFICIAL_TMP_DIR 覆盖，这里每次请求现取以跟随覆盖）：
+  // 原生拖放/粘贴进来的图片会由官方 renderer 写进该目录（codex-clipboard-<uuid>.<ext>），
+  // 若不放行，界面拿到的 app://fs 图片一律 404、附件缩略图加载失败。
+  // 该目录是官方进程私有 0700 目录，内含 socket/pid/追踪日志等其它产物，
+  // 因此这里做「目录 + 文件名形态」双重约束，而不是整目录放行。
+  const officialTempDir = officialRuntimeTempDir();
+  return (
+    officialTempDir.length > 0 &&
+    isWithinRoot(filePath, officialTempDir) &&
+    OFFICIAL_TEMP_FILE_NAME_PATTERN.test(path.basename(filePath))
+  );
 }
 
 function isAllowedLocalDownloadPath(filePath, extraWorkspaceRoots = []) {
