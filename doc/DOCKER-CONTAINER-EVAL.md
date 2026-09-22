@@ -107,7 +107,7 @@ Fatal server error: (EE) Cannot establish any listening sockets
 
 原生安装由 postinst 建 `codex-desktop` 账户并 chown 运行目录；容器里由 Dockerfile 做同样的事，
 并且**入口以该用户运行**。若挂卷的属主与之不一致，会出现原生同样的
-`SingletonLock: File exists / Permission denied` 然后反复重启（见 `deploy.md` §10.3）。
+`SingletonLock: File exists / Permission denied` 然后反复重启（原生侧的同类排查见 `deploy.md` §8）。
 挂 named volume 时通常没问题；挂宿主目录时注意 `chown 999:999`。
 
 ## 6. 与原生部署的差异对照
@@ -136,7 +136,7 @@ Fatal server error: (EE) Cannot establish any listening sockets
 ### 运行示例
 
 ```bash
-# 构建（仓库根目录，先按 deploy.md §3 产出 deb）
+# 构建（仓库根目录；先产出 deb，构建流程见 doc/GATEWAY-PACKAGING.md）
 docker build -f packaging/docker/Dockerfile \
   --build-arg DEB=dist/codex-desktop_2026.09.22.033811_amd64.deb \
   -t codex-desktop:2026.09.22 .

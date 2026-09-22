@@ -1,6 +1,6 @@
 # 由本仓库的 deb 装载出容器镜像。
 #
-# 用法（在仓库根目录，先按 deploy.md §3 产出 deb）：
+# 用法（在仓库根目录；先产出 deb，构建流程见 doc/GATEWAY-PACKAGING.md）：
 #   docker build -f packaging/docker/Dockerfile \
 #     --build-arg DEB=dist/codex-desktop_<版本>_amd64.deb \
 #     -t codex-desktop:latest .
