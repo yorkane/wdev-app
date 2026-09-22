@@ -44,6 +44,23 @@
 **可观测性**：新增 `app_host_orphaned` / `app_host_reattached` / `app_host_orphan_recycled` 等生命周期日志（同端口限流），
 自愈成功会留下 `app_host_reattached` 记录，便于日后统计「自愈了多少次」。
 
+### 仍然存在的根因（本轮**未**修完，需后续处理）
+
+实测发现：**只要有一个浏览器页连上来，隐藏渲染页的轮询就会开始报 `no such export ID`**；
+而**没有任何浏览器页连接时，6 分钟内 0 错误**。
+
+原因在 view 注册的共享键：`official-runtime.cjs:2321 createOfficialIpcEvent()` 把「浏览器页发起的所有 IPC（含 app-host connect）」
+的 sender 一律填成 `officialIpc.hiddenWebContents`。官方 main 用 `webContents.id` 当 key 注册 view，于是
+**浏览器页的会话会覆盖隐藏渲染页自己那条会话的注册槽（同一个 id=1）**；此后隐藏渲染页带着「自己会话的 export id」发请求，
+却被解到浏览器页的 export 表上 → `no such export ID: 1`。
+
+这也解释了全部历史现象：报错总出现在 `rendererWebContentsId=1 rendererWindowVisible=false`；刷新浏览器页只是重新注册、仍然覆盖；
+一度以为「刷新能修好隐藏页」只是因为重新注册后短暂对齐。
+
+**正确修法（尚未实施）**：让浏览器页的 app-host 会话**不占用隐藏渲染页的 view 注册槽** —— 例如为浏览器页建独立的
+（隐藏）webContents 作为 sender、或由网关自行接管 view 注册并在多条浏览器连接之间复用同一视图，使隐藏渲染页自己的会话不被顶掉。
+`ws-hub` 的孤儿化/重挂只能治「同一条会话被销毁」这一类，治不了「注册槽被顶掉」这一类。
+
 ### 判据
 
 ```bash
