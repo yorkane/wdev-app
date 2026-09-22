@@ -2,11 +2,10 @@
 #
 # 用法（在仓库根目录；先产出 deb，构建流程见 doc/GATEWAY-PACKAGING.md）：
 #   docker build -f packaging/docker/Dockerfile \
-#     --build-arg DEB=dist/codex-desktop_<版本>_amd64.deb \
+#     --build-arg DEB=dist/wdev_<版本>_amd64.deb \
 #     -t codex-desktop:latest .
 #
 # 运行（host 网络，与原生部署等价；注意 --shm-size 是 Chromium 需要）：
-#   docker run -d --name codex-desktop --network host --shm-size=1g --init \
 #     -v codex-desktop-state:/var/lib/codex-desktop codex-desktop:latest
 #
 # 运行（bridge + 端口映射）：必须把 HOST 改成 0.0.0.0，否则只绑容器内 loopback，

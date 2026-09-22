@@ -56,7 +56,7 @@ PACKAGE_WITH_UPDATER=0 MAX_BUILD_THREADS=4 make build-app-fresh
 PACKAGE_WITH_UPDATER=0 MAX_BUILD_THREADS=4 make deb
 ```
 
-Install the generated `codex-desktop_*.deb` from `dist/` with the normal Debian
+Install the generated `wdev_*.deb` from `dist/` with the normal Debian
 package manager. The source application is the official signed OpenAI ARM64
 Linux `.deb`, extracted directly without executing maintainer scripts.
 

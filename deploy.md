@@ -1,19 +1,23 @@
 # codex-desktop 部署与配置指南
 
-> 前提：已构建好安装包 `codex-desktop_<版本>_amd64.deb`。本文只讲在该机器上安装与配置。
-> 构建输入是 OpenAI 官方 Linux 包：https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb
+> 前提：已构建好安装包 `wdev_<版本>_amd64.deb`（当前版本 `wdev_2026.09.22.061341_amd64.deb`）。
+> 本文只讲在该机器上安装与配置；构建输入是 OpenAI 官方 Linux 包
+> https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb
+>
+> 注意：发布文件名是 `wdev_*`，但**包内部身份仍是 `codex-desktop`**——安装路径为 `/opt/codex-desktop`，
+> `dpkg -l` / `systemctl` 里看到的也是 `codex-desktop`。因此可以直接覆盖升级，无需先卸载旧版本。
 
 ## 1. 安装
 
 ```bash
-sudo apt-get install -y ./codex-desktop_<版本>_amd64.deb
+sudo apt-get install -y ./wdev_2026.09.22.061341_amd64.deb
 ```
 
-如果这台机器装过旧版本，加一个参数保留本机已有配置：
+把文件名换成你手上的版本即可。如果这台机器装过旧版本，加一个参数保留本机已有配置：
 
 ```bash
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  -o Dpkg::Options::="--force-confold" ./codex-desktop_<版本>_amd64.deb
+  -o Dpkg::Options::="--force-confold" ./wdev_2026.09.22.061341_amd64.deb
 ```
 
 安装会创建服务账户 `codex-desktop` 与运行目录，并注册两个 systemd 服务：
@@ -172,7 +176,7 @@ codex-desktop-gateway doctor --since 1h
 ```bash
 # 升级（保留本机配置）
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  -o Dpkg::Options::="--force-confold" ./codex-desktop_<新版本>_amd64.deb
+  -o Dpkg::Options::="--force-confold" ./wdev_<新版本>_amd64.deb
 codex-desktop-gateway restart
 
 # 卸载（保留配置与数据）

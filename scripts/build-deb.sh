@@ -18,6 +18,10 @@ PACKAGED_RUNTIME_TEMPLATE="$REPO_DIR/packaging/linux/codex-packaged-runtime.sh"
 
 PACKAGE_NAME="${PACKAGE_NAME:-codex-desktop}"
 PACKAGE_VERSION="${PACKAGE_VERSION:-$(date -u +%Y.%m.%d.%H%M%S)}"
+# 发布文件名基名，与包身份 PACKAGE_NAME 分离：
+# 包身份（/opt/<name>、/usr/bin/<name>、/etc/<name>、systemd 单元名、服务账户）保持 codex-desktop，
+# 以保证既有部署可原地升级；发布出来的 .deb 文件用产品名 wdev_<版本>_<架构>.deb。
+PACKAGE_FILE_BASENAME="${PACKAGE_FILE_BASENAME:-wdev}"
 ICON_SOURCE="$(resolve_package_icon_source)"
 MAX_BUILD_THREADS="${MAX_BUILD_THREADS:-0}"
 UPDATER_BINARY_SOURCE="${UPDATER_BINARY_SOURCE:-$REPO_DIR/target/release/codex-update-manager}"
@@ -79,7 +83,7 @@ main() {
 
     local arch output_file
     arch="$(map_arch)"
-    output_file="$DIST_DIR/${PACKAGE_NAME}_${PACKAGE_VERSION}_${arch}.deb"
+    output_file="$DIST_DIR/${PACKAGE_FILE_BASENAME}_${PACKAGE_VERSION}_${arch}.deb"
 
     info "Preparing package root at $PKG_ROOT"
     rm -rf "$PKG_ROOT"

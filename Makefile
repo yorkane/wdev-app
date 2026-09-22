@@ -12,7 +12,9 @@ MAX_BUILD_THREADS_VALUE := $(strip $(MAX_BUILD_THREADS))
 MAX_BUILD_THREADS_ENABLED := $(filter-out 0,$(MAX_BUILD_THREADS_VALUE))
 CARGO_JOBS_ARG = $(if $(MAX_BUILD_THREADS_ENABLED),--jobs $(MAX_BUILD_THREADS_VALUE),)
 RPM_BINARY_PAYLOAD ?= $(if $(MAX_BUILD_THREADS_ENABLED),w19T$(MAX_BUILD_THREADS_VALUE).zstdio,)
-DEB_GLOB := $(CURDIR)/dist/$(PACKAGE_NAME)_*.deb
+# 发布文件名用产品名（wdev），包身份仍是 PACKAGE_NAME（见 scripts/build-deb.sh）。
+DEB_FILE_BASENAME ?= wdev
+DEB_GLOB := $(CURDIR)/dist/$(DEB_FILE_BASENAME)_*.deb
 RPM_GLOB := $(CURDIR)/dist/$(PACKAGE_NAME)-*.rpm
 PACMAN_GLOB := $(CURDIR)/dist/$(PACKAGE_NAME)-[0-9]*.pkg.tar.*
 .DEFAULT_GOAL := help
@@ -131,7 +133,7 @@ deb: maybe-build-updater
 	  echo '[make] gateway build tree missing, running make gateway-build'; \
 	  $(MAKE) gateway-build; \
 	fi
-	MAX_BUILD_THREADS="$(MAX_BUILD_THREADS)" PACKAGE_VERSION="$(or $(PACKAGE_VERSION),)" PACKAGE_WITH_UPDATER="$(PACKAGE_WITH_UPDATER)" ./scripts/build-deb.sh
+	MAX_BUILD_THREADS="$(MAX_BUILD_THREADS)" PACKAGE_VERSION="$(or $(PACKAGE_VERSION),)" PACKAGE_WITH_UPDATER="$(PACKAGE_WITH_UPDATER)" PACKAGE_FILE_BASENAME="$(DEB_FILE_BASENAME)" ./scripts/build-deb.sh
 
 rpm: maybe-build-updater
 	MAX_BUILD_THREADS="$(MAX_BUILD_THREADS)" PACKAGE_VERSION="$(or $(PACKAGE_VERSION),)" PACKAGE_WITH_UPDATER="$(PACKAGE_WITH_UPDATER)" RPM_BINARY_PAYLOAD="$(RPM_BINARY_PAYLOAD)" ./scripts/build-rpm.sh
