@@ -52,6 +52,9 @@
   const BRIDGE_TOAST_BODY_RETRY_MAX = 12;
   const BRIDGE_TOAST_BODY_RETRY_BASE_MS = 40;
   const FILE_PICKER_SESSION_TIMEOUT_MS = 10 * 60_000;
+  // 用户取消文件对话框后，等这么久再确认「确实没有选中文件」。
+  // 取值需容忍 change 迟于 focus 到达；过短会把「选得慢」误判成取消并丢弃选择结果。
+  const FILE_PICKER_CANCEL_GRACE_MS = 1_000;
   const TERMINAL_QUEUE_MAX_SESSIONS = 64;
   const TERMINAL_QUEUE_MAX_PENDING_PER_SESSION = 512;
   const TERMINAL_QUEUE_MAX_TOTAL_PENDING = 4096;
@@ -1754,9 +1757,12 @@
     return new Promise((resolve, reject) => {
       const input = document.createElement("input");
       let finished = false;
+      // 只有「文件对话框打开让页面失焦」之后重新获得焦点，才可能是取消；见 handleFocus。
+      let sawBlur = false;
       let focusCheckTimer = 0;
       let sessionTimeout = 0;
       let disposeFocus = null;
+      let disposeBlur = null;
       const allowMultiple = pickFilesAllowsMultiple(params);
       const accept = pickFilesAccept(params);
 
@@ -1771,6 +1777,8 @@
       const cleanup = () => {
         disposeFocus?.();
         disposeFocus = null;
+        disposeBlur?.();
+        disposeBlur = null;
         if (focusCheckTimer) scheduler.clearTimeout(focusCheckTimer);
         if (sessionTimeout) scheduler.clearTimeout(sessionTimeout);
         focusCheckTimer = 0;
@@ -1788,12 +1796,27 @@
         finish([]);
       }
       function handleFocus() {
-        // macOS 文件选择器取消时不一定触发 change，用重新聚焦后的空列表表示取消。
+        /**
+         * 兜底「取消」判定：macOS 等平台上用户取消文件对话框时不一定触发 change，
+         * 用「重新聚焦后仍没有选中文件」表示取消。
+         *
+         * 但绝不能把「页面获得焦点」一律当成取消信号：用户从其它窗口切回来再点上传时，
+         * 页面本来就会立刻拿到 focus，此时对话框刚打开、input.files 必然为空，
+         * 旧逻辑会在 250ms 后丢弃 input —— 之后用户选好的文件通过 change 送达时已无处投递，
+         * 表现为「选了文件但没上传」。因此要求「先失焦（对话框真的打开过）再聚焦」才判定，
+         * 并放宽宽限期，容忍 change 迟于 focus 到达。
+         */
+        if (!sawBlur) return;
+        sawBlur = false;
         if (focusCheckTimer) scheduler.clearTimeout(focusCheckTimer);
         focusCheckTimer = scheduler.setTimeout(() => {
           focusCheckTimer = 0;
           if (!finished && (!input.files || input.files.length === 0)) finish([]);
-        }, 250);
+        }, FILE_PICKER_CANCEL_GRACE_MS);
+      }
+      function handleBlur() {
+        // 原生文件对话框会抢走焦点；记录「打开过」以便后续 focus 才有取消语义。
+        sawBlur = true;
       }
 
       input.addEventListener(
@@ -1806,6 +1829,7 @@
       );
       input.addEventListener("cancel", () => finish([]), { once: true });
       disposeFocus = adapterHost.events.observe({ key: {}, target: w, type: "focus", capture: true, callback: handleFocus });
+      disposeBlur = adapterHost.events.observe({ key: {}, target: w, type: "blur", capture: true, callback: handleBlur });
       activeBrowserFilePickerCancel = cancelPicker;
       // 某些 WebView 既不触发 cancel 也不恢复 focus；兜底释放离屏 input 与窗口监听。
       sessionTimeout = scheduler.setTimeout(cancelPicker, FILE_PICKER_SESSION_TIMEOUT_MS);
