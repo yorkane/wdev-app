@@ -274,6 +274,34 @@ test("main：--strict 时 FAIL/窗口内 block → 退出码 2；无 FAIL → 0"
 });
 
 test("main：--json 输出可 JSON.parse，含 checks/suggestions 五段结构化数据", async () => {
+  // --strict 只认 FAIL：窗口内有 block（遥测本就被拦，属设计内行为）但无 FAIL 时须退出 0，
+  // 否则健康机器永远退出 2、失去巡检价值；需要「有 block 就算失败」时用 --fail-on-block。
+  const fixture = makeFixture({
+    auditLines: [
+      // 时间戳必须落在 runDoctor 注入的固定时钟 NOW_MS（2026-09-21T17:00Z）窗口内。
+      JSON.stringify({ ts: ts("2026-09-21T16:50:00.000Z"), event: "block", host: "chatgpt.com", path: "/backend-api/wham/usage", method: "POST" }),
+      JSON.stringify({ ts: ts("2026-09-21T16:55:00.000Z"), event: "statsig-local", host: "ab.chatgpt.com", path: "/v1/initialize", method: "POST" }),
+    ],
+    logText: "normal line\n",
+  });
+  const gw = await startFakeGateway({});
+  const base = [
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+  ];
+  const strictOnly = await runDoctor([...base, "--strict"]);
+  assert.equal(strictOnly.code, 0, "有 block 但无 FAIL 时 --strict 必须 0");
+  const failOnBlock = await runDoctor([...base, "--fail-on-block", "--strict"]);
+  assert.equal(failOnBlock.code, 2, "--fail-on-block 命中 block 时必须 2");
+  await gw.close();
+});
+
+test("main：--json 输出可 JSON.parse，含 checks/suggestions 五段结构化数据（原用例）", async () => {
   const webConfigBody =
     "window.__CODEX_WEB_CONFIG__ = {" +
     'brand: {"name":"WasuDev","source":"config","configured":true},' +
@@ -352,6 +380,105 @@ test("main：日志坏模式命中时判据 FAIL", async () => {
 });
 
 test("main：坏参数（--since abc / 未知选项）退出码 1", async () => {
+  const fixture = makeFixture({ auditLines: [] });
+  const base = [
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+  ];
+  const bad1 = await runDoctor(["--since", "abc", ...base]);
+  assert.equal(bad1.code, 1);
+  const bad2 = await runDoctor(["--nope", "1", ...base]);
+  assert.equal(bad2.code, 1);
+  const bad3 = await runDoctor(["--top", "zero", ...base]);
+  assert.equal(bad3.code, 1);
+});
+
+test("main：窗口外的历史坏模式不计入 FAIL（避免修复前的旧行永久报警）", async () => {
+  // 同一个坏模式：一条在窗口内（记 FAIL），一条在窗口外（应被跳过）。
+  const stale = "2026-09-01T00:00:00.000Z";
+  const fresh = new Date(Date.now() - 60_000).toISOString();
+  const fixture = makeFixture({
+    auditLines: [],
+    logText:
+      "[" + stale + "] [Statsig] Failed to parse Response (old, already fixed)\n" +
+      "[" + fresh + "] [network-guard] net_fetch_served_local {}\n",
+  });
+  const gw = await startFakeGateway({});
+  const args = [
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+    "--json",
+  ];
+  const code = await runDoctor(args);
+  const report = JSON.parse(code.out);
+  const logCheck = report.checks.find((c) => c.id === "log-patterns");
+  assert.equal(logCheck.status, "PASS", "只有窗口外的历史命中时必须 PASS");
+  assert.match(logCheck.evidence, /窗口外还有 1 处/);
+  await gw.close();
+
+  // 对照：把同一条历史坏模式的时间戳改到窗口内，判据必须 FAIL。
+  const fixture2 = makeFixture({
+    auditLines: [],
+    logText: "[" + fresh + "] [Statsig] Failed to parse Response (fresh)\n",
+  });
+  const gw2 = await startFakeGateway({});
+  const code2 = await runDoctor([
+    "--since", "1h",
+    "--audit-file", fixture2.auditFile,
+    "--log-file", fixture2.logFile,
+    "--config-file", fixture2.configFile,
+    "--env-file", fixture2.envFile,
+    "--host", gw2.host,
+    "--port", String(gw2.port),
+    "--json",
+  ]);
+  const report2 = JSON.parse(code2.out);
+  const logCheck2 = report2.checks.find((c) => c.id === "log-patterns");
+  assert.equal(logCheck2.status, "FAIL", "窗口内的坏模式必须 FAIL");
+  await gw2.close();
+});
+
+test("main：坏参数（--since abc / 未知选项）退出码 1（原用例）", async () => {
+  // 真实 gateway.log 形态：Electron 控制台行没有 ISO 时间戳（install failed 就是这种），
+  // 夹在有时间戳的行之间。旧的那条必须被倒扫边界排除，不能永久 FAIL。
+  const oldTs = "2026-09-01T00:00:00.000Z";
+  const recentTs = new Date(Date.now() - 60000).toISOString();
+  const fixture = makeFixture({
+    auditLines: [],
+    logText: [
+      "[" + oldTs + "] [network-guard] net_fetch_blocked_by_config {}",
+      "[brand-network-overlay] main runtime install failed: BRAND_NAME_MAX_LENGTH is not defined",
+      "[" + oldTs + "] Launching app agentRunId=null buildFlavor=prod",
+      "[" + recentTs + "] [network-guard] net_fetch_served_local {}",
+      "",
+    ].join("\n"),
+  });
+  const gw = await startFakeGateway({});
+  const code = await runDoctor([
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+    "--json",
+  ]);
+  const report = JSON.parse(code.out);
+  const logCheck = report.checks.find((c) => c.id === "log-patterns");
+  assert.equal(logCheck.status, "PASS", "untimestamped stale line must fall outside the window");
+  assert.match(logCheck.evidence, /1 处/);
+  await gw.close();
+});
+
+test("main：坏参数（--since abc / 未知选项）退出码 1（原用例）", async () => {
   const fixture = makeFixture({ auditLines: [] });
   const base = [
     "--audit-file", fixture.auditFile,

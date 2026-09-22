@@ -28,8 +28,9 @@ const { spawnSync } = require("child_process");
 // 站点配置读取（品牌名 / block / allow）；本仓库无 YAML 依赖，复用其极小子集解析。
 const { loadSiteConfig } = require("../runtime/core/site-config.cjs");
 
-// 安装版本文件：打包态在 /opt/codex-desktop/gateway/VERSION，dev 树里可能不存在。
-const VERSION_FILE = path.resolve(__dirname, "..", "VERSION");
+// 安装版本文件：打包态在 <网关树根>/VERSION（本文件在 gateway/dev/ 下，故上溯两级）。
+const VERSION_FILE = path.resolve(__dirname, "..", "..", "VERSION");
+const PACKAGE_JSON_FILE = path.resolve(__dirname, "..", "..", "package.json");
 // 版本化资源命名空间：/official-patched-v8-<10位指纹>/（与 static-assets.cjs 同一形态）。
 const VERSIONED_PREFIX_RE = /\/official-patched-v8-[A-Za-z0-9_-]{10}\//;
 // 健康端点（匿名可访问）。注意：网关没有 /healthz 路由。
@@ -96,7 +97,8 @@ function usageText() {
     "  --top <n>         拦截活动榜取前 n 条（默认 15）",
     "  --min-count <n>   生成放行建议的最小 block 次数（默认 3）",
     "  --json            以 JSON 输出报告",
-    "  --strict          存在 FAIL 判据或窗口内 block 事件时退出码 2",
+    "  --strict          存在 FAIL 判据时退出码 2（适合巡检/CI）",
+    "  --fail-on-block   窗口内只要有 block 事件就退出码 2（默认不启用：拦截遥测是设计内行为）",
     "  --audit-file <p>  审计 JSONL（默认 /var/log/codex-desktop/network-audit.jsonl）",
     "  --log-file <p>    网关日志（默认 /var/log/codex-desktop/gateway.log）",
     "  --config-file <p> config.yaml（默认 /etc/codex-desktop/config.yaml）",
@@ -104,7 +106,7 @@ function usageText() {
     "  --host <h>        覆盖 env-file 里的 HOST（默认 127.0.0.1）",
     "  --port <p>        覆盖 env-file 里的 PORT（默认 3737）",
     "",
-    "退出码: 0 正常；1 参数错误；2 --strict 且存在 FAIL 判据或窗口内 block 事件。",
+    "退出码: 0 正常；1 参数错误；2 命中 --strict（有 FAIL 判据）或 --fail-on-block（有 block 事件）。",
   ].join("\n");
 }
 
@@ -116,6 +118,7 @@ function parseArgs(argv) {
     minCount: DEFAULT_MIN_COUNT,
     json: false,
     strict: false,
+    failOnBlock: false,
     auditFile: "/var/log/codex-desktop/network-audit.jsonl",
     logFile: "/var/log/codex-desktop/gateway.log",
     configFile: "/etc/codex-desktop/config.yaml",
@@ -157,6 +160,9 @@ function parseArgs(argv) {
         break;
       case "--strict":
         options.strict = true;
+        break;
+      case "--fail-on-block":
+        options.failOnBlock = true;
         break;
       case "--audit-file":
         result = needValue("--audit-file", i);
@@ -589,8 +595,29 @@ function extractVersionedAssetRef(body, prefix) {
   return match ? prefix + match[1] : '';
 }
 
-/** 判据 4：网关日志里三条坏模式逐条检查。 */
-function checkLogPatterns(logFile) {
+/**
+ * 从日志行里取时间戳（网关行首形如 [2026-09-22T00:38:55.421Z]）。
+ * 取不到返回 null：无法定年的行（例如栈续行）不参与窗口过滤，按「可能是本次」保留。
+ */
+function logLineTimestamp(line) {
+  const match = /^\s*\[?\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/.exec(line);
+  if (!match) return null;
+  const parsed = Date.parse(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * 判据 4：网关日志里三条坏模式逐条检查。
+ * 只统计统计窗口内的行：否则修复前的历史条目会让本判据永久 FAIL，
+ * 失去「升级后是否新引入问题」的判据意义。
+ *
+ * 实现为**从尾部倒扫**：日志按时间追加，遇到第一条「有时间戳且早于窗口」的行即停，
+ * 其前面的行必然也在窗口外。这样 Electron 控制台那种**没有时间戳**的行（例如
+ * `[brand-network-overlay] … install failed`）会按位置归入窗口内或窗口外，
+ * 而不是像「无时间戳一律算窗口内」那样把陈年旧账永久算成 FAIL。
+ */
+function checkLogPatterns(logFile, options = {}) {
+  const cutoff = Number.isFinite(options.cutoffMs) ? options.cutoffMs : null;
   let raw = "";
   try {
     raw = fs.readFileSync(logFile, "utf-8");
@@ -598,27 +625,49 @@ function checkLogPatterns(logFile) {
     return { id: "log-patterns", status: "UNKNOWN", evidence: "日志文件不存在或不可读: " + logFile, text: null };
   }
   const lines = raw.split("\n");
+  // 倒扫确定窗口边界：stopAtRightOf 之上的行都在窗口内，之下的都在窗口外。
+  let windowStartIndex = 0; // 0 = 整个文件都在窗口内
+  if (cutoff !== null) {
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const ts = logLineTimestamp(lines[i]);
+      if (ts !== null && ts < cutoff) {
+        windowStartIndex = i + 1;
+        break;
+      }
+    }
+  }
   const hits = [];
+  let skipped = 0;
   LOG_BAD_PATTERNS.forEach((pattern) => {
     lines.forEach((line, index) => {
-      if (pattern.re.test(line)) hits.push({ pattern: pattern.name, line: index + 1, content: trimText(line, 120) });
+      if (!pattern.re.test(line)) return;
+      if (index < windowStartIndex) { skipped += 1; return; }
+      hits.push({ pattern: pattern.name, line: index + 1, content: trimText(line, 120), ts: logLineTimestamp(line) });
     });
   });
   if (hits.length === 0) {
-    return { id: "log-patterns", status: "PASS", evidence: "三条坏模式均未命中（brand-network-overlay install failed / Statsig 解析失败 / ERR_MODULE_NOT_FOUND）", text: raw };
+    const scope = cutoff === null ? "" : "窗口内 ";
+    const note = skipped > 0 ? "（窗口外还有 " + skipped + " 处历史命中，不计入）" : "";
+    return { id: "log-patterns", status: "PASS", evidence: scope + "三条坏模式均未命中（brand-network-overlay install failed / Statsig 解析失败 / ERR_MODULE_NOT_FOUND）" + note, text: raw, skipped };
   }
   const detail = hits
     .slice(0, 5)
-    .map((hit) => "L" + hit.line + " [" + hit.pattern + "] " + hit.content)
+    .map((hit) => "L" + hit.line + (hit.ts ? " @" + new Date(hit.ts).toISOString() : "") + " [" + hit.pattern + "] " + hit.content)
     .join("；");
-  return { id: "log-patterns", status: "FAIL", evidence: "命中 " + hits.length + " 处：" + detail, text: raw };
+  return { id: "log-patterns", status: "FAIL", evidence: "窗口内命中 " + hits.length + " 处：" + detail, text: raw, skipped };
 }
 
 function readInstallVersion() {
   try {
     return fs.readFileSync(VERSION_FILE, "utf-8").trim() || "unknown";
   } catch {
-    return "unknown";
+    // dev 树没有 VERSION 时回落到 package.json，避免报告里出现无意义的 unknown。
+    try {
+      const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON_FILE, "utf-8"));
+      return pkg && pkg.version ? String(pkg.version) : "unknown";
+    } catch {
+      return "unknown";
+    }
   }
 }
 
@@ -716,7 +765,7 @@ async function main(argv, injected = {}) {
     const audit = aggregateAudit(options.auditFile, sinceMs, nowMs);
 
     // 四条升级自检判据（HTTP 探测并行，日志判据同步）。
-    const logCheck = checkLogPatterns(options.logFile);
+    const logCheck = checkLogPatterns(options.logFile, { cutoffMs: nowMs - sinceMs });
     const logText = logCheck.text;
     const [webConfigCheck, namespaceCheck] = await Promise.all([
       checkWebConfig(host, port, siteConfig),
@@ -746,6 +795,7 @@ async function main(argv, injected = {}) {
       top: options.top,
       minCount: options.minCount,
       strict: options.strict,
+      failOnBlock: options.failOnBlock,
       service: {
         unit: unitStatus.unit,
         activeState: unitStatus.activeState,
@@ -783,7 +833,11 @@ async function main(argv, injected = {}) {
     } else {
       stdout.write(renderHuman(report) + "\n");
     }
-    return options.strict && (hasFail || hasBlock) ? 2 : 0;
+    // --strict 只对「判据 FAIL」报警：窗口内出现 block 是设计内行为（遥测本就被拦），
+    // 若把它也算失败，健康机器会永远退出 2，失去巡检价值。需要那种语义时用 --fail-on-block。
+    if (options.strict && hasFail) return 2;
+    if (options.failOnBlock && hasBlock) return 2;
+    return 0;
   } catch (error) {
     // 兜底：doctor 本身不能因任何外部探测崩溃。
     stderr.write("doctor 运行异常（兜底）: " + (error && error.message ? error.message : String(error)) + "\n");

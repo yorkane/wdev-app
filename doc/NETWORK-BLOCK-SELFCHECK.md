@@ -82,6 +82,12 @@ codex-desktop-gateway doctor --json          # 机器可读
 codex-desktop-gateway doctor --strict        # 有可疑项时退出码 2（可进巡检/CI）
 ```
 
+> `--strict` 只对「判据 FAIL」报警（例如 `initialize` 被判成 block）。窗口内出现拦截**不算失败** ——
+> 拦截遥测本来就是设计内行为，否则健康机器会永远退出 2。需要「只要有拦截就报错」时用 `--fail-on-block`。
+
+> 日志判据按统计窗口取：从日志尾部倒扫，遇到第一条早于窗口的行即停，因此修复前的历史条目
+> （例如老版本那条 `main runtime install failed`）不会让判据永久 FAIL，只在证据里注明「窗口外还有 N 处」。
+
 输出四段：
 
 1. **服务/健康**：unit 状态、重启次数、端口、`/api/health`（网关健康路由）、安装版本。
