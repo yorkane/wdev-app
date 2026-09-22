@@ -26,6 +26,12 @@
   const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE, "zh-CN", "zh", "en-US", "en"];
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const WS_READY_WAIT_TIMEOUT_MS = 2500;
+  // 隐藏渲染页（官方后台轮询页）visibilityState 恒为 hidden：隐藏态重连只推迟、不无限推迟，
+  // 超过该上限后仍强制重连一次（走下方指数退避），否则 WS 一掉该页就永远断线。
+  const HIDDEN_RECONNECT_MAX_DEFER_MS = Math.max(
+    5_000,
+    Number(cfg?.hiddenReconnectMaxDeferMs) || 30_000
+  );
   const CLIENT_DIAGNOSTIC_FLUSH_DELAY_MS = 120;
   const CLIENT_DIAGNOSTIC_MAX_BATCH = 40;
   const LOW_PRIORITY_IPC_CONCURRENCY = 2;
@@ -477,6 +483,7 @@
   let reconnectTimer = null;
   let reconnectDelay = 500;
   let reconnectDeferredUntilVisible = false;
+  let hiddenReconnectDeferredAtMs = 0;
   const bridgeStartedAtMs = Date.now();
   const clientDiagnosticQueue = [];
   let clientDiagnosticFlushTimer = null;
@@ -2333,6 +2340,34 @@
     });
   }
 
+  // 自动重载限流：同一页面（sessionStorage 随标签页会话保留）在冷却窗口内最多自动重载一次，
+  // 防止服务端异常持续发 reset 造成无限刷新风暴。
+  const APP_HOST_RESET_RELOAD_COOLDOWN_MS = 30_000;
+  const APP_HOST_RESET_RELOAD_STORAGE_KEY = "codex_app_host_port_reset_at";
+  function maybeReloadForAppHostPortReset(portId) {
+    try {
+      const storage = w.sessionStorage;
+      if (!storage) return;
+      const now = Date.now();
+      const lastRaw = storage.getItem(APP_HOST_RESET_RELOAD_STORAGE_KEY);
+      const lastAt = lastRaw ? Number(lastRaw) : 0;
+      if (Number.isFinite(lastAt) && now - lastAt < APP_HOST_RESET_RELOAD_COOLDOWN_MS) {
+        // 刚重载过：只记诊断不再重载；页面恢复后若仍错位，由用户手动刷新兜底。
+        clientDiagnostic("app-host-port-reset-reload-suppressed", {
+          portId,
+          sinceLastMs: now - lastAt,
+        });
+        return;
+      }
+      storage.setItem(APP_HOST_RESET_RELOAD_STORAGE_KEY, String(now));
+      location.reload();
+    } catch {
+      // sessionStorage 取不到（注入上下文受限等）：兜底策略是不自动重载、只记诊断，
+      // 宁可等用户手动刷新也不做可能无限循环的 location.reload。
+      clientDiagnostic("app-host-port-reset-reload-skipped", { portId });
+    }
+  }
+
   function closeAppHostRelay(state, reason, notifyGateway) {
     if (!state || state.closed || state.closing) return;
     state.closing = true;
@@ -2363,9 +2398,22 @@
       message.type !== "app-host-port-connected" &&
       message.type !== "app-host-port-message" &&
       message.type !== "app-host-port-close" &&
-      message.type !== "app-host-port-error"
+      message.type !== "app-host-port-error" &&
+      message.type !== "app-host-port-reset"
     ) {
       return false;
+    }
+    if (message.type === "app-host-port-reset") {
+      // gateway 判定这个 port 背后的官方 session 已不在（孤儿窗口过期后被回收）：
+      // 页面手里的 MessagePort 指向不存在的 session，新建 relay 必然 export 错位。
+      // 官方 port 由 connect-app-host 事件下发，页面自己造不出等价 port，
+      // 唯一自愈途径是重载页面让官方代码重建 port 与 session。
+      clientDiagnostic("app-host-port-reset", {
+        portId: typeof message.portId === "string" ? message.portId : "",
+        reason: typeof message.reason === "string" ? message.reason : "",
+      });
+      maybeReloadForAppHostPortReset(message.portId);
+      return true;
     }
     const portId = typeof message.portId === "string" ? message.portId : "";
     const state = appHostPortRelays.get(portId);
@@ -3662,6 +3710,7 @@
     socket.addEventListener("open", () => {
       // hello 会把本页面 clientId 注册到 gateway，后续审批/fetch 响应才能定向回来。
       reconnectDelay = 500;
+      hiddenReconnectDeferredAtMs = 0;
       try {
         socket.send(JSON.stringify({ type: "hello", clientId }));
         clientDiagnostic("ws-hello-sent", {
@@ -3867,9 +3916,16 @@
     if (reconnectTimer) return;
     if (document.visibilityState === "hidden") {
       reconnectDeferredUntilVisible = true;
-      return;
+      const deferredAtMs = hiddenReconnectDeferredAtMs || Date.now();
+      hiddenReconnectDeferredAtMs = deferredAtMs;
+      if (Date.now() - deferredAtMs < HIDDEN_RECONNECT_MAX_DEFER_MS) {
+        // 隐藏态继续推迟重连（省电/省连接），直到上限。
+        return;
+      }
+      // 推迟超上限：强制重连（沿用指数退避间隔，不会产生重连风暴）。
     }
     reconnectDeferredUntilVisible = false;
+    hiddenReconnectDeferredAtMs = 0;
     clientDiagnostic("ws-reconnect-scheduled", {
       elapsedMs: reconnectDelay,
       wsReady,

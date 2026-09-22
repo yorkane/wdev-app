@@ -237,6 +237,8 @@ const BROWSER_PROVIDER_DEFINITIONS: readonly BrowserProviderDefinition[] = Objec
   // 品牌文字替换：把已渲染 DOM 文本与用户可见属性里的官方品牌词换成站点品牌名。
   { key: "brand-text", points: { primary: "web.runtime.dom.brand-text" } },
   { key: "menu-item-guard", points: { primary: "web.runtime.dom.menu-item-guard" } },
+  // 内核错误捕获与能力探测：错误上报默认开启，不受 DEBUG_LOGS 门控。
+  { key: "js-error-capture", points: { primary: "web.runtime.dom.js-error-capture" } },
 ]);
 
 const MOBILE_SIDEBAR_TOUCH_SCROLL_STYLE_ID = "opencodex-mobile-sidebar-touch-scroll-styles";

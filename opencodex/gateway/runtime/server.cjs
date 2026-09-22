@@ -87,6 +87,60 @@ const IPC_INVOKE_BODY_MAX_BYTES =
   Math.ceil((CODEX_WEB_PICKED_FILES_MAX_TOTAL_BYTES * 4) / 3) + 2 * 1024 * 1024;
 const GATEWAY_PLUGIN_SYNC_PENDING_COOKIE = "opencodex_gateway_plugin_sync_pending";
 
+// ---------------------------------------------------------------- 客户端 JS 错误落盘
+// js-* 事件（js-error / js-unhandled-rejection / js-capability）是长期可用性埋点：
+// 老内核浏览器（如移动端 Kiki）上官方 bundle 的报错只从这里回到服务端，
+// 因此默认落盘、与 DEBUG_LOGS 解耦；网关侧再做一层限流，防止被恶意页面刷爆日志。
+const JS_ERROR_LOG_EVENT_RE = /^js-(error|unhandled-rejection|capability)$/;
+const JS_ERROR_LOG_SIG_REPEAT_MS = 30 * 1000; // 同签名 30 秒内只落一条
+const JS_ERROR_LOG_CLIENT_WINDOW_MS = 60 * 1000; // 单 clientId 统计窗口
+const JS_ERROR_LOG_CLIENT_MAX_PER_WINDOW = 10; // 窗口内最多落 10 条
+const JS_ERROR_LOG_STATE_MAX = 1024;
+const jsErrorLogSignatures = new Map(); // 签名 -> 最近落盘时间
+const jsErrorLogClientCounts = new Map(); // clientId -> { count, windowStart }
+
+function shortLogValue(value, limit) {
+  const text = typeof value === "string" ? value : "";
+  if (!text) return "";
+  return text.length > limit ? text.slice(0, limit) + "..." : text;
+}
+
+/** 判断一条 js-* 事件是否应落盘；非 js-* 事件一律返回 false（走 DEBUG_LOGS 原路径）。 */
+function shouldLogJsError(event, data, now) {
+  if (!JS_ERROR_LOG_EVENT_RE.test(event)) return false;
+  now = now === undefined ? Date.now() : now;
+  const clientId = data && typeof data.clientId === "string" ? data.clientId.slice(0, 64) : "";
+  if (clientId) {
+    let bucket = jsErrorLogClientCounts.get(clientId);
+    if (!bucket || now - bucket.windowStart >= JS_ERROR_LOG_CLIENT_WINDOW_MS) {
+      bucket = { count: 0, windowStart: now };
+      jsErrorLogClientCounts.set(clientId, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > JS_ERROR_LOG_CLIENT_MAX_PER_WINDOW) return false;
+    if (jsErrorLogClientCounts.size > JS_ERROR_LOG_STATE_MAX) {
+      for (const [key, entry] of jsErrorLogClientCounts.entries()) {
+        if (now - entry.windowStart >= JS_ERROR_LOG_CLIENT_WINDOW_MS) jsErrorLogClientCounts.delete(key);
+      }
+    }
+  }
+  const signature = [
+    clientId,
+    event,
+    shortLogValue(data && data.message, 120),
+    shortLogValue(data && data.reason, 120),
+    shortLogValue(data && data.source, 120),
+  ].join("\u0000");
+  const lastAt = jsErrorLogSignatures.get(signature) || 0;
+  if (now - lastAt < JS_ERROR_LOG_SIG_REPEAT_MS) return false;
+  if (jsErrorLogSignatures.size >= JS_ERROR_LOG_STATE_MAX) {
+    const oldestKey = jsErrorLogSignatures.keys().next().value;
+    if (oldestKey !== undefined) jsErrorLogSignatures.delete(oldestKey);
+  }
+  jsErrorLogSignatures.set(signature, now);
+  return true;
+}
+
 function gatewayUrl(req) {
   // Node 原生 req.url 只有 path，需要补 host 才能安全解析 query 参数。
   return new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -211,13 +265,27 @@ function safeClientLogData(value) {
     "rawChars",
     "ready",
     "reason",
+    "reasonName",
     "requestId",
     "requestMethod",
     "responseType",
     "status",
     "startedCount",
+    "source",
+    "stack",
     "target",
+    "tag",
+    "ua",
+    "platform",
+    "deviceMemory",
+    "hardwareConcurrency",
     "totalQueuedCount",
+    "kind",
+    "line",
+    "applied",
+    "missing",
+    "message",
+    "col",
     "type",
     "url",
     "waitMs",
@@ -226,6 +294,13 @@ function safeClientLogData(value) {
     "wsState",
   ]) {
     const nestedValue = value[key];
+    if ((key === "missing" || key === "applied") && Array.isArray(nestedValue)) {
+      // 能力清单对诊断有价值，数组压成逗号串并限制条数与长度。
+      const joined = nestedValue.filter((item) => typeof item === "string").slice(0, 64).join(",");
+      const listSanitized = sanitizeDiagnosticValue(key + "List", joined);
+      if (listSanitized !== undefined) result[key] = listSanitized;
+      continue;
+    }
     const sanitized = sanitizeDiagnosticValue(key, nestedValue);
     if (sanitized !== undefined) result[key] = key === "clientId" ? shortId(String(sanitized)) : sanitized;
   }
@@ -251,14 +326,17 @@ async function handleClientLog(req, res) {
 
   // 浏览器端会批量上报诊断事件，减少日志本身对真实 IPC 请求的干扰；旧单事件格式继续兼容。
   const entries = Array.isArray(parsed.events) ? parsed.events.slice(0, 200) : [parsed];
-  if (DEBUG_LOGS) {
-    // client-diagnostic 是浏览器侧辅助埋点，正常渲染会大量触发；默认只接收不落盘，排查前端链路时再打开。
-    for (const entry of entries) {
-      const event = entry && typeof entry.event === "string" ? entry.event.slice(0, 120) : "unknown";
-      const data = safeClientLogData(entry && entry.data);
-      if (!data.clientId && typeof parsed.clientId === "string") data.clientId = shortId(parsed.clientId);
-      diagnosticLog("client-diagnostic", event, data);
+  for (const entry of entries) {
+    const event = entry && typeof entry.event === "string" ? entry.event.slice(0, 120) : "unknown";
+    const data = safeClientLogData(entry && entry.data);
+    if (!data.clientId && typeof parsed.clientId === "string") data.clientId = shortId(parsed.clientId);
+    if (shouldLogJsError(event, data)) {
+      // js-* 事件默认落盘（网关侧已限流），与 DEBUG_LOGS 解耦。
+      diagnosticLog("client-js-error", event, data);
+      continue;
     }
+    // client-diagnostic 是浏览器侧辅助埋点，正常渲染会大量触发；默认只接收不落盘，排查前端链路时再打开。
+    if (DEBUG_LOGS) diagnosticLog("client-diagnostic", event, data);
   }
   return sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
 }
@@ -991,5 +1069,7 @@ module.exports = {
     gatewayCompatibilityPaths,
     holdHiddenRuntimeGcmRequest,
     isHiddenRuntimeGcmHoldRequest,
+    // js-* 客户端错误落盘的限流判定，单独导出便于单测（纯函数，只读内存态 Map）。
+    shouldLogJsError,
   },
 };

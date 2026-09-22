@@ -225,6 +225,7 @@
   "web.runtimeCompatibility.point.web.runtime.dom.tooltip-dismiss.description": "Adapt official Tooltip mounting and dismissal.",
   "web.runtimeCompatibility.point.web.runtime.dom.brand-text.description": "Replace rendered official brand text with the site brand name.",
   "web.runtimeCompatibility.point.web.runtime.dom.menu-item-guard.description": "Hide the official new-feature, help and pet menu entries.",
+  "web.runtimeCompatibility.point.web.runtime.dom.js-error-capture.description": "Capture browser kernel JS errors and probe missing API capabilities on older mobile browsers.",
   "web.runtimeCompatibility.point.web.runtime.dom.window-controls-overlay.description": "Adapt the PWA title bar and safe areas.",
   "web.runtimeCompatibility.point.web.runtime.smart-router.composer.description": "Locate and adapt the official model picker.",
   "web.runtimeCompatibility.point.web.runtime.smart-router.settings.description": "Inject smart scheduling into official settings.",

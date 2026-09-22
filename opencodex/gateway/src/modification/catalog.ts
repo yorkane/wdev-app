@@ -324,6 +324,9 @@ export const POINT_DEFINITIONS = Object.freeze([
   point("web.runtime.dom.brand-text", "把已渲染界面的官方品牌文字替换为站点品牌名", "web-shell", G.rendererUi, A.semanticView),
   // 官方帮助菜单的新功能/帮助与账号菜单的显示宠物都是外链或无关入口，按文案隐藏。
   point("web.runtime.dom.menu-item-guard", "隐藏官方帮助与宠物里的无关菜单项", "web-shell", G.rendererUi, A.semanticView),
+  // 老内核（移动端第三方浏览器）的 JS 报错与能力探测：错误上报默认落盘，
+  // 能力缺失清单驱动服务端诊断；polyfill 只补缺失 API，不改变已有行为。
+  point("web.runtime.dom.js-error-capture", "捕获浏览器内核 JS 报错并探测缺失的 API 能力", "web-shell", G.rendererUi, A.semanticView),
   windowControlsOverlayPoint(),
   pluginPoint("web.runtime.smart-router.composer", "定位并适配官方模型选择器", "smart-router", G.smartRouting, P.smartModelRouter, A.semanticView),
   pluginPoint("web.runtime.smart-router.settings", "向官方设置注入智能调度页面", "smart-router", G.smartRouting, P.smartModelRouter, A.semanticView),

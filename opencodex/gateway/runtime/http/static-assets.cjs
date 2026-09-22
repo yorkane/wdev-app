@@ -76,6 +76,9 @@ const CODEX_STATSIG_TELEMETRY_GUARD_PATH = "/codex-statsig-telemetry-guard.js";
 const CODEX_NETWORK_GUARD_PATH = "/codex-network-guard.js";
 const CODEX_BRAND_TEXT_PATH = "/codex-brand-text.js";
 const CODEX_MENU_ITEM_GUARD_PATH = "/codex-menu-item-guard.js";
+// 内核错误捕获与能力兜底：老内核（如 Kiki 移动端浏览器）上官方 bundle 的 JS
+// 报错要能回到服务端，缺失 API 要能探测并打最小 polyfill。
+const CODEX_JS_ERROR_CAPTURE_PATH = "/codex-js-error-capture.js";
 const FAVICON_PATH = "/favicon.ico";
 const PWA_MANIFEST_PATH = "/manifest.webmanifest";
 const OFFICIAL_LOADING_SHIMMER_POWER_GUARD = [
@@ -148,6 +151,7 @@ const BROWSER_PROVIDER_KEY_BY_FILE = new Map([
   [path.join(INTERNAL_PROVIDER_DIR, "codex-network-guard.js"), "network-guard"],
   [path.join(INTERNAL_PROVIDER_DIR, "codex-brand-text.js"), "brand-text"],
   [path.join(INTERNAL_PROVIDER_DIR, "codex-menu-item-guard.js"), "menu-item-guard"],
+  [path.join(INTERNAL_PROVIDER_DIR, "codex-js-error-capture.js"), "js-error-capture"],
 ]);
 const OFFICIAL_OPEN_IN_FOLDER_MESSAGE_ID = "artifactTab.preview.openInFolder";
 const OPENCODEX_DOWNLOAD_FILE_MESSAGE_ID = "web.remoteFile.downloadFile";
@@ -332,6 +336,7 @@ const WEB_SHELL_STATIC_FILES = new Map([
   [CODEX_NETWORK_GUARD_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-network-guard.js")],
   [CODEX_BRAND_TEXT_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-brand-text.js")],
   [CODEX_MENU_ITEM_GUARD_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-menu-item-guard.js")],
+  [CODEX_JS_ERROR_CAPTURE_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-js-error-capture.js")],
   [CODEX_APP_HOST_MESSAGE_CODEC_PATH, path.join(WEB_SHELL_DIR, "codex-app-host-message-codec.js")],
   [CODEX_BRIDGE_POLYFILL_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-bridge-polyfill.js")],
   [CODEX_REMOTE_FILE_ACTIONS_PATH, path.join(INTERNAL_PROVIDER_DIR, "codex-remote-file-actions.js")],
@@ -772,6 +777,8 @@ function createStaticAssetService({
         CODEX_NETWORK_GUARD_PATH,
         CODEX_BRAND_TEXT_PATH,
         CODEX_MENU_ITEM_GUARD_PATH,
+        // 错误捕获随聚合运行时下发：监听要在官方 bundle 解析前挂上。
+        CODEX_JS_ERROR_CAPTURE_PATH,
         OPENCODEX_MODIFICATION_ACTIVATE_PATH,
       ].map((reqPath) => WEB_SHELL_STATIC_FILES.get(reqPath)),
     };
@@ -1144,6 +1151,8 @@ function createStaticAssetService({
           runtimeScript(CODEX_NETWORK_GUARD_PATH),
           runtimeScript(CODEX_BRAND_TEXT_PATH),
           runtimeScript(CODEX_MENU_ITEM_GUARD_PATH),
+          // 逐文件回退路径同样带上错误捕获，聚合 bootstrap 与逐文件两条链路等价。
+          runtimeScript(CODEX_JS_ERROR_CAPTURE_PATH),
           runtimeScript(OPENCODEX_MODIFICATION_ACTIVATE_PATH),
         ];
     // manifest 在 Cloudflare Access 等前置认证后面也必须带同源凭据，否则 Chrome 可能拿不到受保护的 manifest。

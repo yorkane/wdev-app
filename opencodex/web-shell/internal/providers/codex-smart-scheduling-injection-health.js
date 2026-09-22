@@ -70,8 +70,10 @@
   };
 
   function interpolate(template, values) {
+    // 老内核（Kiki）可能缺 String.prototype.replaceAll：%key% 占位符都是字面量，
+    // split/join 为等价改写，行为一致。
     return Object.entries(values).reduce(
-      (result, [key, value]) => result.replaceAll(`%${key}%`, String(value)),
+      (result, [key, value]) => result.split(`%${key}%`).join(String(value)),
       String(template || "")
     );
   }

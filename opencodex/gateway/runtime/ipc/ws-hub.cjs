@@ -30,6 +30,15 @@ const WS_MAX_BUFFERED_BYTES = Math.max(
   Number(process.env.OPENCODEX_WS_MAX_BUFFERED_BYTES) || 64 * 1024 * 1024
 );
 const APP_HOST_RELAY_MAX_ENTRIES = Math.max(1, Number(process.env.OPENCODEX_APP_HOST_MAX_RELAYS) || 64);
+// WS 临时断开时官方 app-host 会话的保留时长：页面重连窗口内保留官方 MessagePortMain，
+// 让浏览器旧 MessagePort 重挂回同一条 relay，避免官方 main 新建 session 后 export 表错位。
+// 默认放宽到 30 分钟：手机切后台/系统挂起常远超 5 分钟，5 分钟一过 TTL 到期即触发
+// app-host-port-reset（页面整页重载），正在进行的会话会被打断，代价明显高于保留成本。
+// 代价是官方 main 侧 session 多保留一份（每条约一个 MessagePortMain + 少量缓冲帧），
+// 由 orphanAppHostRelays 的全局上限（按最旧优先回收）兜底，内存不会无界增长。
+const APP_HOST_ORPHAN_TTL_MS = Math.max(5_000, Number(process.env.OPENCODEX_APP_HOST_ORPHAN_TTL_MS) || 30 * 60_000);
+// 孤儿/重挂/回收事件的诊断限流：同一 port 窗口内最多一条，避免断线抖动刷屏。
+const APP_HOST_LIFECYCLE_LOG_WINDOW_MS = 30_000;
 const WS_IPC_MAX_IN_FLIGHT = Math.max(32, Number(process.env.OPENCODEX_WS_IPC_MAX_IN_FLIGHT) || 4096);
 const ROUTE_ID_SCAN_MAX_NODES = 128;
 const BROADCAST_DEDUPE_MAX_ENTRIES_PER_SOCKET = 16;
@@ -113,6 +122,7 @@ function createWsHub(
     handleNotificationEvent,
     isAuthed,
     maxAppHostRelays = APP_HOST_RELAY_MAX_ENTRIES,
+    orphanTtlMs = APP_HOST_ORPHAN_TTL_MS,
     maxBufferedBytes = WS_MAX_BUFFERED_BYTES,
     maxClients = WS_MAX_CLIENTS,
     maxPayloadBytes = WS_MAX_PAYLOAD_BYTES,
@@ -149,6 +159,262 @@ function createWsHub(
   let suppressedAuthRejectCount = 0;
   const appHostTraffic = new Map();
   let nextAppHostRelayGeneration = 0;
+  // 官方 app-host relay 的孤儿表：key 是 clientId:portId。WS 断开时 relay 不在这里销毁，
+  // 而是保留官方 MessagePortMain 等页面重连；官方 main 的 RPC session 与 MessagePort 终身绑定，
+  // 一旦这里先销毁，页面重连后建出的新 session 必然和页面旧 MessagePort 的 export 表错位
+  // （生产日志表现为 sa_server_request_failed "no such export ID: 1"，刷新页面才能恢复）。
+  const orphanedAppHostRelays = new Map();
+  const orphanedAppHostByClient = new Map();
+  const appHostLifecycleLogState = new Map();
+  // 曾经建立过官方会话的 clientId:portId 记录。重连时若同名端口没有可重挂的孤儿（已过期/已死），
+  // 说明页面 MessagePort 背后的官方 session 已经不存在，新 relay 建的必然是错位的新 session；
+  // 此时通知页面走 app-host-port-reset 自愈（页面自动重载重建 port），而不是让用户手动刷新。
+  const everLiveAppHostPorts = new Map();
+  const EVER_LIVE_PORT_MAX_ENTRIES = 1024;
+  // 孤儿窗口内官方→浏览器方向帧的缓冲上限：RPC 的 push 帧直接决定两端 export 表长度，
+  // 丢一帧就是永久性 export 错位，所以断线窗口内的下行帧必须完整缓冲，重挂后按序冲刷。
+  const ORPHAN_FRAME_LIMIT = 4000;
+  const ORPHAN_FRAME_CHARS_LIMIT = 16 * 1024 * 1024;
+
+  function logAppHostLifecycle(scope, portKey, event, details = {}) {
+    const now = Date.now();
+    const state = appHostLifecycleLogState.get(portKey) || { lastAt: 0, suppressed: 0 };
+    if (now - state.lastAt < APP_HOST_LIFECYCLE_LOG_WINDOW_MS) {
+      state.suppressed += 1;
+      appHostLifecycleLogState.set(portKey, state);
+      if (state.suppressed % 100 !== 0) return;
+      // 被限流的事件只在第 100 次时补一条汇总，既保留可计数性又不刷屏。
+      diagnosticWarn(scope, `${event}_throttled`, { ...details, suppressed: state.suppressed });
+      state.suppressed = 0;
+      state.lastAt = now;
+      return;
+    }
+    state.lastAt = now;
+    if (state.suppressed > 0) details.suppressedBefore = state.suppressed;
+    appHostLifecycleLogState.set(portKey, state);
+    diagnosticWarn(scope, event, details);
+  }
+
+  function orphanKeyFor(clientId, portId) {
+    return `${clientId}:${portId}`;
+  }
+
+  function rememberEverLivePort(clientId, portId) {
+    const key = orphanKeyFor(clientId, portId);
+    everLiveAppHostPorts.set(key, Date.now());
+    while (everLiveAppHostPorts.size > EVER_LIVE_PORT_MAX_ENTRIES) {
+      const oldest = everLiveAppHostPorts.keys().next().value;
+      if (oldest === undefined) break;
+      everLiveAppHostPorts.delete(oldest);
+    }
+  }
+
+  function removeOrphanEntry(entry) {
+    if (orphanedAppHostRelays.get(entry.key) === entry) orphanedAppHostRelays.delete(entry.key);
+    const ports = orphanedAppHostByClient.get(entry.clientId);
+    if (ports) {
+      ports.delete(entry.key);
+      if (ports.size === 0) orphanedAppHostByClient.delete(entry.clientId);
+    }
+    if (entry.timer) clearTimeout(entry.timer);
+  }
+
+  function findOrphanEntry(clientId, portId) {
+    return orphanedAppHostRelays.get(orphanKeyFor(clientId, portId)) || null;
+  }
+
+  function dropOrphanForContext(context, reason) {
+    // relay 在孤儿期间自行终止（官方端关闭端口/编码失败等）：官方 session 已死，
+    // 条目必须移除，页面回来时只能走新 relay + reset 自愈路径。
+    const entry = findOrphanEntry(context.clientId, context.portId);
+    if (!entry) return;
+    removeOrphanEntry(entry);
+    logAppHostLifecycle("ws-hub", entry.key, "app_host_orphan_dropped", {
+      clientId: shortId(context.clientId),
+      portId: shortId(context.portId),
+      reason,
+    });
+  }
+
+  function enqueueOrphanFrame(context, data) {
+    if (context.terminalState !== "orphaned") return false;
+    let wireData;
+    try {
+      wireData = appHostMessageCodec.encodeMessageData(data);
+    } catch (error) {
+      logAppHostLifecycle("ws-hub", orphanKeyFor(context.clientId, context.portId), "app_host_orphan_encode_failed", {
+        clientId: shortId(context.clientId),
+        portId: shortId(context.portId),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // 先落 terminal 再 close，保证 close 回调里 relayIsCurrent 按 closed 判定，不会误发端口错误帧。
+      context.terminalState = "closed";
+      dropOrphanForContext(context, "orphan_encode_failed");
+      try {
+        context.relay?.close("orphan_encode_failed");
+      } catch {}
+      return false;
+    }
+    if (!context.orphanFrames) {
+      context.orphanFrames = [];
+      context.orphanFrameChars = 0;
+    }
+    const chars = typeof wireData.data === "string"
+      ? 256 + wireData.data.length
+      : 256 + (JSON.stringify(wireData) || "").length;
+    if (context.orphanFrames.length >= ORPHAN_FRAME_LIMIT || context.orphanFrameChars + chars > ORPHAN_FRAME_CHARS_LIMIT) {
+      // 缓冲放不下说明断线窗口远超预期（或帧异常巨大）：主动终止官方 session，
+      // 页面回来时收到 reset 通知后自动重载，保证可恢复而不是静默错位。
+      logAppHostLifecycle("ws-hub", orphanKeyFor(context.clientId, context.portId), "app_host_orphan_buffer_overflow", {
+        clientId: shortId(context.clientId),
+        portId: shortId(context.portId),
+        frames: context.orphanFrames.length,
+        chars: context.orphanFrameChars,
+      });
+      dropOrphanForContext(context, "orphan_buffer_overflow");
+      // 先落 terminal 再 close，同上。
+      context.terminalState = "closed";
+      try {
+        context.relay?.close("orphan_buffer_overflow");
+      } catch {}
+      return false;
+    }
+    context.orphanFrames.push(wireData);
+    context.orphanFrameChars += chars;
+    return true;
+  }
+
+  function relayScopeOf(context) {
+    // relay 回调在创建时闭包捕获的是当时 socket 的 map；孤儿重挂后 map 会换，
+    // 必须每次动态解析，否则重挂后官方→浏览器方向的帧会被 relayIsCurrent 判成旧 generation 丢弃。
+    if (context && context.relaysMap) return context.relaysMap;
+    if (context && context.ws && context.ws.__codexAppHostRelays) return context.ws.__codexAppHostRelays;
+    return null;
+  }
+
+  function recycleOrphan(entry) {
+    const { key, clientId, portId, context, timer } = entry;
+    if (timer) clearTimeout(timer);
+    if (orphanedAppHostRelays.get(key) !== entry) return;
+    orphanedAppHostRelays.delete(key);
+    const ports = orphanedAppHostByClient.get(clientId);
+    if (ports) {
+      ports.delete(key);
+      if (ports.size === 0) orphanedAppHostByClient.delete(clientId);
+    }
+    if (context.terminalState !== "active" && context.terminalState !== "orphaned") return;
+    // 回收时按正常 peer-close 释放官方 session：先 null 再关端口，官方端把它当作页面关闭。
+    let graceful = false;
+    try {
+      graceful = context.relay?.postMessage(null) === true;
+    } catch {}
+    if (!graceful) {
+      try {
+        context.relay?.close("orphan_expired");
+      } catch {}
+    }
+    context.terminalState = "closed";
+    logAppHostLifecycle("ws-hub", key, "app_host_orphan_recycled", {
+      clientId: shortId(clientId),
+      portId: shortId(portId),
+      waitedMs: Math.max(0, Date.now() - entry.sinceAt),
+    });
+  }
+
+  function orphanAppHostRelays(ws, ttlMs) {
+    const relays = ws.__codexAppHostRelays;
+    if (!relays || relays.size === 0) return 0;
+    const clientId = socketClientId(ws);
+    let count = 0;
+    for (const [portId, context] of [...relays]) {
+      if (context.terminalState !== "active" || context.registered !== true) continue;
+      relays.delete(portId);
+      const key = orphanKeyFor(clientId, portId);
+      const existing = orphanedAppHostRelays.get(key);
+      if (existing) {
+        // 同名孤儿还在保留窗口内：让新断开取代旧条目（同一页面只有一份官方 port）。
+        clearTimeout(existing.timer);
+        existing.context.terminalState = "closed";
+        try {
+          existing.context.relay?.close("replaced_by_newer_disconnect");
+        } catch {}
+      }
+      context.terminalState = "orphaned";
+      context.terminalNotified = false;
+      // 关闭旧 socket 与 relay 的绑定：relay 的 onMessage/onClose 都按 relayIsCurrent 判定，
+      // 这里不再属于任何 socket 的 relays 表；孤儿窗口内官方→浏览器帧改走 enqueueOrphanFrame 缓冲。
+      context.relaysMap = null;
+      const entry = { key, clientId, portId, context, sinceAt: Date.now(), timer: null };
+      entry.timer = setTimeout(() => recycleOrphan(entry), Math.max(1, Number(ttlMs) || APP_HOST_ORPHAN_TTL_MS));
+      if (typeof entry.timer.unref === "function") entry.timer.unref();
+      rememberEverLivePort(clientId, portId);
+      orphanedAppHostRelays.set(key, entry);
+      let ports = orphanedAppHostByClient.get(clientId);
+      if (!ports) {
+        ports = new Map();
+        orphanedAppHostByClient.set(clientId, ports);
+      }
+      ports.set(key, entry);
+      count += 1;
+    }
+    // 全局孤儿上限：页面反复 reload 会不断产生新 clientId 的孤儿会话，按最旧优先回收，
+    // 上限与每 socket 的 relay 上限同量级，避免官方 main 侧 session 无界累积。
+    while (orphanedAppHostRelays.size > Math.max(1, Number(maxAppHostRelays) || 1)) {
+      const oldest = orphanedAppHostRelays.entries().next().value;
+      if (!oldest) break;
+      recycleOrphan(oldest[1]);
+    }
+    if (count > 0) {
+      logAppHostLifecycle("ws-hub", `${clientId}:orphan-batch`, "app_host_orphaned", {
+        clientId: shortId(clientId),
+        orphanedPorts: count,
+        ttlMs: Math.max(1, Number(ttlMs) || APP_HOST_ORPHAN_TTL_MS),
+      });
+    }
+    return count;
+  }
+
+  function reattachOrphanedAppHostRelay(ws, clientId, portId) {
+    const key = orphanKeyFor(clientId, portId);
+    const entry = orphanedAppHostRelays.get(key);
+    if (!entry) return null;
+    const { context, timer } = entry;
+    if (context.terminalState !== "orphaned") {
+      orphanedAppHostRelays.delete(key);
+      const ports = orphanedAppHostByClient.get(clientId);
+      if (ports) ports.delete(key);
+      return null;
+    }
+    clearTimeout(timer);
+    orphanedAppHostRelays.delete(key);
+    const ports = orphanedAppHostByClient.get(clientId);
+    if (ports) {
+      ports.delete(key);
+      if (ports.size === 0) orphanedAppHostByClient.delete(clientId);
+    }
+    // 重新挂回当前 socket：复用同一条 relay 和同一个官方 MessagePortMain，
+    // 官方 main 侧的 RPC session 从头到尾没有换过，页面 MessagePort 的 export 表保持有效。
+    context.terminalState = "active";
+    context.ws = ws;
+    context.relaysMap = appHostRelaysForSocket(ws);
+    context.terminalNotified = false;
+    context.relaysMap.set(portId, context);
+    rememberEverLivePort(clientId, portId);
+    // 断线窗口内缓冲的官方帧先冲刷，再发 connected 让页面冲刷它自己的上行队列；
+    // 两个方向各自保持 FIFO，RPC export 表不会被乱序/丢帧打错位。
+    for (const frame of context.orphanFrames || []) {
+      safeSend(ws, { type: "app-host-port-message", portId, ...frame }, { suppressDiagnostic: true });
+    }
+    context.orphanFrames = [];
+    context.orphanFrameChars = 0;
+    rememberEverLivePort(clientId, portId);
+    logAppHostLifecycle("ws-hub", key, "app_host_reattached", {
+      clientId: shortId(clientId),
+      portId: shortId(portId),
+      orphanMs: Math.max(0, Date.now() - entry.sinceAt),
+    });
+    return context;
+  }
 
   function socketRemoteAddress(socket) {
     return (socket && socket.__codexRemoteAddress) || "";
@@ -470,9 +736,14 @@ function createWsHub(
     return true;
   }
 
-  function closeAppHostRelays(ws, reason) {
+  function closeAppHostRelays(ws, reason, { ttlMs } = {}) {
     const relays = ws.__codexAppHostRelays;
     if (!relays || relays.size === 0) return;
+    if (reason === "client_disconnected" && ttlMs) {
+      // 临时性 WS 断开：保留官方端口等页面重连，见 orphanAppHostRelays 注释。
+      orphanAppHostRelays(ws, ttlMs);
+      return;
+    }
     // 页面断开时主动关闭官方端口，否则官方 app-host 服务会保留无主连接。
     for (const context of [...relays.values()]) {
       let graceful = false;
@@ -488,7 +759,9 @@ function createWsHub(
 
   function removeClient(ws) {
     flushAppHostTrafficForClient(socketClientId(ws));
-    closeAppHostRelays(ws, "client_disconnected");
+    // WS 断开（close/error 都会走到这里）按临时断开处理：孤儿化 relay 保留官方 session，
+    // 页面重连后重新挂接；超过保留窗口仍没回来才真正释放官方端口。
+    closeAppHostRelays(ws, "client_disconnected", { ttlMs: orphanTtlMs });
     clients.delete(ws);
     if (ws.__codexWebClientId && clientsById.get(ws.__codexWebClientId) === ws) {
       const clientId = ws.__codexWebClientId;
@@ -640,6 +913,32 @@ function createWsHub(
       return true;
     }
 
+    const reattached = reattachOrphanedAppHostRelay(ws, clientId, portId);
+    if (reattached) {
+      // 复用同一条 relay 与同一个官方 MessagePortMain：官方 main 的 RPC session 从未更换，
+      // 页面 MessagePort 的 export 表保持有效，因此不会出现 no such export ID。
+      // ack 与新建路径完全一致（{ type, portId }）；reattached 标记仅供诊断。
+      safeSend(ws, { type: "app-host-port-connected", portId, reattached: true }, { suppressDiagnostic: true });
+      return true;
+    }
+
+    // 孤儿窗口已过（TTL 回收/主动丢弃）但同一个 clientId:portId 曾有过正常会话：
+    // 页面手里仍是旧 session 的 MessagePort，而官方 main 侧的 session 已释放，
+    // 此时新建 relay 必然造出一个和页面 export 表错位的新 session（no such export ID 复发）。
+    // 不新建，直接通知页面走 app-host-port-reset 自愈（页面自动重载重建 port）。
+    // 精确判定：命中 everLive 表（曾有过正常会话）且当前 socket 上没有该 port 的 active relay、
+    // 上面也没有可重挂的 orphan——三者同时成立才说明页面手里是已失效的旧 port。
+    const everLiveSinceAt = everLiveAppHostPorts.get(orphanKeyFor(clientId, portId));
+    if (everLiveSinceAt !== undefined && !appHostRelaysForSocket(ws).get(portId)) {
+      logAppHostLifecycle("ws-hub", orphanKeyFor(clientId, portId), "app_host_port_reset_requested", {
+        clientId: shortId(clientId),
+        portId: shortId(portId),
+        ageMs: Math.max(0, Date.now() - everLiveSinceAt),
+      });
+      safeSend(ws, { type: "app-host-port-reset", portId, reason: "session-expired" }, { suppressDiagnostic: true });
+      return true;
+    }
+
     const relays = appHostRelaysForSocket(ws);
     const existing = relays.get(portId);
     if (existing) {
@@ -676,8 +975,9 @@ function createWsHub(
         portId,
         remoteAddress: req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "",
         onClose(reason) {
-          // 旧 generation 的 close 只能释放自身资源，不能通知当前浏览器 relay。
-          if (!relayIsCurrent(relays, context)) return;
+          // 旧 generation 的 close 只能释放自身资源，不能通知当前浏览器 relay；
+          // relays 动态解析（relayScopeOf），孤儿重挂后 map 已换，仍能正确判定归属。
+          if (!relayIsCurrent(relayScopeOf(context) || relays, context)) return;
           closeAppHostRelay(relays, context, reason);
           if (DEBUG_LOGS) {
             diagnosticLog("ws-hub", "app_host_closed", {
@@ -693,7 +993,12 @@ function createWsHub(
         },
         onMessage(data) {
           // 旧字符串保持原帧；新版结构化克隆值编码成 JSON-safe wire 数据后再进入 WebSocket。
-          if (!relayIsCurrent(relays, context)) return;
+          // 孤儿窗口内官方→浏览器帧改入缓冲队列，重挂后按 FIFO 冲刷；丢一帧就是永久 export 错位。
+          if (context.terminalState === "orphaned") {
+            enqueueOrphanFrame(context, data);
+            return;
+          }
+          if (!relayIsCurrent(relayScopeOf(context) || relays, context)) return;
           let wireData;
           try {
             wireData = appHostMessageCodec.encodeMessageData(data);
@@ -723,7 +1028,7 @@ function createWsHub(
       });
       context.relay = relay;
       context.registered = true;
-      if (context.terminalState !== "active") {
+      if (context.terminalState !== "active" && context.terminalState !== "orphaned") {
         try {
           relay.close("connect_failed");
         } catch {}

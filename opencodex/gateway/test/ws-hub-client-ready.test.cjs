@@ -115,7 +115,11 @@ test("restores app-host downlink before the first post-reconnect data frame", as
 
   first.close();
   await waitForClose(first);
-  await relays[0].closedPromise;
+  // 断开只孤儿化 relay：官方端口不关闭，closedPromise 不应被触发。
+  let closedFired = false;
+  relays[0].closedPromise.then(() => { closedFired = true; });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(closedFired, false);
 
   const second = new WebSocket(url);
   sockets.push(second);
@@ -124,15 +128,17 @@ test("restores app-host downlink before the first post-reconnect data frame", as
   await waitForMessage(second, (message) => message.type === "hello-ack");
   // bridge 在 hello-ack 后主动重发 connect，不依赖新的 browser-to-official RPC 数据。
   second.send(JSON.stringify({ type: "app-host-connect", clientId, portId }));
-  await waitForMessage(second, (message) => message.type === "app-host-port-connected");
+  const ack = await waitForMessage(second, (message) => message.type === "app-host-port-connected");
+  assert.equal(ack.reattached, true);
+  assert.equal(relays.length, 1);
 
   const officialMessage = waitForMessage(
     second,
     (message) => message.type === "app-host-port-message" && message.data === "thread/updated"
   );
-  relays[1].emitMessage("thread/updated");
+  relays[0].emitMessage("thread/updated");
   await officialMessage;
-  assert.equal(relays.length, 2);
+  assert.equal(relays.length, 1);
 });
 
 test("replaces an overlapping socket for the same browser client before broadcasts", async (t) => {
