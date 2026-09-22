@@ -337,7 +337,8 @@ test("main：--json 输出可 JSON.parse，含 checks/suggestions 五段结构�
   assert.equal(report.config.locale, "zh-CN");
   assert.equal(report.config.blockedHosts.length, 2);
   assert.equal(report.activity.totalBlock, 3);
-  assert.ok(Array.isArray(report.checks) && report.checks.length === 4);
+  // 五条升级自检判据：initialize / web-config / namespace-health / log-patterns / app-host-view-slot。
+  assert.ok(Array.isArray(report.checks) && report.checks.length === 5);
   assert.ok(Array.isArray(report.suggestions));
   assert.ok(report.suggestions.some((s) => s.rule === "chatgpt.com/backend-api/*"));
   assert.match(report.suggestionsYaml, /allowPaths:/);
@@ -492,6 +493,112 @@ test("main：坏参数（--since abc / 未知选项）退出码 1（原用例）
   assert.equal(bad2.code, 1);
   const bad3 = await runDoctor(["--top", "zero", ...base]);
   assert.equal(bad3.code, 1);
+});
+
+// ---------- 判据 5：app-host-view-slot ----------
+
+const EXPORT_LINE = (tsIso) =>
+  "[" + tsIso + "] [electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 1\"} rendererWebContentsId=1 rendererWindowVisible=false";
+
+test("main：app-host-view-slot 计数 ≥ 阈值 → FAIL 且计入 --strict", async () => {
+  const fixture = makeFixture({
+    auditLines: [],
+    // 3 条窗口内（NOW_MS=2026-09-21T17:00Z，--since 1h 切线 16:00）的隐藏渲染页症状行。
+    logText:
+      EXPORT_LINE("2026-09-21T16:40:00.000Z") + "\n" +
+      EXPORT_LINE("2026-09-21T16:50:00.000Z") + "\n" +
+      EXPORT_LINE("2026-09-21T16:59:59.000Z") + "\n",
+  });
+  const gw = await startFakeGateway({});
+  const args = [
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+    "--json",
+  ];
+  const code = await runDoctor(args);
+  const report = JSON.parse(code.out);
+  const check = report.checks.find((c) => c.id === "app-host-view-slot");
+  assert.ok(check, "报告必须包含 app-host-view-slot 判据");
+  assert.equal(check.status, "FAIL", "窗口内 3 次（=阈值）必须 FAIL");
+  assert.match(check.evidence, /3 次/);
+  assert.match(check.evidence, /OPENCODEX_APP_HOST_AUTORECOVER/);
+  // --strict：FAIL 判据存在时退出码 2。
+  const strict = await runDoctor([...args.slice(0, args.length - 1), "--strict"]);
+  assert.equal(strict.code, 2, "--strict 下 app-host-view-slot FAIL 必须退出 2");
+  // 非 strict 时退出码保持 0（症状判据只报警，不阻断巡检）。
+  assert.equal(code.code, 0);
+  await gw.close();
+});
+
+test("main：app-host-view-slot 低计数 → PASS（偶发不报警）", async () => {
+  const fixture = makeFixture({
+    auditLines: [],
+    logText: EXPORT_LINE("2026-09-21T16:50:00.000Z") + "\n",
+  });
+  const gw = await startFakeGateway({});
+  const code = await runDoctor([
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+    "--json",
+  ]);
+  const report = JSON.parse(code.out);
+  const check = report.checks.find((c) => c.id === "app-host-view-slot");
+  assert.equal(check.status, "PASS", "1 次（<阈值 3）视为偶发 PASS");
+  await gw.close();
+});
+
+test("main：app-host-view-slot 窗口外历史行不计入；浏览器页行不计入", async () => {
+  const staleLine =
+    "[2026-09-21T15:00:00.000Z] [electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 1\"} rendererWebContentsId=1 rendererWindowVisible=false";
+  const browserLine =
+    "[2026-09-21T16:50:00.000Z] [electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 1\"} rendererWebContentsId=1 rendererWindowVisible=true";
+  const otherIdLine =
+    "[2026-09-21T16:51:00.000Z] [electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 7\"} rendererWebContentsId=2 rendererWindowVisible=false";
+  const fixture = makeFixture({ auditLines: [], logText: [staleLine, browserLine, otherIdLine].join("\n") + "\n" });
+  const gw = await startFakeGateway({});
+  const code = await runDoctor([
+    "--since", "1h",
+    "--audit-file", fixture.auditFile,
+    "--log-file", fixture.logFile,
+    "--config-file", fixture.configFile,
+    "--env-file", fixture.envFile,
+    "--host", gw.host,
+    "--port", String(gw.port),
+    "--json",
+  ]);
+  const report = JSON.parse(code.out);
+  const check = report.checks.find((c) => c.id === "app-host-view-slot");
+  assert.equal(check.status, "PASS", "窗口外历史行 / 浏览器页行 / 其他 webContents 的行都不计入");
+  assert.match(check.evidence, /计数为 0/);
+  await gw.close();
+});
+
+test("countAppHostViewSlotFailures：行分类细节（可见行、id≠1、无标记行）", () => {
+  const lines = [
+    "[2026-09-21T16:40:00.000Z] [electron-message-handler] no such export ID: 1 rendererWebContentsId=1 rendererWindowVisible=false",
+    "[2026-09-21T16:41:00.000Z] [electron-message-handler] no such export ID: 1 rendererWebContentsId=1 rendererWindowVisible=true",
+    "[2026-09-21T16:42:00.000Z] [electron-message-handler] no such export ID: 9 rendererWebContentsId=2 rendererWindowVisible=false",
+    "[2026-09-21T16:43:00.000Z] [electron-message-handler] no such entry on exports table rendererWindowVisible=false",
+    "some other line with no error",
+  ];
+  const result = doctor.__test.countAppHostViewSlotFailures(lines, 0);
+  assert.equal(result.count, 2, "只计 id=1 隐藏页 + 无标记的症状行");
+  assert.equal(result.lastLine, 4);
+  assert.equal(result.lastTs, Date.parse("2026-09-21T16:43:00.000Z"));
+  // windowStartIndex 截断：窗口外的行不计。
+  const clamped = doctor.__test.countAppHostViewSlotFailures(lines, 3);
+  assert.equal(clamped.count, 1);
+  assert.equal(doctor.__test.APP_HOST_VIEW_SLOT_THRESHOLD, 3);
 });
 
 test("main：窗口内无活动 → 报告含「（窗口内无拦截活动）」且无建议", async () => {

@@ -45,6 +45,13 @@ const LOG_BAD_PATTERNS = [
   { name: "ERR_MODULE_NOT_FOUND", re: /ERR_MODULE_NOT_FOUND/ },
 ];
 
+// 判据 5（app-host-view-slot）：隐藏渲染页的 view 注册槽被浏览器页会话覆盖后，官方 main 的
+// electron-message-handler 会在网关日志里刷 "no such export ID"（rendererWebContentsId=1 /
+// rendererWindowVisible=false）。窗口内计数 ≥ 阈值判 FAIL：这是已知未修根因（doc/SESSION-IDLE-AND-KIKI-DIAGNOSIS.md），
+// 当前缓解是无浏览器客户端连接时自动重载隐藏页（OPENCODEX_APP_HOST_AUTORECOVER），完整修复待定。
+const APP_HOST_VIEW_SLOT_FAILURE_RE = /no such export ID|no such entry on exports table/;
+const APP_HOST_VIEW_SLOT_THRESHOLD = 3;
+
 // 参与拦截活动榜聚合的事件类型（config 事件是启动快照，不进榜单）。
 const AGGREGATED_EVENTS = new Set(["block", "allow-path", "statsig-local"]);
 const DEFAULT_MIN_COUNT = 3;
@@ -638,6 +645,8 @@ function checkLogPatterns(logFile, options = {}) {
   }
   const hits = [];
   let skipped = 0;
+  // 判据 5 复用这里算好的窗口边界：统计隐藏渲染页 "no such export ID" 的窗口内次数。
+  const exportSlot = countAppHostViewSlotFailures(lines, windowStartIndex);
   LOG_BAD_PATTERNS.forEach((pattern) => {
     lines.forEach((line, index) => {
       if (!pattern.re.test(line)) return;
@@ -648,13 +657,59 @@ function checkLogPatterns(logFile, options = {}) {
   if (hits.length === 0) {
     const scope = cutoff === null ? "" : "窗口内 ";
     const note = skipped > 0 ? "（窗口外还有 " + skipped + " 处历史命中，不计入）" : "";
-    return { id: "log-patterns", status: "PASS", evidence: scope + "三条坏模式均未命中（brand-network-overlay install failed / Statsig 解析失败 / ERR_MODULE_NOT_FOUND）" + note, text: raw, skipped };
+    return { id: "log-patterns", status: "PASS", evidence: scope + "三条坏模式均未命中（brand-network-overlay install failed / Statsig 解析失败 / ERR_MODULE_NOT_FOUND）" + note, text: raw, skipped, exportSlot };
   }
   const detail = hits
     .slice(0, 5)
     .map((hit) => "L" + hit.line + (hit.ts ? " @" + new Date(hit.ts).toISOString() : "") + " [" + hit.pattern + "] " + hit.content)
     .join("；");
-  return { id: "log-patterns", status: "FAIL", evidence: "窗口内命中 " + hits.length + " 处：" + detail, text: raw, skipped };
+  return { id: "log-patterns", status: "FAIL", evidence: "窗口内命中 " + hits.length + " 处：" + detail, text: raw, skipped, exportSlot };
+}
+
+/**
+ * 统计窗口内隐藏渲染页 "no such export ID" 的次数与最后出现时间（判据 5 用）。
+ * 只认「隐藏渲染页」报的行：明确标 rendererWindowVisible=true 的行来自浏览器页，跳过；
+ * 带 rendererWebContentsId= 的行必须 id=1（隐藏窗口恒为第一个 webContents）；
+ * 没有 id 字段的行按症状行计数（无 visible 标记时按隐藏页处理）。
+ */
+function countAppHostViewSlotFailures(lines, windowStartIndex) {
+  const result = { count: 0, lastTs: null, lastLine: null };
+  for (let index = windowStartIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!APP_HOST_VIEW_SLOT_FAILURE_RE.test(line)) continue;
+    if (/rendererWindowVisible=true/.test(line)) continue;
+    const idMatch = /rendererWebContentsId=(\d+)/.exec(line);
+    if (idMatch && Number(idMatch[1]) !== 1) continue;
+    result.count += 1;
+    result.lastLine = index + 1;
+    const ts = logLineTimestamp(line);
+    if (ts !== null) result.lastTs = ts;
+  }
+  return result;
+}
+
+/** 判据 5：app-host view 注册槽错位（已知未修根因的症状计数；计 FAIL 并参与 --strict）。 */
+function checkAppHostViewSlot(logCheck) {
+  const slot = logCheck && logCheck.exportSlot;
+  if (!slot || typeof slot.count !== "number") {
+    return { id: "app-host-view-slot", status: "UNKNOWN", evidence: "日志不可读，无法统计 \"no such export ID\"" };
+  }
+  if (slot.count === 0) {
+    return { id: "app-host-view-slot", status: "PASS", evidence: "窗口内隐藏渲染页 \"no such export ID\" 计数为 0（未观察到 view 注册槽被覆盖的症状）" };
+  }
+  if (slot.count < APP_HOST_VIEW_SLOT_THRESHOLD) {
+    return { id: "app-host-view-slot", status: "PASS", evidence: "窗口内出现 " + slot.count + " 次（低于阈值 " + APP_HOST_VIEW_SLOT_THRESHOLD + " 次，视为偶发）" };
+  }
+  const last = slot.lastTs ? "，最后出现 " + new Date(slot.lastTs).toISOString() : "";
+  return {
+    id: "app-host-view-slot",
+    status: "FAIL",
+    evidence:
+      "窗口内出现 " + slot.count + " 次（阈值 " + APP_HOST_VIEW_SLOT_THRESHOLD + last +
+      "）。这是「浏览器页 app-host 会话覆盖隐藏渲染页 view 注册槽」的已知症状（完整修复待定）；" +
+      "当前缓解是无浏览器客户端连接时自动重载隐藏页（OPENCODEX_APP_HOST_AUTORECOVER，默认开），" +
+      "详见 doc/SESSION-IDLE-AND-KIKI-DIAGNOSIS.md。",
+  };
 }
 
 function readInstallVersion() {
@@ -772,11 +827,14 @@ async function main(argv, injected = {}) {
       checkVersionedNamespace(host, port, healthStatus),
     ]);
     const initializeCheck = checkInitialize(audit, logText);
+    // app-host-view-slot 复用 log-patterns 的窗口边界与计数，不再单独读文件；
+    // 计 FAIL（参与 --strict）：症状持续出现说明自愈未生效或根因恶化，巡检应当看见。
     const checks = [
       { name: "ab.chatgpt.com/v1/initialize 本地应答", ...initializeCheck },
       { name: "/codex-web-config.js 与配置一致", ...webConfigCheck },
       { name: "版本化资源命名空间 + /api/health", ...namespaceCheck },
       { name: "日志坏模式检查", ...logCheck },
+      { name: "app-host view 注册槽（no such export ID）", ...checkAppHostViewSlot(logCheck) },
     ];
 
     const suggestions = buildSuggestionRules(audit.entries, options.minCount);
@@ -853,7 +911,18 @@ module.exports = {
   checkInitialize,
   extractAllowPaths,
   parseEnvFile,
-  __test: { parseArgs, usageText, LOG_BAD_PATTERNS, AGGREGATED_EVENTS, compareCountDesc, compareBlockDesc },
+  __test: {
+    parseArgs,
+    usageText,
+    LOG_BAD_PATTERNS,
+    AGGREGATED_EVENTS,
+    compareCountDesc,
+    compareBlockDesc,
+    countAppHostViewSlotFailures,
+    checkAppHostViewSlot,
+    APP_HOST_VIEW_SLOT_FAILURE_RE,
+    APP_HOST_VIEW_SLOT_THRESHOLD,
+  },
 };
 
 if (require.main === module) {

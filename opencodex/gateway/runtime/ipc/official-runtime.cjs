@@ -669,13 +669,193 @@ function appServerSpawnHookStatus() {
 function setWsHub(nextWsHub) {
   // server.cjs 创建 WebSocket hub 后再注入，避免 runtime 层反向依赖 HTTP server。
   removeWsClientReadyListener?.();
+  appHostAutoRecoverClientCleanup?.();
+  appHostAutoRecoverClientCleanup = null;
   wsHub = nextWsHub;
   // Web config 首次加载可能早于浏览器 WS hello；页面真正注册后再重发一次 following，确保快照不丢。
   removeWsClientReadyListener =
     typeof nextWsHub?.onClientReady === "function"
       ? nextWsHub.onClientReady(() => officialLiveObserver.refresh())
       : null;
+  // 客户端全部断开后的下一个检测窗口再评估：症状仍在时立即自愈，避免无限期放弃。
+  appHostAutoRecoverClientCleanup =
+    typeof nextWsHub?.onClientRemoved === "function"
+      ? nextWsHub.onClientRemoved(() => {
+          try {
+            if (activeBrowserClientCount() === 0) evaluateAppHostAutoRecover(Date.now(), "client-gone");
+          } catch {
+            // 自愈评估异常不影响 WS 主流程。
+          }
+        })
+      : null;
 }
+
+// ---------------------------------------------------------------------------
+// 隐藏渲染页自愈（app-host view 注册槽被覆盖的症状缓解）
+//
+// 根因（未修，见 doc/SESSION-IDLE-AND-KIKI-DIAGNOSIS.md）：createOfficialIpcEvent 把浏览器页
+// 的 app-host connect 也挂在隐藏 webContents 上，官方 main 按 webContents.id 键控 view 注册，
+// 浏览器页会话顶掉隐藏渲染页自己的注册槽后，隐藏页轮询持续报 "no such export ID: 1"。
+// 这里的缓解：60s 窗口内该错误 ≥ 阈值次、且当前没有任何浏览器客户端连接时，自动 reload
+// 隐藏渲染页让它重新注册自己的 view。有客户端时 defer（reload 会打断用户会话），
+// 最后一个客户端断开后的下一个检测窗口再尝试。全局冷却默认 10 分钟，可整体关闭。
+const APP_HOST_AUTORECOVER_WINDOW_MS = 60_000;
+const APP_HOST_AUTORECOVER_THRESHOLD = 3;
+const APP_HOST_AUTORECOVER_DEFAULT_COOLDOWN_MS = 10 * 60_000;
+const EXPORT_ID_FAILURE_RE = /no such export ID|no such entry on exports table/;
+const appHostAutoRecover = {
+  failures: [], // 60s 窗口内的隐藏渲染页失败时间戳
+  lastRecoverAtMs: null, // 最近一次自动 reload 的时间戳（全局冷却用）
+  recoverCount: 0, // 累计触发次数
+  deferredSinceMs: null, // 因有客户端连接/冷却被推迟的起始时间
+};
+let appHostAutoRecoverClientCleanup = null;
+
+function appHostAutoRecoverEnabled() {
+  const raw = String(process.env.OPENCODEX_APP_HOST_AUTORECOVER ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "off" && raw !== "false";
+}
+
+function appHostAutoRecoverCooldownMs() {
+  const value = Number(process.env.OPENCODEX_APP_HOST_AUTORECOVER_COOLDOWN_MS);
+  return Number.isFinite(value) && value > 0 ? value : APP_HOST_AUTORECOVER_DEFAULT_COOLDOWN_MS;
+}
+
+/** 当前有多少个处于 OPEN 的浏览器 WS 客户端；无法取到一律按 0（不 reload 的前提判断走人工）。 */
+function activeBrowserClientCount() {
+  try {
+    const clients = wsHub && wsHub.clients;
+    if (!clients || typeof clients.forEach !== "function") return 0;
+    let count = 0;
+    for (const socket of clients) {
+      if (socket && socket.readyState === socket.OPEN) count += 1;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+/** 判断一条日志是否「隐藏渲染页自己」报的 view 注册槽错位（浏览器页的同类错误不算）。 */
+function isHiddenRendererExportIdFailureLine(line) {
+  if (typeof line !== "string" || !EXPORT_ID_FAILURE_RE.test(line)) return false;
+  // 明确标了 rendererWindowVisible=true 的行来自可见的浏览器页，不属于隐藏渲染页症状。
+  if (/rendererWindowVisible=true/.test(line)) return false;
+  const idMatch = /rendererWebContentsId=(\d+)/.exec(line);
+  if (idMatch) {
+    const hidden = officialIpc.hiddenWebContents;
+    if (hidden && typeof hidden.id === "number") return Number(idMatch[1]) === hidden.id;
+    // 隐藏窗口尚未建立时这类行不可能是它发的，不计入。
+    return false;
+  }
+  // 行里没有 webContents id 字段时，用「隐藏窗口恒不可见」这一特征兜底。
+  return true;
+}
+
+function performAppHostAutoRecoverReload(now, details, webContentsOverride) {
+  const webContents = webContentsOverride || officialIpc.hiddenWebContents;
+  try {
+    if (!webContents || webContents.isDestroyed()) {
+      if (appHostAutoRecover.deferredSinceMs === null) {
+        appHostAutoRecover.deferredSinceMs = now;
+        diagnosticLog("official-app-host", "autorecover_deferred", { ...details, reason: "web_contents_destroyed" });
+      }
+      return;
+    }
+    webContents.reload();
+    appHostAutoRecover.lastRecoverAtMs = now;
+    appHostAutoRecover.recoverCount += 1;
+    appHostAutoRecover.deferredSinceMs = null;
+    appHostAutoRecover.failures.length = 0;
+    diagnosticLog("official-app-host", "autorecover_reload", {
+      ...details,
+      recoverCount: appHostAutoRecover.recoverCount,
+      cooldownMs: appHostAutoRecoverCooldownMs(),
+    });
+  } catch (error) {
+    diagnosticWarn("official-app-host", "autorecover_reload_failed", {
+      ...details,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function evaluateAppHostAutoRecover(now, trigger) {
+  if (!appHostAutoRecoverEnabled()) return;
+  const count = appHostAutoRecover.failures.length;
+  if (trigger === "failure" && count < APP_HOST_AUTORECOVER_THRESHOLD) return;
+  const clients = activeBrowserClientCount();
+  if (clients > 0) {
+    if (appHostAutoRecover.deferredSinceMs === null) {
+      appHostAutoRecover.deferredSinceMs = now;
+      diagnosticLog("official-app-host", "autorecover_deferred", {
+        trigger,
+        failures: count,
+        clientCount: clients,
+      });
+    }
+    return;
+  }
+  if (count < APP_HOST_AUTORECOVER_THRESHOLD) {
+    // 客户端全断且症状窗口已清空：复位 defer 标记，等待下一次症状。
+    appHostAutoRecover.deferredSinceMs = null;
+    return;
+  }
+  const cooldownMs = appHostAutoRecoverCooldownMs();
+  if (appHostAutoRecover.lastRecoverAtMs !== null && now - appHostAutoRecover.lastRecoverAtMs < cooldownMs) {
+    if (appHostAutoRecover.deferredSinceMs === null) {
+      appHostAutoRecover.deferredSinceMs = now;
+      diagnosticLog("official-app-host", "autorecover_deferred", {
+        trigger,
+        failures: count,
+        clientCount: 0,
+        reason: "cooldown",
+      });
+    }
+    return;
+  }
+  performAppHostAutoRecoverReload(now, { trigger, failures: count, clientCount: 0 });
+}
+
+function recordHiddenRendererExportIdFailure(now = Date.now()) {
+  try {
+    const state = appHostAutoRecover;
+    state.failures.push(now);
+    const cutoff = now - APP_HOST_AUTORECOVER_WINDOW_MS;
+    while (state.failures.length > 0 && state.failures[0] < cutoff) state.failures.shift();
+    evaluateAppHostAutoRecover(now, "failure");
+  } catch {
+    // 自愈检测异常绝不影响主流程。
+  }
+}
+
+// 症状日志来自官方 main 的 electron-message-handler（logger 汇到 process 控制台 → 即
+// /var/log/codex-desktop/gateway.log）。这里给 console.log 套一层观测：命中隐藏渲染页的
+// "no such export ID" 行就计入 60s 窗口。观测本身失败只回落到原日志行为。
+let appHostConsoleObserverInstalled = false;
+let appHostConsoleObserverInner = null;
+function installAppHostConsoleObserver() {
+  if (appHostConsoleObserverInstalled) return;
+  appHostConsoleObserverInstalled = true;
+  // 记住当前 console.log（可能是测试注入的 sink），卸载时精确还原，不破坏链。
+  appHostConsoleObserverInner = console.log;
+  console.log = function observedConsoleLog(message, ...rest) {
+    try {
+      if (typeof message === "string" && isHiddenRendererExportIdFailureLine(message)) {
+        recordHiddenRendererExportIdFailure();
+      }
+    } catch {
+      // 观测异常必须静默。
+    }
+    return appHostConsoleObserverInner.apply(console, [message, ...rest]);
+  };
+}
+function uninstallAppHostConsoleObserver() {
+  if (!appHostConsoleObserverInstalled) return;
+  appHostConsoleObserverInstalled = false;
+  console.log = appHostConsoleObserverInner;
+}
+installAppHostConsoleObserver();
 
 function getOfficialBundle() {
   return officialBundle;
@@ -3017,5 +3197,25 @@ module.exports = {
     maybeHandleConfiguredNetworkBlockNoop,
     maybeHandleStatsigControlPlaneFetchNoop,
     maybeHandleStatsigTelemetryFetchNoop,
+    // 测试专用：app-host 隐藏渲染页自愈的注入/复位入口（见 test/app-host-autorecover.test.cjs）。
+    appHostAutoRecover: {
+      state: () => appHostAutoRecover,
+      recordFailure: recordHiddenRendererExportIdFailure,
+      evaluate: evaluateAppHostAutoRecover,
+      isFailureLine: isHiddenRendererExportIdFailureLine,
+      reload: performAppHostAutoRecoverReload,
+      activeBrowserClientCount,
+      installConsoleObserver: installAppHostConsoleObserver,
+      uninstallConsoleObserver: uninstallAppHostConsoleObserver,
+      setHiddenWebContentsForTest(webContents) {
+        officialIpc.hiddenWebContents = webContents;
+      },
+      reset() {
+        appHostAutoRecover.failures.length = 0;
+        appHostAutoRecover.lastRecoverAtMs = null;
+        appHostAutoRecover.recoverCount = 0;
+        appHostAutoRecover.deferredSinceMs = null;
+      },
+    },
   },
 };
