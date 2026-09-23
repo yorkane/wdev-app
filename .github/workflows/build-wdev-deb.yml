@@ -2,15 +2,17 @@ name: Build wdev deb
 
 run-name: Build wdev deb
 
-# 产出单一 deb（桌面应用 + OpenCodex 网关），并作为 Release 附件发布。
+# 产出单一 deb（桌面应用 + OpenCodex 网关）。
 #
 # 上游官方包由 scripts/lib/upstream-linux-package.js 解析：从签名索引下载，并用仓库内的公钥
 # 验证 InRelease / Packages / SHA-256，因此不需要任何 secret，也不是「信任 latest URL」。
 # 构建输入是仓库里已入库的 linux-features/features.json（品牌与出站拦截覆盖层默认启用）。
 #
-# 触发：
-#   - push 到 dev：构建 + 上传 workflow artifact + 发布/更新 draft release（不打扰任何人）；
-#   - workflow_dispatch：同上，但默认发布正式 release（可勾选 draft）。
+# 本工作流**不发布 Release**：只构建并上传 workflow artifact，避免自动产生对外可见的发布物。
+# 需要对外发布时，请手动创建 Release 并附上 artifact（或另行决定发布流程）。
+#
+# 触发：仅手动（workflow_dispatch）。
+
 on:
   workflow_dispatch:
     inputs:
@@ -18,27 +20,8 @@ on:
         description: 包版本（留空则用 UTC 时间戳，如 2026.09.22.061341）
         required: false
         type: string
-      draft:
-        description: 以 draft 形式发布 release
-        required: false
-        type: boolean
-        default: false
-  push:
-    branches: [dev]
-    paths:
-      - install.sh
-      - Makefile
-      - assets/**
-      - launcher/**
-      - packaging/**
-      - scripts/**
-      - linux-features/**
-      - opencodex/**
-      - nix/upstream-linux-packages.json
-      - .github/workflows/build-wdev-deb.yml
-
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: wdev-deb-${{ github.ref }}
@@ -50,13 +33,10 @@ env:
 
 jobs:
   deb:
-    name: Build and publish the single deb
+    name: Build the deb
     runs-on: ubuntu-24.04
     # 本地实测约 15 分钟，瓶颈是 dpkg-deb 单线程压缩；留足冗余。
     timeout-minutes: 150
-    env:
-      # push 到 dev 一律发 draft；正式发布走 workflow_dispatch。
-      RELEASE_DRAFT: ${{ github.event_name == 'push' && 'true' || inputs.draft }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -191,34 +171,3 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
-
-      - name: Publish the release asset
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          deb="${{ steps.package.outputs.deb }}"
-          version="${{ steps.package.outputs.version }}"
-          tag="deb-${version}"
-          draft_flag=""
-          if [ "$RELEASE_DRAFT" = "true" ]; then draft_flag="--draft"; fi
-          {
-            echo "单一 deb，同时交付两部分："
-            echo
-            echo "- 重打包的桌面应用（/opt/codex-desktop），已应用 linux-features 覆盖层"
-            echo "- OpenCodex 网关（/opt/codex-desktop/gateway，自带 node，含 systemd 单元）"
-            echo
-            echo "安装：sudo apt-get install -y ./$(basename "$deb")"
-            echo "配置与服务管理见仓库 deploy.md。"
-            echo
-            echo "sha256: $(cut -d" " -f1 sha256.txt)"
-          } > notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$deb" --clobber
-          else
-            gh release create "$tag" "$deb" \
-              --title "wdev ${version}" \
-              --notes-file notes.md \
-              $draft_flag
-          fi
-          echo "release: $tag (draft=$RELEASE_DRAFT)"
