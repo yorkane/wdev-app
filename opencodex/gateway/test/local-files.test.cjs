@@ -353,11 +353,15 @@ test("keeps app-fs 404 for files outside the official temp dir allowlist", async
   await expectNotAllowed(outsideFile);
 
   // CODEX_HOME 下白名单外的文件：仍 404（生成图片目录是白名单，HOME 本身不是）。
-  const homeSecretFile = path.join(CODEX_HOME, "appfs-negative-secret.txt");
+  // 注意：CODEX_HOME 在干净环境（CI runner）上可能并不存在，必须自己建目录，
+  // 且只写进一个自建的唯一子目录，避免污染真实的 ~/.codex。
+  const homeSecretDir = path.join(CODEX_HOME, `appfs-negative-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(homeSecretDir, { recursive: true });
+  const homeSecretFile = path.join(homeSecretDir, "appfs-negative-secret.txt");
   fs.writeFileSync(homeSecretFile, "s");
   t.after(() => {
     try {
-      fs.rmSync(homeSecretFile, { force: true });
+      fs.rmSync(homeSecretDir, { force: true, recursive: true });
     } catch {}
   });
   await expectNotAllowed(homeSecretFile);
