@@ -1,0 +1,224 @@
+name: Build wdev deb
+
+run-name: Build wdev deb
+
+# 产出单一 deb（桌面应用 + OpenCodex 网关），并作为 Release 附件发布。
+#
+# 上游官方包由 scripts/lib/upstream-linux-package.js 解析：从签名索引下载，并用仓库内的公钥
+# 验证 InRelease / Packages / SHA-256，因此不需要任何 secret，也不是「信任 latest URL」。
+# 构建输入是仓库里已入库的 linux-features/features.json（品牌与出站拦截覆盖层默认启用）。
+#
+# 触发：
+#   - push 到 dev：构建 + 上传 workflow artifact + 发布/更新 draft release（不打扰任何人）；
+#   - workflow_dispatch：同上，但默认发布正式 release（可勾选 draft）。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 包版本（留空则用 UTC 时间戳，如 2026.09.22.061341）
+        required: false
+        type: string
+      draft:
+        description: 以 draft 形式发布 release
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [dev]
+    paths:
+      - install.sh
+      - Makefile
+      - assets/**
+      - launcher/**
+      - packaging/**
+      - scripts/**
+      - linux-features/**
+      - opencodex/**
+      - nix/upstream-linux-packages.json
+      - .github/workflows/build-wdev-deb.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wdev-deb-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_WITH_UPDATER: "0"
+  MAX_BUILD_THREADS: "4"
+
+jobs:
+  deb:
+    name: Build and publish the single deb
+    runs-on: ubuntu-24.04
+    # 本地实测约 15 分钟，瓶颈是 dpkg-deb 单线程压缩；留足冗余。
+    timeout-minutes: 150
+    env:
+      # push 到 dev 一律发 draft；正式发布走 workflow_dispatch。
+      RELEASE_DRAFT: ${{ github.event_name == 'push' && 'true' || inputs.draft }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      # 构建峰值需要约 6-8 GB 空闲（官方包 + 解包应用 + 网关树 + deb 暂存 + 成品），
+      # 先清掉 runner 上预装但我们不用的工具链。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.18.3 --activate
+          pnpm --version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev gnupg xz-utils ca-certificates
+          dpkg-deb --version | head -1
+
+      # 便携 node 默认从 npmmirror 取（国内快）。GitHub runner 上若不可达，回退到 nodejs.org，
+      # 两个镜像的目录布局一致（$BASE/$VER/node-$VER-linux-$ARCH.tar.xz）。
+      - name: Select the portable node source
+        run: |
+          mirror_ok=0
+          if curl -fsSL --max-time 30 -o /dev/null https://registry.npmmirror.com/-/binary/node/latest-v24.x/; then
+            mirror_ok=1
+          fi
+          if [ "$mirror_ok" = "1" ]; then
+            echo "npmmirror reachable; using the default GATEWAY_NODE_BASE_URL"
+          else
+            echo "npmmirror unreachable; falling back to nodejs.org/dist"
+            echo "GATEWAY_NODE_BASE_URL=https://nodejs.org/dist" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve the signed upstream package
+        id: upstream
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          package="$(node scripts/lib/upstream-linux-package.js \
+            --output-dir upstream/amd64 \
+            --metadata upstream/amd64.json \
+            --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
+            --arch amd64)"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "== 签名校验后的上游身份 =="
+          cat upstream/amd64.json
+
+      - name: Build the gateway tree
+        run: make gateway-build
+
+      # 网关构建产物就绪后再跑这些用例（其中一个要读 gateway/dist）。
+      - name: Test the gateway build outputs
+        working-directory: opencodex
+        run: |
+          node --test \
+            gateway/test/app-host-message-codec.test.cjs \
+            gateway/test/app-host-port-reset.test.cjs \
+            gateway/test/file-picker-cancel.test.cjs \
+            gateway/test/local-files.test.cjs \
+            gateway/test/js-error-capture.test.cjs
+
+      # 不设 CODEX_LINUX_FEATURES_CONFIG，走默认的 linux-features/features.json，
+      # 即启用 brand-network-overlay（品牌替换 + 出站拦截 + 菜单与宠物隐藏 + JS 错误采集）。
+      - name: Build the application tree
+        run: ./install.sh "${{ steps.upstream.outputs.package }}"
+
+      - name: Build the deb
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            version="$(date -u +%Y.%m.%d.%H%M%S)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # 官方包已解包完成，先删掉以腾出空间（deb 暂存约 1.6 GB）。
+          rm -rf upstream
+          PACKAGE_VERSION="$version" make deb
+          deb="dist/wdev_${version}_amd64.deb"
+          [ -f "$deb" ] || { echo "expected artifact not found: $deb" >&2; exit 1; }
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          deb="${{ steps.package.outputs.deb }}"
+          echo "== 包元数据 =="
+          dpkg-deb -f "$deb" Package Version Architecture
+          dpkg-deb -f "$deb" Package | grep -qx codex-desktop
+          dpkg-deb -f "$deb" Architecture | grep -qx amd64
+          echo "== 两个交付件都在包里 =="
+          dpkg-deb -c "$deb" > listing.txt
+          grep -q "./opt/codex-desktop/ChatGPT" listing.txt
+          grep -q "./opt/codex-desktop/gateway/gateway/dist/modification/catalog.js" listing.txt
+          grep -q "./opt/codex-desktop/gateway/node/bin/node" listing.txt
+          grep -q "./lib/systemd/system/codex-desktop-gateway.service" listing.txt
+          grep -q "./etc/codex-desktop/config.yaml" listing.txt
+          echo "== 覆盖层补丁已启用 =="
+          dpkg-deb --fsys-tarfile "$deb" \
+            | tar -xO ./opt/codex-desktop/.codex-linux/build-info.json > build-info.json
+          grep -q brand-network-overlay build-info.json
+          echo "build-info.json:"; cat build-info.json
+          echo "== 大小与校验和 =="
+          ls -la "$deb"
+          sha256sum "$deb" > sha256.txt
+          cat sha256.txt
+          {
+            echo "### wdev deb ${{ steps.package.outputs.version }}"
+            echo
+            dpkg-deb -f "$deb" Package Version Architecture
+            cat sha256.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wdev-deb-${{ steps.package.outputs.version }}
+          path: |
+            ${{ steps.package.outputs.deb }}
+            sha256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish the release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          deb="${{ steps.package.outputs.deb }}"
+          version="${{ steps.package.outputs.version }}"
+          tag="deb-${version}"
+          draft_flag=""
+          if [ "$RELEASE_DRAFT" = "true" ]; then draft_flag="--draft"; fi
+          {
+            echo "单一 deb，同时交付两部分："
+            echo
+            echo "- 重打包的桌面应用（/opt/codex-desktop），已应用 linux-features 覆盖层"
+            echo "- OpenCodex 网关（/opt/codex-desktop/gateway，自带 node，含 systemd 单元）"
+            echo
+            echo "安装：sudo apt-get install -y ./$(basename "$deb")"
+            echo "配置与服务管理见仓库 deploy.md。"
+            echo
+            echo "sha256: $(cut -d" " -f1 sha256.txt)"
+          } > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$deb" --clobber
+          else
+            gh release create "$tag" "$deb" \
+              --title "wdev ${version}" \
+              --notes-file notes.md \
+              $draft_flag
+          fi
+          echo "release: $tag (draft=$RELEASE_DRAFT)"

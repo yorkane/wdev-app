@@ -1,6 +1,7 @@
 # codex-desktop 部署与配置指南
 
 > 前提：已构建好安装包 `wdev_<版本>_amd64.deb`（当前版本 `wdev_2026.09.22.061341_amd64.deb`）。
+> 发布件由 CI 构建并附在 GitHub Release 上（tag 形如 `deb-<版本>`），也可以自己在构建机上打包。
 > 本文只讲在该机器上安装与配置；构建输入是 OpenAI 官方 Linux 包
 > https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb
 >
