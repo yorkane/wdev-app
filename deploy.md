@@ -27,6 +27,22 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 若默认端口 `3737` 或显示号 `:99` 已被占用，先按 §2 改配置再启动。
 
+### 1.1 建议一并安装的系统包
+
+```bash
+sudo apt-get install -y bubblewrap gh
+```
+
+| 包 | 作用 | 不装会怎样 |
+|---|---|---|
+| `bubblewrap` | Codex 沙箱执行命令时使用；缺失时界面会提示安装并回退到内置副本 | 提示持续出现，沙箱策略下执行命令可能失败 |
+| `gh` | 侧栏 Pull Request 等功能依赖 GitHub CLI | 日志出现 spawn gh ENOENT，PR 类功能不可用 |
+
+> 目标机 apt 源若缺包（镜像站缺 pool 文件导致 404），可在另一台同版本机器上执行
+> apt-get download bubblewrap gh，再把 .deb 拷过去用 dpkg -i 安装（两机同为 22.04 时通用）。
+
+> 装好后可用 codex doctor 确认沙箱状态（应显示 sandbox 正常）。
+
 ## 2. 配置
 
 两个配置文件都是 conffile（升级不会覆盖本机改动）：
@@ -66,17 +82,53 @@ sudo sed -i "s/^CODEX_DESKTOP_LOCALE=.*/CODEX_DESKTOP_LOCALE=zh-CN/" /etc/codex-
 codex-desktop-gateway restart
 ```
 
-### 2.3 服务账户（可选）
+### 2.3 服务账户（重要）
 
-默认用包内创建的系统账户 `codex-desktop`。要与主机上其它服务共用账户时，在 `gateway.env` 里声明：
+网关以某个系统账户身份运行。默认是安装时创建的 codex-desktop（--system 账户，登录 shell 为 /usr/sbin/nologin）。
+
+**该账户的登录 shell 必须是可用 shell（如 /bin/bash），否则界面里的终端（terminal）打不开。**
+原因：终端功能要以该账户身份拉起交互 shell，nologin 会被直接拒绝，报 This account is currently not available.；
+而这条失败发生在官方 app-server 内部，**不会出现在网关日志里**，表现就是「终端点了没反应、也没报错」。
+
+两种做法：
+
+**做法 A（推荐）：与机群统一账户，例如 aigc**
 
 ```ini
 GATEWAY_SERVICE_USER=aigc
 GATEWAY_SERVICE_GROUP=aigc
 ```
 
-只改这一处即可（安装脚本会据此设定运行目录属主并生成 systemd drop-in）。
-需要确认该账户对 `/var/lib/codex-desktop`、`/var/log/codex-desktop` 有写权限。
+在 /etc/codex-desktop/gateway.env 里声明后，重装或升级时 postinst 会据此设定运行目录属主并生成等效的 systemd drop-in。
+**已装好的机器要立刻生效，需补一个 drop-in 并同步属主**：
+
+```bash
+sudo mkdir -p /etc/systemd/system/codex-desktop-gateway.service.d
+sudo tee /etc/systemd/system/codex-desktop-gateway.service.d/10-service-user.conf <<EOF
+[Service]
+User=aigc
+Group=aigc
+EOF
+sudo chown -R aigc:aigc /var/lib/codex-desktop /var/log/codex-desktop
+sudo systemctl daemon-reload && sudo systemctl restart codex-desktop-gateway
+```
+
+**做法 B：保留包内账户，只把它的 shell 改成可用**
+
+```bash
+sudo usermod -s /bin/bash codex-desktop
+sudo systemctl restart codex-desktop-gateway
+```
+
+两种做法都会**重启网关、短暂中断当前会话**。无论哪种，都要确保运行账户对 /var/lib/codex-desktop、
+/var/log/codex-desktop 有写权限——属主不对会出现 SingletonLock: Permission denied 之类错误并反复重启。
+
+> 切换账户后建议顺手清理旧账户在 /tmp 留下的目录：属主仍是旧账户时新账户可能写不进去，
+> 日志会出现 listen EACCES ... /tmp/codex-browser-use/*.sock。用以下命令把属主改过来：
+>
+> ```bash
+> sudo find /tmp -maxdepth 1 -user 旧账户 -exec chown -R 新账户:新账户 {} +
+> ```
 
 ### 2.4 模型与 provider（可选，仅接自建模型时需要）
 
@@ -195,4 +247,7 @@ sudo dpkg -P codex-desktop
 - **服务反复重启**：多为端口或显示号被占（`ss -ltnp | grep 3737`、`pgrep -a Xvfb`），按 §2.1 改配置。
 - **起不来且日志提到 SingletonLock / Permission denied**：运行目录属主与服务账户不一致，
   执行 `U=$(systemctl show -p User --value codex-desktop-gateway); sudo chown -R "$U:$U" /var/lib/codex-desktop /var/log/codex-desktop` 后重启。
+- **界面上出现 bubblewrap 提示 / 沙箱报错**：系统未装 `bubblewrap`，按 §1.1 安装；安装后用 `codex doctor` 确认。
+- **界面里的终端（terminal）打不开、也没报错**：运行账户的登录 shell 是 `/usr/sbin/nologin`（包内默认 `codex-desktop` 就是这样），按 §2.3 换成 `aigc` 或 `usermod -s /bin/bash`。
+- **日志出现 `spawn gh ENOENT`**：未装 `gh`，按 §1.1 安装。
 - **页面能打开但拿不到模型**：检查 `CODEX_HOME/config.toml` 的 `openai_base_url` 是否指向可用的模型服务。
