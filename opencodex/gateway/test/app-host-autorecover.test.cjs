@@ -57,6 +57,8 @@ function cleanState(enabled) {
   rec.uninstallConsoleObserver();
   rec.installConsoleObserver();
   rec.reset();
+  // 去重状态是进程级观测状态，逐条测试前必须复位，否则上一条测试的同文本行会吞掉本条计数。
+  rec.resetObservationDedupe();
   setEnabled(enabled);
   process.env[ENV_COOLDOWN] = String(10 * 60_000);
 }
@@ -69,6 +71,7 @@ test.afterEach(() => {
   rec.uninstallConsoleObserver();
   rec.installConsoleObserver();
   rec.reset();
+  rec.resetObservationDedupe();
   rec.setHiddenWebContentsForTest(null);
 });
 
@@ -120,6 +123,233 @@ test("console.log 观测：命中行计入窗口，非命中行不计数", () =>
   assert.equal(state.failures.length, 1, "只有命中行计入 60s 窗口");
   assert.ok(logged.some((line) => line.includes("no such export ID")), "原日志行为不受观测影响");
   assert.ok(logged.some((line) => line.includes("unrelated")));
+});
+
+// ---------- stream 观测（新捕获点：process.stdout / process.stderr write） ----------
+//
+// 生产缺陷的根因就在这里：官方 main 的 logger 按级别分发（error→console.error、
+// warning→console.warn、info→console.info、debug→console.debug、trace→console.log），
+// 而 sa_server_request_failed 这类症状行是 error/warning 级 → 只经 process.stderr，
+// 旧的 console.log hook 一行都抓不到（生产日志 14.6 万行症状行 / 0 次 autorecover）。
+// 本组测试必须用 console.error / console.warn 走 stream 路径验证，不能用旧的 console.log 注入。
+
+function attachObserverToSink() {
+  rec.uninstallConsoleObserver();
+  const captured = { out: [], err: [] };
+  const originalOut = process.stdout.write;
+  const originalErr = process.stderr.write;
+  process.stdout.write = function collectingStdoutWrite(chunk, ...rest) {
+    captured.out.push(String(chunk));
+    // 只吞掉本测试植入的症状行，其余原文（含 node --test 报告输出）继续交给真 fd。
+    return String(chunk).includes("no such ") ? true : originalOut.apply(process.stdout, [chunk, ...rest]);
+  };
+  process.stderr.write = function collectingStderrWrite(chunk, ...rest) {
+    captured.err.push(String(chunk));
+    return String(chunk).includes("no such ") ? true : originalErr.apply(process.stderr, [chunk, ...rest]);
+  };
+  rec.installConsoleObserver();
+  assert.equal(rec.streamObserverInstalled(), true, "安装观测器必须同时挂上 stdout/stderr 的 write hook");
+  return {
+    captured,
+    detach() {
+      rec.uninstallConsoleObserver();
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      rec.installConsoleObserver();
+    },
+  };
+}
+
+const HIDDEN_FAILURE_LINE =
+  "[electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 1\"} rendererWebContentsId=1 rendererWindowVisible=false";
+
+/**
+ * 生产里的症状行文本带 itemId / threadId / export id 等可变字段，彼此并不相同；
+ * 用编号造行以区分「不同的真实投递」与「同一次投递被两层重复观测」。
+ */
+function hiddenFailureLine(n) {
+  return '[electron-message-handler] sa_server_request_failed {"message":"no such export ID: 1"}' +
+    ' rendererWebContentsId=1 rendererWindowVisible=false itemId=item_' + n;
+}
+
+test("stream 捕获：console.error（官方 error 级）的症状行计入窗口且日志原样落盘", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    console.error(HIDDEN_FAILURE_LINE);
+    assert.equal(rec.state().failures.length, 1, "error 级症状行必须由 stream 捕获点计入");
+    assert.ok(sink.captured.err.some((l) => l.includes("no such export ID")), "原 stderr 输出不受观测影响");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("stream 捕获：console.warn / 直接 process.stderr.write / Buffer 写入都能计数", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    console.warn(hiddenFailureLine(1)); // warning 级（官方 logger 的 warning 路径）
+    assert.equal(rec.state().failures.length, 1, "warn 级症状行计入");
+    assert.equal(hidden.reloadCount, 0, "1 次未达阈值不 reload");
+    process.stderr.write(hiddenFailureLine(2) + "\n"); // 不经 console 的直写
+    assert.equal(rec.state().failures.length, 2, "直写 stderr 也计入");
+    process.stderr.write(Buffer.from(hiddenFailureLine(3) + "\n")); // Buffer chunk → 第 3 次达阈值
+    assert.equal(hidden.reloadCount, 1, "经新捕获路径刷满阈值后必须真正 reload");
+    assert.equal(rec.state().recoverCount, 1);
+    assert.equal(rec.state().failures.length, 0, "reload 后症状窗口清空");
+    assert.ok(sink.captured.err.some((l) => l.includes("itemId=item_1")), "warn 原文仍写进 stderr");
+    assert.ok(sink.captured.err.some((l) => l.includes("itemId=item_3")), "Buffer 原文仍写进 stderr");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("stream 捕获：非症状行与浏览器页（visible=true）行不计入，且不影响其它日志", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    console.error("[electron-message-handler] sa_server_request_failed {\"message\":\"no such export ID: 1\"} rendererWebContentsId=1 rendererWindowVisible=true");
+    console.error("[gateway] unrelated failure details");
+    console.warn("plain warn");
+    process.stdout.write("plain stdout\n");
+    assert.equal(rec.state().failures.length, 0, "可见浏览器页与无关行不得计入");
+    assert.equal(hidden.reloadCount, 0);
+    assert.ok(sink.captured.err.some((l) => l.includes("unrelated")), "无关 stderr 原样落盘");
+    assert.ok(sink.captured.out.some((l) => l.includes("plain stdout")), "无关 stdout 原样落盘");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("去重：console.log 的同一次投递只计一次（console hook 与其下游 stream 不重复计数）", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    // console hook 与它下游的 stdout stream hook 会各看到一次同一条日志 → 只计 1 次。
+    console.log(hiddenFailureLine(1));
+    assert.equal(rec.state().failures.length, 1, "同一次 console.log 投递只能计 1 次");
+    assert.equal(rec.observerStats().streamYieldedToConsole, 1, "stream 层必须让路给 console 层的同一次投递");
+    assert.equal(rec.observerStats().consoleCounted, 1);
+    assert.equal(rec.observerStats().streamCounted, 0, "经 console 的投递不得由 stream 层重复计数");
+    // 多参数形式：console 层只看到格式化前的 message，stream 层看到拼上 util.format 结果的全文。
+    // 多参数：console 层按 util.format 规则格式化后仍命中，且只计 1 次。
+    console.log("[electron-message-handler] sa_server_request_failed", { error: new Error("no such export ID: 1"), rendererWebContentsId: 1, rendererWindowVisible: false });
+    assert.equal(rec.state().failures.length, 2, "多参数 console.log 同样只计 1 次");
+    assert.equal(rec.observerStats().consoleCounted, 2, "第二行由 console 层计数");
+    // 不经过 console 的直写：stream 层必须自己计数（不能被认领逻辑吞掉）→ 第 3 次达阈值。
+    const statsBefore = rec.observerStats();
+    process.stdout.write(hiddenFailureLine(3) + "\n");
+    assert.equal(rec.observerStats().streamCounted, statsBefore.streamCounted + 1, "直写 stdout 由 stream 层自行计数");
+    assert.equal(hidden.reloadCount, 1, "三种来源合计达阈值后触发 reload");
+    assert.equal(rec.state().recoverCount, 1);
+    assert.equal(rec.state().failures.length, 0, "reload 后症状窗口清空");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("去重窗口外的重复症状行仍分别计数（保证 60s/3 次阈值不被去重吞掉）", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    const originalNow = Date.now;
+    let fake = originalNow.call(Date);
+    Date.now = () => fake;
+    try {
+      console.error(hiddenFailureLine(1));
+      fake += 1000; // 1s 后（真实轮询节奏）
+      console.error(hiddenFailureLine(1));
+      fake += 1000;
+      console.error(hiddenFailureLine(1));
+    } finally {
+      Date.now = originalNow;
+    }
+    assert.equal(hidden.reloadCount, 1, "秒级间隔的重复症状必须逐次计数并触发");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("去重不会吞掉真实突发：同文本症状行毫秒级连发 3 次仍计 3 次并触发", () => {
+  // 生产实测：症状行是密集突发（同一次故障里相邻两行只差 3~5ms、文本可以完全相同），
+  // 所以任何"同文本+短时间窗"的去重都会把阈值误判成 1 次。这里用同文本连发做最严苛回归。
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  const sink = attachObserverToSink();
+  try {
+    const burst = hiddenFailureLine("burst");
+    console.error(burst);
+    console.error(burst);
+    assert.equal(rec.state().failures.length, 2, "同文本连发的第 2 次也要计数");
+    console.error(burst);
+    assert.equal(hidden.reloadCount, 1, "同文本连发 3 次必须达阈值并 reload");
+    assert.equal(rec.state().recoverCount, 1);
+    // 未经 console 的直写突发同样不受去重影响。
+    rec.reset();
+    const reloadsBefore = hidden.reloadCount;
+    process.stderr.write(burst + "\n");
+    process.stderr.write(burst + "\n");
+    process.stderr.write(burst + "\n");
+    assert.equal(rec.state().failures.length, 0, "第 3 次直写达阈值 → 立即 reload 并清空窗口");
+    assert.equal(rec.state().recoverCount, 1, "reset 后重新计数：直写突发同样触发自愈");
+    assert.equal(hidden.reloadCount, reloadsBefore + 1, "直写突发必须再做一次 reload");
+  } finally {
+    sink.detach();
+  }
+});
+
+test("观测器可反复装卸：hook 不叠加、卸完后 stream 与 console 还原为原生实现", () => {
+  cleanState("1");
+  const hidden = makeWebContents();
+  rec.setHiddenWebContentsForTest(hidden);
+  setWsHub(makeFakeHub(0));
+  // cleanState 已经装了一层观测器，先卸载才能取到真正的原生实现作为还原基准。
+  rec.uninstallConsoleObserver();
+  const nativeOut = process.stdout.write;
+  const nativeErr = process.stderr.write;
+  const nativeLog = console.log;
+  assert.equal(rec.streamObserverInstalled(), false, "卸载后不应残留 stream hook");
+  // 顶层已安装一次；再装若干次必须是幂等的（否则同一次投递会被计数多次 → 假阳性 reload）。
+  rec.installConsoleObserver();
+  rec.installConsoleObserver();
+  rec.uninstallConsoleObserver();
+  rec.installConsoleObserver();
+  assert.equal(rec.streamObserverInstalled(), true);
+  assert.notEqual(process.stdout.write, nativeOut, "安装后 stdout.write 应为观测 hook");
+  assert.notEqual(console.log, nativeLog, "安装后 console.log 应为观测 hook");
+
+  const counted = hiddenFailureLine("idem");
+  process.stderr.write(counted + "\n");
+  process.stderr.write(counted + "\n");
+  assert.equal(rec.state().failures.length, 2, "反复装卸后每次投递仍只计一次");
+
+  rec.uninstallConsoleObserver();
+  assert.equal(process.stdout.write, nativeOut, "卸载必须还原原生 stdout.write");
+  assert.equal(process.stderr.write, nativeErr, "卸载必须还原原生 stderr.write");
+  assert.equal(console.log, nativeLog, "卸载必须还原安装前的 console.log");
+  assert.equal(rec.streamObserverInstalled(), false);
+
+  const before = rec.state().failures.length;
+  process.stderr.write(hiddenFailureLine("after") + "\n");
+  assert.equal(rec.state().failures.length, before, "卸载后不再观测");
+  rec.installConsoleObserver();
 });
 
 // ---------- 触发/安全条件 ----------

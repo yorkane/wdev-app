@@ -829,31 +829,143 @@ function recordHiddenRendererExportIdFailure(now = Date.now()) {
   }
 }
 
-// 症状日志来自官方 main 的 electron-message-handler（logger 汇到 process 控制台 → 即
-// /var/log/codex-desktop/gateway.log）。这里给 console.log 套一层观测：命中隐藏渲染页的
-// "no such export ID" 行就计入 60s 窗口。观测本身失败只回落到原日志行为。
+// 症状日志来自官方 main 的 electron-message-handler，最终汇到进程控制台 →
+// /var/log/codex-desktop/gateway.log。
+//
+// 取证结论（决定这里的捕获点，勿凭印象改动）：
+// 1. 官方 main 与 gateway JS 在同一个 Electron main 进程里（runner 通过
+//    OPENCODEX_GATEWAY_ENTRY 在 opencodex-gateway 主进程内 require gateway/main.cjs；
+//    /proc/<pid>/environ 可见该变量，且 fd 1/2 与 dev runner 共用 gateway.log），
+//    所以进程内 hook 足够，不需要改 run-gateway.cjs 的 stdio 管道。
+// 2. 官方 main logger（asar 内 logger-*.js + window-all-closed-*.js 的 dC()）按级别分发到
+//    不同的 console 方法：error→console.error、warning→console.warn、info→console.info、
+//    debug→console.debug、trace→console.log。只包 console.log 会漏掉 error/warning 级的
+//    sa_server_request_failed 行 —— 这正是自愈在生产 0 次触发的原因（14.6 万行症状行无一行命中）。
+// 3. 所有 console.* 最终都经过 process.stdout/process.stderr 的 write（已在本机 node 与包内
+//    node v24 上探针验证：error/warn→stderr，log/info/debug→stdout），因此这两个 write 是
+//    能同时覆盖全部级别与「直接 process.stdout.write」的最小公共捕获点。
+//
+// console 层的 hook 一并保留：既是既有测试/注入 sink 的入口，也覆盖官方或第三方把 console.*
+// 改写成不走 stream.write 的实现。两层同时命中同一次投递时只计一次，规则见下面的深度说明。
 let appHostConsoleObserverInstalled = false;
-let appHostConsoleObserverInner = null;
+// 官方 logger 用到的全部 console 级别（error/warning/info/debug/trace 分别对应
+// console.error/warn/info/debug/log）；只包 console.log 会漏掉 error/warning 级症状行。
+const APP_HOST_OBSERVED_CONSOLE_METHODS = ["log", "info", "warn", "error", "debug"];
+const appHostConsoleObserverInners = new Map();
+const appHostStreamObserverInner = new Map();
+// 观测层自计数：部署后用来核对「两个捕获点各自看到过多少症状行」，以及让路是否吞掉了应有计数。
+const appHostObserverStats = { consoleCounted: 0, streamCounted: 0, streamYieldedToConsole: 0 };
+
+// 一次 console.* 调用会在同一同步调用栈里被两层各看到一次：console hook 看到格式化前的 message，
+// 紧接着原生实现把它交给 stream hook。必须只计一次，否则 60s/3 次的阈值会被同一条日志填满。
+//
+// 配对靠「同步调用栈深度」而不是文本+时间窗：生产实测症状行是同一次故障里 3~5ms 间隔的密集突发
+// （文本可以完全相同），任何基于文本与时间窗的去重都可能把真实突发误判成重复而吞掉计数。
+// console hook 在进入原生实现前把深度 +1、返回后 -1，因此它下游的那次 stream 写入必定落在深度 >0
+// 的区间内 —— 直接让路给 console 层的计数即可；而不经过 console 的直写（第三方库、官方 file logger
+// 之外的路径）深度为 0，由 stream 层自己计数。
+let appHostConsoleDeliveryDepth = 0;
+// 再入保护：命中后 recordHiddenRendererExportIdFailure → evaluate → diagnosticLog 又会写日志，
+// 那类自愈自身日志（autorecover_reload / autorecover_deferred）不允许再被观测计数。
+let observingAppHostOutput = false;
+
+// stream hook 位于进程全部 stdout/stderr 写入的 hot path 上（生产 gateway.log 约 96 MB/天）。
+// 两个症状分支都以 "no such " 开头，用它做廉价预筛，绝大多数日志行不必进正则、也不必额外分配。
+const APP_HOST_OBSERVE_PRESCAN = "no such ";
+const APP_HOST_OBSERVE_PRESCAN_BUF = Buffer.from(APP_HOST_OBSERVE_PRESCAN, "utf8");
+
+/**
+ * 观测一段（可能是多行的）控制台输出；命中即计入 60s 窗口。异常一律静默。
+ * source 决定计数归属（"console" / "stream"）；"stream" 且正处于某次 console 调用的同步区间内时让路。
+ */
+function observeAppHostConsoleOutput(chunk, source) {
+  if (observingAppHostOutput) return;
+  if (source === "stream" && appHostConsoleDeliveryDepth > 0) {
+    // console.* 的下游写入：同一次投递已由 console 层计数。
+    appHostObserverStats.streamYieldedToConsole += 1;
+    return;
+  }
+  try {
+    observingAppHostOutput = true;
+    let text;
+    if (typeof chunk === "string") {
+      if (!chunk.includes(APP_HOST_OBSERVE_PRESCAN)) return;
+      text = chunk;
+    } else if (Buffer.isBuffer(chunk)) {
+      // 直接用 Buffer.includes 预筛，避免为不相关的写入整体解码。
+      if (!chunk.includes(APP_HOST_OBSERVE_PRESCAN_BUF)) return;
+      text = chunk.toString("utf8");
+    } else {
+      text = String(chunk ?? "");
+      if (!text.includes(APP_HOST_OBSERVE_PRESCAN)) return;
+    }
+    if (!EXPORT_ID_FAILURE_RE.test(text)) return;
+    for (const line of text.split("\n")) {
+      if (!isHiddenRendererExportIdFailureLine(line)) continue;
+      if (source === "console") appHostObserverStats.consoleCounted += 1;
+      else appHostObserverStats.streamCounted += 1;
+      recordHiddenRendererExportIdFailure();
+    }
+  } catch {
+    // 观测异常必须静默，绝不能影响日志与主流程。
+  } finally {
+    observingAppHostOutput = false;
+  }
+}
+
 function installAppHostConsoleObserver() {
   if (appHostConsoleObserverInstalled) return;
   appHostConsoleObserverInstalled = true;
-  // 记住当前 console.log（可能是测试注入的 sink），卸载时精确还原，不破坏链。
-  appHostConsoleObserverInner = console.log;
-  console.log = function observedConsoleLog(message, ...rest) {
-    try {
-      if (typeof message === "string" && isHiddenRendererExportIdFailureLine(message)) {
-        recordHiddenRendererExportIdFailure();
+  // 记住当前各级别的 console 方法（可能是测试注入的 sink），卸载时精确还原，不破坏链。
+  // console 层与 stream 层互为备份：官方 console.* 若被改写绕过 stream.write，这里仍能观测；
+  // 若照常落 stream，则由同步深度标记保证同一次投递只计一次。
+  for (const method of APP_HOST_OBSERVED_CONSOLE_METHODS) {
+    if (appHostConsoleObserverInners.has(method)) continue;
+    const original = console[method];
+    if (typeof original !== "function") continue;
+    appHostConsoleObserverInners.set(method, original);
+    console[method] = function observedConsoleMethod(message, ...rest) {
+      try {
+        // 多参数形式要按原生规则先做 util.format，否则格式化前只剩前缀、可能漏掉症状字段。
+        const formatted = rest.length === 0
+          ? typeof message === "string" ? message : util.format(message)
+          : util.format(message, ...rest);
+        observeAppHostConsoleOutput(formatted, "console");
+      } catch {
+        // 观测异常静默，不影响日志本身。
       }
-    } catch {
-      // 观测异常必须静默。
-    }
-    return appHostConsoleObserverInner.apply(console, [message, ...rest]);
-  };
+      // 深度标记必须覆盖原生实现的那次同步 stream 写入，且异常时也要撤销。
+      appHostConsoleDeliveryDepth += 1;
+      try {
+        return original.apply(console, [message, ...rest]);
+      } finally {
+        appHostConsoleDeliveryDepth -= 1;
+      }
+    };
+  }
+  // 主捕获点：官方 logger 的 error/warning/info/debug 级症状行只经过 stream.write，
+  // 必须在这里观测。原 write 用闭包捕获（hot path 上不做 Map 查询），保留原调用与返回值。
+  for (const stream of [process.stdout, process.stderr]) {
+    if (!stream || typeof stream.write !== "function" || appHostStreamObserverInner.has(stream)) continue;
+    const originalWrite = stream.write;
+    appHostStreamObserverInner.set(stream, originalWrite);
+    stream.write = function observedStreamWrite(chunk, ...rest) {
+      observeAppHostConsoleOutput(chunk, "stream");
+      return originalWrite.apply(stream, [chunk, ...rest]);
+    };
+  }
 }
 function uninstallAppHostConsoleObserver() {
   if (!appHostConsoleObserverInstalled) return;
   appHostConsoleObserverInstalled = false;
-  console.log = appHostConsoleObserverInner;
+  for (const [method, original] of appHostConsoleObserverInners) {
+    console[method] = original;
+  }
+  appHostConsoleObserverInners.clear();
+  for (const [stream, originalWrite] of appHostStreamObserverInner) {
+    stream.write = originalWrite;
+  }
+  appHostStreamObserverInner.clear();
 }
 installAppHostConsoleObserver();
 
@@ -3207,6 +3319,16 @@ module.exports = {
       activeBrowserClientCount,
       installConsoleObserver: installAppHostConsoleObserver,
       uninstallConsoleObserver: uninstallAppHostConsoleObserver,
+      // 观测层诊断/测试用：stream 捕获 hook 是否已挂上、去重状态可否复位。
+      streamObserverInstalled: () => appHostStreamObserverInner.size > 0,
+      observerStats: () => ({ ...appHostObserverStats }),
+      resetObservationDedupe() {
+        // 只剩自计数需要复位：两层配对靠同步调用栈深度，没有跨调用的共享状态。
+        appHostObserverStats.consoleCounted = 0;
+        appHostObserverStats.streamCounted = 0;
+        appHostObserverStats.streamYieldedToConsole = 0;
+        appHostConsoleDeliveryDepth = 0;
+      },
       setHiddenWebContentsForTest(webContents) {
         officialIpc.hiddenWebContents = webContents;
       },
