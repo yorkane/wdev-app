@@ -60,6 +60,11 @@ const {
 } = require("./http/runtime-compatibility.cjs");
 const { createHistoryPreviewService } = require("./history-preview.cjs");
 const { createWsHub } = require("./ipc/ws-hub.cjs");
+const {
+  createIdempotentReadCache,
+  runExecuteIpcInvoke,
+} = require("./ipc/idempotent-read-cache.cjs");
+const { createThreadContentInvalidation } = require("./ipc/thread-content-invalidation.cjs");
 const { workspaceRootsFromIpcPayload } = require("./ipc/workspace-root-context.cjs");
 const { createWorkspaceRootsService } = require("./ipc/workspace-roots.cjs");
 const { diagnosticError, diagnosticLog, diagnosticWarn, sanitizeDiagnosticValue, shortId } = require("./core/diagnostics.cjs");
@@ -78,6 +83,29 @@ const {
 const {
   HIDDEN_RUNTIME_GCM_HOLD_PATH,
 } = require("./electron/hidden-runtime-command-line.cjs");
+
+// 幂等读 TTL 缓存（HTTP 与 WS 两条 IPC 路径在 executeIpcInvoke 汇合处折叠轮询/roster 风暴）。
+// 单例即可：缓存键包含 hostId+method+params，天然按官方 app-server 维度隔离。
+const ipcReadCache = createIdempotentReadCache();
+// 回合/子智能体内容失效广播（官方 main 只对自己 conversations 表里的会话广播快照，
+// 子智能体线程的 item/turn 通知被丢弃 → 浏览器只能手动刷新）。与 ipcReadCache 共用
+// ws-hub 的 observeOutboundPayload 事件源，per-thread 去抖后广播 query-cache-invalidate。
+const threadContentInvalidation = createThreadContentInvalidation();
+// createGateway 装配后指向当前 WS hub；启动早期（hub 未建）时缓存自动退化为直通。
+let activeWebSocketHub = null;
+// runExecuteIpcInvoke 的哨兵：返回它表示"未命中缓存"，调用方继续走真实官方 IPC。
+const IPC_READ_CACHE_BYPASS = Symbol("opencodexIpcReadCacheBypass");
+
+function deliverCachedIpcResponse(clientId, envelope) {
+  // 定向回推只能命中已完成 hello 的 client；任何失败都让调用方退回真实 IPC，绝不吞请求。
+  if (!activeWebSocketHub || typeof activeWebSocketHub.sendTo !== "function") return false;
+  try {
+    if (typeof activeWebSocketHub.hasClient === "function" && !activeWebSocketHub.hasClient(clientId)) return false;
+    return activeWebSocketHub.sendTo(clientId, envelope, { suppressDiagnostic: true }) === true;
+  } catch {
+    return false;
+  }
+}
 
 // server.cjs 只负责编排 HTTP/WS 生命周期；官方 Electron hook 细节放在 official-runtime.cjs。
 const LOCAL_DOWNLOAD_PATH_BODY_MAX_BYTES = 32 * 1024;
@@ -778,6 +806,23 @@ async function executeIpcInvoke(
       }
       return value;
     }
+    // 幂等读折叠（HTTP 与 WS 两条路径在这里汇合）：白名单命中 TTL 缓存时直接定向回推官方
+    // mcp-response 给页面（页面按 request id 匹配），跳过隐藏 renderer→app-server 往返；
+    // 未命中则登记 pending 后照常放行，官方回包经 WS hub 旁路观察入库。
+    // 放在所有 per-request 副作用（修改点 emit、root 注册、展示观测、诊断日志）之后，
+    // 只替换最贵的 invokeOfficialIpc 一跳；invoke 返回值与真实链路一致为 undefined。
+    const cachedValue = await runExecuteIpcInvoke(
+      { args, channel, clientId },
+      async () => IPC_READ_CACHE_BYPASS,
+      { deliver: deliverCachedIpcResponse, readCache: ipcReadCache }
+    );
+    if (cachedValue !== IPC_READ_CACHE_BYPASS) {
+      const elapsedMs = Date.now() - startedAtMs;
+      if (DEBUG_LOGS && !suppressRoutineLog) {
+        diagnosticLog("gateway-ipc", "invoke_end", { ...diagnosticBase, elapsedMs, ok: true, readCache: "hit" });
+      }
+      return undefined;
+    }
     // AsyncLocalStorage 让后续官方 webContents.send 和打开文件拦截能知道这次浏览器 IPC 属于哪个 client。
     const value = await requestContext.run(
       {
@@ -1026,7 +1071,39 @@ async function createGateway() {
     observeAppHostFrame(frame) {
       pluginService.smartSchedulingPresentation?.observeAppHostFrame(frame);
     },
+    // 回收日志里的活跃 turn 观测：只在真正回收的那一刻实时读路由状态，模块加载期不拉取。
+    getActiveWorkSnapshot() {
+      try {
+        const snapshot = pluginService?.modelRouter?.turnRouteStatus?.snapshot?.();
+        const active = snapshot?.active;
+        if (!active || typeof active !== "object") return null;
+        return {
+          activeTurnCount: Number(snapshot.activeCount),
+          activeThreadIds: Object.keys(active),
+        };
+      } catch {
+        // 诊断回调绝不影响回收链路。
+        return null;
+      }
+    },
+    // 幂等读缓存的响应入库与失效钩子：所有 gateway→浏览器 下行帧在此被旁路观察。
+    // mcp-response 按 pending 登记表入库；query-cache-invalidate（runThreadListInvalidation）
+    // 与 turn 终端/thread 生命周期通知（transport INTERNAL_TURN_TERMINAL_METHODS 的官方通知形态）
+    // 触发全量清空。观察失败静默，不影响 WS 投递。
+    observeOutboundPayload(envelope, meta) {
+      ipcReadCache.observeOutboundEnvelope(envelope, meta);
+      // 同一事件源的第二个旁路订阅者：内容类失效广播。内部全程 try/catch 之外再兜一层，
+      // 任何异常都不允许影响 WS 投递。
+      try {
+        threadContentInvalidation.note(envelope);
+      } catch {}
+    },
   });
+  activeWebSocketHub = webSocketHub;
+  // hub 装配完成后才真正有接收方；装配前的通知直接忽略（无 browser 可投递）。
+  threadContentInvalidation.bindWsHub(webSocketHub);
+  // 页面掉线后它登记的 pending 请求永远等不到定向回推：立刻清掉，避免官方迟到响应入缓存。
+  webSocketHub.onClientRemoved(({ clientId }) => ipcReadCache.clearPendingForClient(clientId));
   pluginService.bindSmartSchedulingPresentation({
     onClientRemoved: webSocketHub.onClientRemoved,
     sendTo: webSocketHub.sendTo,
