@@ -37,6 +37,9 @@
   const LOW_PRIORITY_IPC_CONCURRENCY = 2;
   const LOW_PRIORITY_IPC_QUEUE_MAX_ENTRIES = 512;
   const LOW_PRIORITY_IPC_LOG_EVERY = 25;
+  // 与官方 main 的 log-message 等级表同构（error<warning<info<debug<trace）；
+  // 表外的等级官方 main 一律丢弃，页面侧也必须丢，保持两端行为一致。
+  const RENDERER_LOG_LEVEL_RANK = { error: 0, warning: 1, info: 2, debug: 3, trace: 4 };
   const CONNECTOR_LOGO_CACHE_MAX_ENTRIES = 256;
   const CONNECTOR_LOGO_CACHE_MAX_CHARS = 8 * 1024 * 1024;
   const CONNECTOR_LOGO_INFLIGHT_MAX_ENTRIES = 512;
@@ -698,6 +701,54 @@
       payload &&
       typeof payload === "object" &&
       (payload.type === "log-message" || isLowPriorityFetchPayload(payload))
+    );
+  }
+
+  function isRendererLogMessagePayload(channel, payload) {
+    return (
+      channel === "codex_desktop:message-from-view" &&
+      !!payload &&
+      typeof payload === "object" &&
+      payload.type === "log-message"
+    );
+  }
+
+  /** 页面侧允许转发的最低 log-message 等级；阈值由 gateway 按其丢弃阈值下发。 */
+  function rendererLogForwardMaxRank() {
+    const configured = String((cfg && cfg.rendererLogLevel) || "").trim().toLowerCase();
+    // 旧 gateway 没有该字段时取官方 prod 默认 info：宁可少转发调试日志，也不能让真实 IPC 排队。
+    const level = Object.prototype.hasOwnProperty.call(RENDERER_LOG_LEVEL_RANK, configured)
+      ? configured
+      : "info";
+    return RENDERER_LOG_LEVEL_RANK[level];
+  }
+
+  function rendererLogMessageRank(payload) {
+    const level = String((payload && payload.level) || "").trim().toLowerCase();
+    // 缺失或未知等级在 main 侧同样过不了过滤，返回 -1 让调用方按「不转发」处理。
+    return Object.prototype.hasOwnProperty.call(RENDERER_LOG_LEVEL_RANK, level)
+      ? RENDERER_LOG_LEVEL_RANK[level]
+      : -1;
+  }
+
+  /**
+   * 官方 renderer 每个 reasoning delta 都会 dispatchMessage('log-message')，桌面端这是进程内 send，
+   * Web 壳里却要付一次「浏览器→反代→gateway」往返；而隐藏 main 又会把低于 maxLogLevel 的行直接丢弃，
+   * 于是流式回答期间数千条注定被丢掉的日志把 model/list、mcp-request 等真实 IPC 全挤成 pending。
+   * 这里按 main 的同一阈值在发出前丢弃，并把幸存的日志压到最低优先级队列且永不回传失败
+   * （失败若回传，官方 logger 会再产生新的 log-message，形成自激放大）。
+   */
+  function forwardRendererLogMessage(payload) {
+    const rank = rendererLogMessageRank(payload);
+    if (rank < 0 || rank > rendererLogForwardMaxRank()) return Promise.resolve(true);
+    const summary = CLIENT_DIAGNOSTICS_ENABLED
+      ? ipcDiagnosticSummary("codex_desktop:message-from-view", payload)
+      : {};
+    return enqueueLowPriorityIpc(summary, () =>
+      invokeGatewayImmediate("codex_desktop:message-from-view", [payload], payload)
+    ).then(
+      () => true,
+      () => true
     );
   }
 
@@ -2652,6 +2703,10 @@
   async function invokeGateway(channel, args) {
     const ipcArgs = Array.isArray(args) ? args : [args];
     const payload = payloadFromIpcArgs(ipcArgs);
+    if (isRendererLogMessagePayload(channel, payload)) {
+      // 渲染端日志是 best-effort：等级过滤 + 最低优先级队列，不占用真实 IPC 的并发额度。
+      return forwardRendererLogMessage(payload);
+    }
     if (isLowPriorityFetchPayload(payload)) {
       /**
        * connector logo 属于首屏非关键资产，但官方 renderer 会一次性发很多。

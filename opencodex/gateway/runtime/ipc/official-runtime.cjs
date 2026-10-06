@@ -3090,6 +3090,21 @@ function buildGatewayStatus() {
   return status;
 }
 
+// 隐藏 main 处理 log-message 时按同一张等级表丢弃低等级行（官方取值：error<warning<info<debug<trace，
+// 默认 prod → info，可用 CODEX_MAX_LOG_LEVEL 抬高）。
+const RENDERER_LOG_LEVELS = ["error", "warning", "info", "debug", "trace"];
+
+/**
+ * 页面侧应当转发到哪一等级以上的 log-message。
+ * 必须与隐藏 main 的丢弃阈值同构：main 本来就会丢的行，页面再走一次「浏览器→反代→gateway」往返是纯浪费，
+ * 流式回答时（每个 reasoning delta 一条 trace）足以把 model/list、mcp-request 等真实 IPC 挤成 pending。
+ */
+function rendererLogForwardLevel() {
+  const configured = String(process.env.CODEX_MAX_LOG_LEVEL || "").trim().toLowerCase();
+  // 非法值与官方 Fe() 一样回落到 prod 默认 info，不能让拼错的等级把日志面打开成 trace。
+  return RENDERER_LOG_LEVELS.includes(configured) ? configured : "info";
+}
+
 async function webConfigScript(options = {}) {
   // 这个脚本由浏览器入口动态加载，避免把本机路径和端口写死到 web-shell 构建产物里。
   const i18n = withPluginI18nMessages(getI18nSnapshot());
@@ -3117,6 +3132,9 @@ async function webConfigScript(options = {}) {
     gatewayPluginConfig: ${JSON.stringify(gatewayPluginConfig)},
     // 浏览器诊断仅在服务端会消费日志或显式排查 WS 时开启，正常模式不产生额外上报请求。
     debugClientDiagnostics: ${JSON.stringify(DEBUG_LOGS || process.env.OPENCODEX_DEBUG_WS === "1")},
+    // 官方 renderer 的 log-message 由页面侧按此阈值预筛；与隐藏 main 的 maxLogLevel 保持一致，
+    // 运维把 CODEX_MAX_LOG_LEVEL 调成 debug/trace 排障时，页面会同步开始转发这些等级。
+    rendererLogLevel: ${JSON.stringify(rendererLogForwardLevel())},
     // debugWs 只控制 WS 大包/慢解析采样，不控制压缩；压缩属于 gateway 传输层优化。
     debugWs: ${JSON.stringify(process.env.OPENCODEX_DEBUG_WS === "1")},
     appServer: ${JSON.stringify({ kind: "official-electron-ipc", spawnHook: appServerSpawnHookStatus() })},
@@ -3304,6 +3322,7 @@ module.exports = {
     threadListInvalidationRequest,
     classifyStatsigControlPlaneFetchUrl,
     buildStatsigInitializeGatewayResponse,
+    rendererLogForwardLevel,
     // 测试专用：暴露配置化网络拦截 handler，验证 allowPaths 放行 / block 拦截 / 审计落盘。
     // 生产路径通过 invokeOfficialIpc 间接调用，这里直接导出以便单测注入受控配置与审计文件。
     maybeHandleConfiguredNetworkBlockNoop,
