@@ -127,6 +127,10 @@ function createWsHub(
     maxClients = WS_MAX_CLIENTS,
     maxPayloadBytes = WS_MAX_PAYLOAD_BYTES,
     observeAppHostFrame,
+    // 可选：返回 { activeTurnCount, activeThreadIds } 的回调，仅用于回收日志的活跃 turn 观测。
+    getActiveWorkSnapshot = null,
+    // 可选：统一观察 gateway→浏览器 的下行帧（{channel,payload} 信封），供幂等读缓存记录响应与失效事件。
+    observeOutboundPayload = null,
   }
 ) {
   if (!WebSocketServer) {
@@ -292,6 +296,36 @@ function createWsHub(
     return null;
   }
 
+  // 活跃 turn 快照只用于回收日志：到期回收是否与「页面还在跑任务」交错，是判断回收是否误伤的唯一线索。
+  const ACTIVE_WORK_THREAD_IDS_MAX = 8;
+
+  function activeWorkSnapshotFields() {
+    // 回调未注入时完全零开销；注入后任何异常都只吞掉诊断字段，回收本身不受影响。
+    if (typeof getActiveWorkSnapshot !== "function") return {};
+    let snapshot = null;
+    try {
+      snapshot = getActiveWorkSnapshot();
+    } catch (error) {
+      diagnosticWarn("ws-hub", "app_host_active_work_snapshot_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
+    }
+    if (!snapshot || typeof snapshot !== "object") return {};
+    const fields = {};
+    const activeTurnCount = Number(snapshot.activeTurnCount);
+    if (Number.isFinite(activeTurnCount)) fields.activeTurnCount = Math.max(0, Math.round(activeTurnCount));
+    if (Array.isArray(snapshot.activeThreadIds)) {
+      // 日志脱敏会把数组压成 array(N)，因此这里显式拼成短 id 字符串，保证落盘可 grep。
+      const ids = snapshot.activeThreadIds
+        .slice(0, ACTIVE_WORK_THREAD_IDS_MAX)
+        .map((threadId) => shortId(String(threadId ?? "")))
+        .filter(Boolean);
+      if (ids.length > 0) fields.activeThreadIds = ids.join(",");
+    }
+    return fields;
+  }
+
   function recycleOrphan(entry) {
     const { key, clientId, portId, context, timer } = entry;
     if (timer) clearTimeout(timer);
@@ -318,6 +352,7 @@ function createWsHub(
       clientId: shortId(clientId),
       portId: shortId(portId),
       waitedMs: Math.max(0, Date.now() - entry.sinceAt),
+      ...activeWorkSnapshotFields(),
     });
   }
 
@@ -795,8 +830,25 @@ function createWsHub(
     lastAuthRejectLogAtMs = now;
   }
 
+  function observeOutbound(envelope) {
+    // 观察器是旁路能力：任何异常都不能影响 WS 投递本身。
+    if (typeof observeOutboundPayload !== "function") return;
+    try {
+      observeOutboundPayload(envelope, { clientId: "" });
+    } catch {}
+  }
+
+  function observeOutboundTo(clientId, envelope) {
+    if (typeof observeOutboundPayload !== "function") return;
+    try {
+      observeOutboundPayload(envelope, { clientId });
+    } catch {}
+  }
+
   /** 向所有在线浏览器广播 gateway 消息。 */
   function broadcast(payload, options = {}) {
+    // 广播帧无归属 client：幂等读缓存只从中提取失效事件，不入库响应。
+    observeOutbound(payload);
     const readySockets = [];
     for (const socket of clients) {
       if (socket.readyState !== socket.OPEN) continue;
@@ -829,6 +881,8 @@ function createWsHub(
 
   /** 向指定 clientId 的浏览器发送 gateway 消息。 */
   function sendTo(clientId, payload, options = {}) {
+    // mcp-response 这类定向回包走 sendTo 而非 broadcast，幂等读缓存按 clientId 观察并入库。
+    observeOutboundTo(clientId, payload);
     const socket = clientsById.get(clientId);
     if (!socket || socket.readyState !== socket.OPEN) {
       if (!options.suppressDiagnostic) {

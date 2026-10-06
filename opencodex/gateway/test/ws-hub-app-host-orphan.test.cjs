@@ -462,3 +462,76 @@ test("orphan inside the window reattaches without any reset frame (reset must no
     "reattach inside the orphan window must not emit a reset"
   );
 });
+
+// —— 活跃 turn 快照（回收日志字段，纯诊断零行为变化）——
+
+function captureDiagnosticWarn() {
+  const lines = [];
+  const original = console.warn;
+  console.warn = (...args) => lines.push(args.map((item) => String(item)).join(" "));
+  return { lines, restore: () => { console.warn = original; } };
+}
+
+async function runRecycleWithSnapshot(t, getActiveWorkSnapshot) {
+  const server = http.createServer();
+  const relays = [];
+  const sockets = [];
+  createWsHub(server, {
+    createAppHostRelay(options) {
+      const relay = makeFakeRelay(options);
+      relays.push(relay);
+      return relay;
+    },
+    getActiveWorkSnapshot,
+    handleNotificationEvent() {},
+    isAuthed: () => true,
+    orphanTtlMs: 120,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    for (const socket of sockets) socket.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const url = "ws://127.0.0.1:" + server.address().port + "/ws";
+  const clientId = "snapshot-client-" + Math.random().toString(36).slice(2);
+  const portId = "snapshot-port-1";
+  const first = await openHelloClient(url, clientId, sockets);
+  await connectAppHost(first, clientId, portId);
+  const capture = captureDiagnosticWarn();
+  first.close();
+  await waitForClose(first);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  capture.restore();
+  return { capture, relays };
+}
+
+test("recycle log carries active-turn snapshot fields when a provider is injected", async (t) => {
+  const longIds = Array.from({ length: 10 }, (_, index) => "thread-" + index + "-01a11034fd0e7013aca1ab6987bb8c0" + index);
+  const { capture, relays } = await runRecycleWithSnapshot(t, () => ({
+    activeThreadIds: longIds,
+    activeTurnCount: 3,
+  }));
+  // 回收行为本身不受影响。
+  assert.equal(relays[0].nullCount, 1);
+  const recycled = capture.lines.filter((line) => line.includes("app_host_orphan_recycled"));
+  assert.equal(recycled.length, 1, "回收日志必须落盘一条");
+  assert.ok(recycled[0].includes('"activeTurnCount":3'), recycled[0]);
+  const idsMatch = recycled[0].match(/"activeThreadIds":"([^"]*)"/);
+  assert.ok(idsMatch, "activeThreadIds 必须以短 id 字符串落盘");
+  const ids = idsMatch[1].split(",");
+  assert.equal(ids.length, 8, "activeThreadIds 截断到最多 8 个");
+  for (const id of ids) assert.ok(id.length <= 16, "线程 id 必须是短 id 形态：" + id);
+});
+
+test("a throwing snapshot provider must not affect the recycle itself", async (t) => {
+  const { capture, relays } = await runRecycleWithSnapshot(t, () => {
+    throw new Error("snapshot provider boom");
+  });
+  assert.equal(relays[0].nullCount, 1, "回调抛错时回收必须照常释放官方端口");
+  assert.equal(relays[0].closed, false);
+  const recycled = capture.lines.filter((line) => line.includes("app_host_orphan_recycled"));
+  assert.equal(recycled.length, 1, "回收日志仍然落盘");
+  assert.ok(!recycled[0].includes("activeTurnCount"), "回调异常时不得出现脏字段");
+  assert.ok(!recycled[0].includes("activeThreadIds"), "回调异常时不得出现脏字段");
+});
