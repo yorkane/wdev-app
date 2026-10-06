@@ -40,6 +40,18 @@ async function handleBrowserReports(req, res, compatibilityService) {
     );
     return;
   }
+  if (compatibilityService.browserSimulationPhase === "phase1") {
+    // 桥接迁移 Phase 1（e7 L15）：上报端点接口存在但整层 dormant——不写 Registry、不推进 epoch、
+    // 不做插件目录注册。这里必须回 200 而不是 400：灰度期残留的旧标签页拿到确认才会停止重试，
+    // 400 会把它们推进退避重试阶梯（正是本层要消灭的 3,066 次/小时自持环）。
+    sendJson(
+      res,
+      200,
+      { ok: true, accepted: 0, dormant: true, reportEpoch: "", resync: false },
+      { "cache-control": "no-store" }
+    );
+    return;
+  }
   const reports = Array.isArray(parsed.reports) ? parsed.reports : [];
   const catalogs = Array.isArray(parsed.catalogs) ? parsed.catalogs : [];
   if (reports.length === 0 || reports.length > MAX_BROWSER_REPORTS_PER_REQUEST) {

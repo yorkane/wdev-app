@@ -1,5 +1,9 @@
 const crypto = require("crypto");
 const path = require("path");
+const {
+  BROWSER_SIMULATION_PHASE,
+  resolveBrowserSimulationPhase,
+} = require("../core/config.cjs");
 const { registerCompatibilityCatalog } = require("./catalog.cjs");
 const {
   createCompatibilityRegistry,
@@ -20,7 +24,12 @@ function createCompatibilityService({
   reportStore,
   persistDelayMs = 25,
   now = () => Date.now(),
+  // 桥接迁移 Phase 1（BRIDGE-SERVICE-DESIGN.md §9）：phase1 下浏览器上报脚本不再注入，
+  // 服务端的「接管即推进 epoch」语义随之 dormant——接口保留、代际不推进、不消费接管。
+  // 默认读模块级缓存的 env；显式入参仅供测试在同进程内构造两套行为。legacy 与今天一致。
+  browserSimulationPhase = BROWSER_SIMULATION_PHASE,
 } = {}) {
+  const simulationPhase = resolveBrowserSimulationPhase(browserSimulationPhase);
   let explicitRuntimeIdentity = null;
   const registry = registerCompatibilityCatalog(
     createCompatibilityRegistry({
@@ -61,6 +70,8 @@ function createCompatibilityService({
   }
 
   function advanceBrowserReportEpoch() {
+    // phase1：epoch 接管语义停用，代际冻结（不推进），调用方看到的永远是初始代际。
+    if (simulationPhase === "phase1") return currentBrowserReportEpoch();
     browserReportRevision += 1;
     return currentBrowserReportEpoch();
   }
@@ -174,6 +185,15 @@ function createCompatibilityService({
   }
 
   function browserKernelReportResult({ clientId, generation, report, reportEpoch }) {
+    if (simulationPhase === "phase1") {
+      // phase1：接口存在但一律「确认且不落库」——不推进 epoch、不重置 web.runtime.* 点位、
+      // 不做新鲜度仲裁，避免灰度期残留标签页的上报把 Registry 打回接管流程（e7 L15 / §6 S11）。
+      return Object.freeze({
+        accepted: false,
+        reportEpoch: currentBrowserReportEpoch(),
+        resync: false,
+      });
+    }
     const requestEpoch = typeof reportEpoch === "string" && reportEpoch.length <= 160 ? reportEpoch : "";
     const result = (accepted) => Object.freeze({
       accepted,
@@ -249,6 +269,8 @@ function createCompatibilityService({
     modifications,
     modificationPoints,
     reportStore: store,
+    // 只读诊断：阶段旗标（legacy / phase1）。phase1 下浏览器上报与 epoch 接管整层 dormant。
+    browserSimulationPhase: simulationPhase,
     setRuntimeIdentity,
     browserKernelReport,
     browserKernelReportResult,

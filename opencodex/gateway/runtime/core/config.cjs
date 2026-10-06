@@ -48,6 +48,24 @@ const AUTH_TOKEN_TTL_MS = Math.max(
   Number(process.env.CODEX_WEB_AUTH_TOKEN_TTL_MS || 12 * 60 * 60 * 1000)
 );
 const DEBUG_LOGS = process.env.CODEX_WEB_DEBUG === "1" || process.env.CODEX_WEB_DEBUG === "true";
+// 桥接迁移 Phase 1 阶段开关（见 doc/BRIDGE-SERVICE-DESIGN.md §9）：
+//   legacy（默认）＝今天的浏览器侧模拟层全部注入，行为与今天完全一致；
+//   phase1＝停用 L13（polyfill 本地 fetch 合成）、L15（runtime-compatibility 浏览器上报 + 网关 epoch 接管）
+//           与 L18（浏览器 UI 补丁簇）。L14 出站拦截按用户裁决保留到 Phase 2，不受本旗标影响。
+// 只在模块加载时读一次并缓存；非法值回退 legacy 并 warn，绝不让拼错的旗标造成半停用状态。
+const BROWSER_SIMULATION_PHASE_ENV = "OPENCODEX_BROWSER_SIMULATION_PHASE";
+const BROWSER_SIMULATION_PHASES = new Set(["legacy", "phase1"]);
+function resolveBrowserSimulationPhase(rawValue, warn) {
+  const emit = warn || ((message) => console.warn(message));
+  const value = String(rawValue == null ? "" : rawValue).trim().toLowerCase();
+  if (!value) return "legacy";
+  if (BROWSER_SIMULATION_PHASES.has(value)) return value;
+  try {
+    emit("[opencodex] " + BROWSER_SIMULATION_PHASE_ENV + "='" + rawValue + "' 非法，回退 legacy（可用值：legacy / phase1）");
+  } catch {}
+  return "legacy";
+}
+const BROWSER_SIMULATION_PHASE = resolveBrowserSimulationPhase(process.env[BROWSER_SIMULATION_PHASE_ENV]);
 const IPC_SLOW_LOG_MS = Number(process.env.CODEX_WEB_SLOW_LOG_MS || 750);
 const LOCAL_FILE_TOKEN_TTL_MS = Math.max(1_000, Number(process.env.CODEX_WEB_LOCAL_FILE_TOKEN_TTL_MS || 5 * 60 * 1000));
 const LOCAL_DOWNLOAD_ARCHIVE_DIR = path.join(RUNTIME_DIR, "local-downloads");
@@ -209,6 +227,10 @@ function officialRuntimeTempDir() {
 module.exports = {
   AUTH_CONFIG_PATH,
   AUTH_TOKEN_TTL_MS,
+  BROWSER_SIMULATION_PHASE,
+  BROWSER_SIMULATION_PHASE_ENV,
+  BROWSER_SIMULATION_PHASES,
+  resolveBrowserSimulationPhase,
   CODEX_GENERATED_IMAGES_DIR,
   CODEX_HOME,
   CODEX_WEB_PICKED_FILE_MAX_BYTES,

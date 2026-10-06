@@ -4,6 +4,7 @@ const path = require("path");
 const { Worker } = require("worker_threads");
 const zlib = require("zlib");
 const {
+  BROWSER_SIMULATION_PHASE,
   PATCHED_OFFICIAL_PREFIX,
   WEB_SHELL_ASSETS_PREFIX,
   WEB_SHELL_DIR,
@@ -11,6 +12,7 @@ const {
   isWithinRoot,
   mimeType,
   readText,
+  resolveBrowserSimulationPhase,
 } = require("../core/config.cjs");
 const { isLoopbackHostHeader } = require("../core/loopback-host.cjs");
 const { DEFAULT_BRAND_NAME, getSiteConfig } = require("../core/site-config.cjs");
@@ -153,6 +155,45 @@ const BROWSER_PROVIDER_KEY_BY_FILE = new Map([
   [path.join(INTERNAL_PROVIDER_DIR, "codex-menu-item-guard.js"), "menu-item-guard"],
   [path.join(INTERNAL_PROVIDER_DIR, "codex-js-error-capture.js"), "js-error-capture"],
 ]);
+/**
+ * 桥接迁移 Phase 1（doc/BRIDGE-SERVICE-DESIGN.md §9）：浏览器侧模拟层的注入清单按阶段旗标分流。
+ * legacy（默认）＝与今天完全一致；phase1＝不注入下面这些条目。
+ * L14（network-guard / statsig-telemetry-guard）按用户裁决保留到 Phase 2，不在本清单内。
+ * 旗标只读一次缓存在模块级；非法值经 resolveBrowserSimulationPhase 回退 legacy。
+ */
+const BROWSER_SIMULATION_DISABLED_URL_PATHS = Object.freeze({
+  // L18 浏览器 UI 补丁簇（e7 report.md:42）：菜单注入、侧栏预览、窗口控件 overlay、
+  // tooltip/离屏动画守卫、iOS 与移动端键盘/侧栏适配、品牌文字替换。
+  l18: new Set([
+    OPENCODEX_SIDEBAR_PREVIEW_PATH,
+    OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH,
+    "/opencodex/internal/providers/mobile-keyboard-optimization.js",
+    "/opencodex/internal/providers/ios-fix.js",
+    "/opencodex/internal/providers/mobile-sidebar-auto-collapse.js",
+    OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH,
+    CODEX_TOOLTIP_DISMISS_GUARD_PATH,
+    CODEX_BRAND_TEXT_PATH,
+    CODEX_MENU_ITEM_GUARD_PATH,
+  ]),
+  // L15 runtime-compatibility 浏览器上报（e7 report.md:39）：不再加载上报脚本；
+  // 只读诊断静态页（runtime-compatibility.html/js/css）不在 e7 L15 定义行内，保留。
+  l15: new Set([OPENCODEX_RUNTIME_COMPATIBILITY_PATH]),
+  // L13 不在这里登记：它的注入单元是整个 codex-bridge-polyfill（L11/L12/L13/L17 同文件），
+  // 整层不注入会连坐传输层与 Electron 环境门面。L13 的停用发生在 polyfill 内部
+  // （读 window.__OPENCODEX_BROWSER_SIMULATION_PHASE__），注入清单因此始终保留 polyfill。
+});
+function browserSimulationDisabledUrlPaths(phase) {
+  if (phase !== "phase1") return new Set();
+  return new Set([
+    ...BROWSER_SIMULATION_DISABLED_URL_PATHS.l15,
+    ...BROWSER_SIMULATION_DISABLED_URL_PATHS.l18,
+  ]);
+}
+/** phase1 下被停用的注入文件绝对路径集合；legacy 返回空集合，即注入清单与今天完全一致。 */
+function browserSimulationDisabledFiles(phase) {
+  const disabled = browserSimulationDisabledUrlPaths(phase);
+  return new Set(Array.from(disabled, (reqPath) => WEB_SHELL_STATIC_FILES.get(reqPath)));
+}
 const OFFICIAL_OPEN_IN_FOLDER_MESSAGE_ID = "artifactTab.preview.openInFolder";
 const OPENCODEX_DOWNLOAD_FILE_MESSAGE_ID = "web.remoteFile.downloadFile";
 const JS_STRING_LITERAL = String.raw`(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|` + "`" + String.raw`(?:\\.|[^` + "`" + String.raw`\\])*` + "`" + ")";
@@ -351,7 +392,10 @@ function createStaticAssetService({
   getI18nSnapshot,
   getOfficialBundle,
   patchedAssetCacheMaxBytes = PATCHED_ASSET_CACHE_MAX_BYTES,
-}) {
+  // 阶段旗标默认读模块级缓存的 env；显式入参仅供测试在同进程内同时构造 legacy/phase1 两套清单。
+  browserSimulationPhase = BROWSER_SIMULATION_PHASE,
+} = {}) {
+  const simulationPhase = resolveBrowserSimulationPhase(browserSimulationPhase);
   const staticModificationRuntime = createHostModificationRuntime({
     host: "static",
     compatibilityService,
@@ -749,8 +793,8 @@ function createStaticAssetService({
   }`;
   }
 
-  function runtimeBootstrapFileGroups(entries) {
-    return {
+  function runtimeBootstrapFileGroups(entries, phase = simulationPhase) {
+    const groups = {
       beforePlugins: [
         WEB_SHELL_STATIC_FILES.get(OPENCODEX_MODIFICATION_RUNTIME_PATH),
         WEB_SHELL_STATIC_FILES.get(OPENCODEX_RUNTIME_COMPATIBILITY_PATH),
@@ -781,6 +825,23 @@ function createStaticAssetService({
         CODEX_JS_ERROR_CAPTURE_PATH,
         OPENCODEX_MODIFICATION_ACTIVATE_PATH,
       ].map((reqPath) => WEB_SHELL_STATIC_FILES.get(reqPath)),
+    };
+    return applyBrowserSimulationPhase(groups, phase);
+  }
+
+  /**
+   * 按阶段旗标从聚合运行时清单中移除 L13/L15/L18 条目。
+   * legacy 分支返回按原顺序重建的等价清单（今天的行为快照）；phase1 下对应条目缺席，
+   * L14（network-guard / statsig-telemetry-guard）与其余传输/桥接条目保持在场。
+   */
+  function applyBrowserSimulationPhase(groups, phase) {
+    if (phase !== "phase1") {
+      return { beforePlugins: [...groups.beforePlugins], afterPlugins: [...groups.afterPlugins] };
+    }
+    const disabledFiles = browserSimulationDisabledFiles(phase);
+    return {
+      beforePlugins: groups.beforePlugins.filter((file) => !!file && !disabledFiles.has(file)),
+      afterPlugins: groups.afterPlugins.filter((file) => !!file && !disabledFiles.has(file)),
     };
   }
 
@@ -1106,10 +1167,19 @@ function createStaticAssetService({
     html = patchHtmlBrandCompatible(html);
     const startupPreloads = startupAssetPreloads(html);
     const lateModuleHrefs = lateStartupModuleHrefs(i18n.locale);
-    const previewMarkup = sidebarPreviewMarkup(options.sidebarPreview, i18n.locale);
+    // phase1 下 L18 侧栏预览（服务端注入的官方侧栏 DOM 快照）整体停用，legacy 保持原行为。
+    const simulationDisabledPaths = browserSimulationDisabledUrlPaths(simulationPhase);
+    const previewMarkup =
+      simulationPhase === "phase1" ? "" : sidebarPreviewMarkup(options.sidebarPreview, i18n.locale);
     if (startupPreloads) hitCompatibilityPoint(staticPoints.startupPreload);
     if (previewMarkup) hitCompatibilityPoint(staticPoints.sidebarPreview);
     const useRuntimeBundle = canBundleRuntimeBootstrap();
+    // phase1 用独立全局变量把阶段旗标传进页面（不塞 __CODEX_WEB_CONFIG__：那份对象由
+    // /codex_web-config.js 整体赋值，内联脚本早于 defer 执行会被覆盖）。legacy 不注入，HTML 与今天一致。
+    const simulationPhaseScript =
+      simulationPhase === "phase1"
+        ? '<script>window.__OPENCODEX_BROWSER_SIMULATION_PHASE__=' + '"' + 'phase1' + '"' + ';</script>'
+        : "";
     // 固定 bootstrap 脚本的 URL 追加内容指纹：边缘网关剥 ETag，协商缓存不可依赖，?fp= 是唯一失效位。
     const bootstrapHref = OPENCODEX_RUNTIME_BOOTSTRAP_PATH + "?fp=" + runtimeBootstrapFingerprintToken();
     const deferRuntimeScripts = !officialHtmlHasEagerScript(html);
@@ -1117,40 +1187,42 @@ function createStaticAssetService({
       `<script${deferRuntimeScripts ? " defer" : ""} src="${src}"></script>`;
     const runtimeScripts = useRuntimeBundle
       ? [
+          ...(simulationPhaseScript ? [simulationPhaseScript] : []),
           '<link rel="preload" as="script" href="/codex-web-config.js">',
           `<link rel="preload" as="script" href="${bootstrapHref}">`,
           runtimeScript("/codex-web-config.js"),
           runtimeScript(bootstrapHref),
         ]
       : [
+          ...(simulationPhaseScript ? [simulationPhaseScript] : []),
           runtimeScript("/codex-web-config.js"),
           runtimeScript(OPENCODEX_MODIFICATION_RUNTIME_PATH),
-          runtimeScript(OPENCODEX_RUNTIME_COMPATIBILITY_PATH),
-          runtimeScript(OPENCODEX_SIDEBAR_PREVIEW_PATH),
-          runtimeScript(OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH),
+          ...(simulationDisabledPaths.has(OPENCODEX_RUNTIME_COMPATIBILITY_PATH) ? [] : [runtimeScript(OPENCODEX_RUNTIME_COMPATIBILITY_PATH)]),
+          ...(simulationDisabledPaths.has(OPENCODEX_SIDEBAR_PREVIEW_PATH) ? [] : [runtimeScript(OPENCODEX_SIDEBAR_PREVIEW_PATH)]),
+          ...(simulationDisabledPaths.has(OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH) ? [] : [runtimeScript(OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH)]),
           runtimeScript(OPENCODEX_PLUGIN_SYSTEM_PATH),
           runtimeScript(OPENCODEX_PLUGIN_LOADER_PATH),
-          ...[...BUILTIN_PROVIDER_FILES.keys()].map(runtimeScript),
+          ...[...BUILTIN_PROVIDER_FILES.keys()].filter((reqPath) => !simulationDisabledPaths.has(reqPath)).map(runtimeScript),
           runtimeScript(CODEX_SMART_SCHEDULING_INJECTION_HEALTH_PATH),
           runtimeScript(CODEX_SMART_MODEL_ROUTER_SETTINGS_PATH),
           runtimeScript(CODEX_SMART_MODEL_ROUTER_COMPOSER_PATH),
           runtimeScript(CODEX_SMART_SCHEDULING_SUMMARY_PATH),
           runtimeScript(OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH),
-          runtimeScript(OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH),
+          ...(simulationDisabledPaths.has(OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH) ? [] : [runtimeScript(OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH)]),
           // codec 先于 bridge 执行，确保新版 AppHost 的首批结构化帧可以立即编码。
           runtimeScript(CODEX_APP_HOST_MESSAGE_CODEC_PATH),
           runtimeScript(CODEX_BRIDGE_POLYFILL_PATH),
           runtimeScript(CODEX_REMOTE_FILE_ACTIONS_PATH),
           runtimeScript(CODEX_WORKSPACE_ROOT_PICKER_PATH),
-          runtimeScript(CODEX_TOOLTIP_DISMISS_GUARD_PATH),
+          ...(simulationDisabledPaths.has(CODEX_TOOLTIP_DISMISS_GUARD_PATH) ? [] : [runtimeScript(CODEX_TOOLTIP_DISMISS_GUARD_PATH)]),
           // 聚合启动路径之外的逐文件回退加载同样要带上遥测拦截，否则官方 bundle 含 eager script
           // 或存在外部插件时该 Provider 根本不加载，修改点会在 locate 阶段被判 unsupported。
           runtimeScript(CODEX_STATSIG_TELEMETRY_GUARD_PATH),
           // 逐文件回退路径同样要带上域名拦截与品牌替换，否则该 Provider 根本不加载，
           // 修改点会在 locate 阶段被判 unsupported。
           runtimeScript(CODEX_NETWORK_GUARD_PATH),
-          runtimeScript(CODEX_BRAND_TEXT_PATH),
-          runtimeScript(CODEX_MENU_ITEM_GUARD_PATH),
+          ...(simulationDisabledPaths.has(CODEX_BRAND_TEXT_PATH) ? [] : [runtimeScript(CODEX_BRAND_TEXT_PATH)]),
+          ...(simulationDisabledPaths.has(CODEX_MENU_ITEM_GUARD_PATH) ? [] : [runtimeScript(CODEX_MENU_ITEM_GUARD_PATH)]),
           // 逐文件回退路径同样带上错误捕获，聚合 bootstrap 与逐文件两条链路等价。
           runtimeScript(CODEX_JS_ERROR_CAPTURE_PATH),
           runtimeScript(OPENCODEX_MODIFICATION_ACTIVATE_PATH),
@@ -1463,6 +1535,15 @@ ${pluginGatewayStateBootstrapScript()}
     const i18n = currentI18n();
     // 登录页是浏览器第一个看到的界面，它的 <title> / PWA meta 同样要跟随品牌名。
     let html = patchHtmlBrand(patchWebShellAppVersion(patchHtmlLang(readText(shell), i18n.locale)));
+    // phase1 下登录壳同样按层清单收敛：L15 上报脚本与 L18 窗口控件 overlay 不再加载；
+    // legacy 完全不走这个分支，HTML 字节与今天一致。
+    if (simulationPhase === "phase1") {
+      const shellDisabled = browserSimulationDisabledUrlPaths(simulationPhase);
+      for (const reqPath of [OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH]) shellDisabled.add(reqPath);
+      for (const reqPath of shellDisabled) {
+        html = html.split('<script src="' + reqPath + '"></script>').join("");
+      }
+    }
     const links = officialStyleLinks();
     if (links) {
       // web-shell 自己负责承载 UI，注入官方样式后视觉表现和桌面 renderer 保持一致。

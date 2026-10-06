@@ -58,6 +58,16 @@
   // 用户取消文件对话框后，等这么久再确认「确实没有选中文件」。
   // 取值需容忍 change 迟于 focus 到达；过短会把「选得慢」误判成取消并丢弃选择结果。
   const FILE_PICKER_CANCEL_GRACE_MS = 1_000;
+  // 桥接迁移 Phase 1（e7 L13）：浏览器本地 fetch 响应合成路径按阶段旗标停用。
+  // phase 由 gateway 在官方 HTML 内联的 __OPENCODEX_BROWSER_SIMULATION_PHASE__ 传入（cfg.browserSimulationPhase 为兜底）；缺省或非法一律
+  // 视为 legacy（与今天完全一致）。L11/L12/L17 同文件能力不受影响；Statsig payload 构造器
+  // 继续挂载——它是 L14（codex-network-guard，Phase 2 前保留）的响应体来源。
+  const BROWSER_SIMULATION_PHASE =
+    String(
+      w.__OPENCODEX_BROWSER_SIMULATION_PHASE__ || cfg.browserSimulationPhase || ""
+    ).trim().toLowerCase() === "phase1"
+      ? "phase1"
+      : "legacy";
   const TERMINAL_QUEUE_MAX_SESSIONS = 64;
   const TERMINAL_QUEUE_MAX_PENDING_PER_SESSION = 512;
   const TERMINAL_QUEUE_MAX_TOTAL_PENDING = 4096;
@@ -3393,17 +3403,22 @@
         if (payload && typeof payload === "object" && payload.type === "open-in-browser" && payload.url) {
           return openExternal(payload.url);
         }
-        if (handlePickFilesFetchMessage(payload)) {
-          return true;
-        }
-        if (handleIdeContextFetchMessage(payload)) {
-          return true;
-        }
-        if (handlePostLoginStatsigBootstrapFetchMessage(payload)) {
-          return true;
-        }
-        if (handleStatsigTelemetryFetchMessage(payload)) {
-          return true;
+        // 桥接迁移 Phase 1（e7 L13）：本地 fetch 响应合成整组停用。四条 vscode://codex/* 与
+        // Statsig/遥测合成路径集中在这一组分发点，phase1 下全部跳过，让消息原样进入官方 main
+        // 通道（由 L06 网关侧短路兜底）；legacy 分支与今天完全一致。L14 的出站拦截不受影响。
+        if (BROWSER_SIMULATION_PHASE !== "phase1") {
+          if (handlePickFilesFetchMessage(payload)) {
+            return true;
+          }
+          if (handleIdeContextFetchMessage(payload)) {
+            return true;
+          }
+          if (handlePostLoginStatsigBootstrapFetchMessage(payload)) {
+            return true;
+          }
+          if (handleStatsigTelemetryFetchMessage(payload)) {
+            return true;
+          }
         }
         emitOpenCodexPluginEvent("view:message", payload);
         const workspaceRootResult = handleRemoteWorkspaceRootOption(payload);
@@ -3647,6 +3662,10 @@
   if (typeof w.fetch === "function" && !w.__codexWebFetchPatched) {
     const originalFetch = w.fetch.bind(w);
     w.fetch = async (input, init) => {
+      // phase1（e7 L13）：不再由浏览器扮演 main——sentry-ipc://、Statsig 与遥测端点的
+      // 本地合成响应整层停用，请求原样透传（出站拦截仍由 L14 network-guard 负责）。
+      // 判定放在函数最前端：legacy 分支的后续执行顺序与今天逐行一致。
+      if (BROWSER_SIMULATION_PHASE === "phase1") return originalFetch(input, init);
       const url =
         typeof input === "string"
           ? input
