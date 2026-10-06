@@ -35,7 +35,14 @@
 
 **网关侧（主修）**：WS 临时断开时**不再销毁** app-host 会话，而是把 relay **孤儿化**（不发 null、不关官方端口），
 按 `clientId+portId` 保留；页面重连时**重新挂接同一条 relay / 同一个 MessagePortMain** → 官方 session 从未更换，
-页面的 export 表始终有效。配回收定时器（默认 5 分钟，`OPENCODEX_APP_HOST_ORPHAN_TTL_MS`）与全局上限：页面真的不回来了才按旧语义释放。
+页面的 export 表始终有效。配回收定时器（默认 30 分钟，`OPENCODEX_APP_HOST_ORPHAN_TTL_MS`，下限 5 秒）与全局上限：页面真的不回来了才按旧语义释放。
+
+> **2026-10-06 取证结论**：孤儿到期回收（`recycleOrphan`）只做 `relay.postMessage(null)`/`close` 释放该页面的
+> AppView RPC session，**全程零 `process.kill`，不会杀 app-server 及其子智能体进程树**（生产 266 次回收 vs
+> 306 次重连认领可交叉验证）。子智能体真正死亡源于**网关整体重启时对子进程树的 SIGTERM**，与孤儿回收无关。
+> 为把这两件事彻底区分开，回收日志 `app_host_orphan_recycled` 现已附带活跃 turn 快照字段
+> （`activeTurnCount` / 截断的 `activeThreadIds`，来自 modelRouter turnRouteStatus），回收若与"页面还在跑任务"
+> 交错会直接可见。
 断线窗口内官方→浏览器的帧会被缓冲并在重挂后按 FIFO 冲刷，避免 RPC 丢帧/乱序。
 
 **客户端侧（辅修）**：`codex-bridge-polyfill.js` 的 `scheduleReconnect()` 原本在 `document.visibilityState === "hidden"` 时**无限期推迟重连**，
