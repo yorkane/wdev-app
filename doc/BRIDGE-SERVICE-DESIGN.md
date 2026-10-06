@@ -1,6 +1,6 @@
 # 桥接服务设计（Bridge Service Design）
 
-> 决策状态：**已裁决（2026-10-06），待实施评审**
+> 决策状态：**已裁决并完成实施评审（v2，2026-10-06，含协议实测修订）**，可进入 Phase 1
 > 作者：arch_doc（依据 root 架构裁决落笔）｜ 本文档为新建文件，无历史版本
 
 ## TL;DR
@@ -256,3 +256,60 @@ e7 用另一条判据把 28 层归位（e7 §⓪，report.md:8-12）：每一层
 - 官方 spawn env 基线（e6 C10 :45640-45680 / :45834）：args `[app-server, ...overrides.flatMap(a=>["-c",a]), --analytics-default-enabled]`，env LOG_FORMAT=json、RUST_LOG=warn、CODEX_INTERNAL_ORIGINATOR_OVERRIDE、CODEX_MCP_NODE_PATH、PATH 追加——桥拉起 app-server 时对齐，避免被官方后端流量指纹识破（e7 L05：401 Unauthorized 17 条全部落在 featured-plugin 预热，"伪装流量被官方后端识破"）。
 
 （完）
+
+---
+
+## 实施评审结论与修订（v2，2026-10-06 协议实测后裁决）
+
+> 状态更新：已裁决并完成实施评审（协议实测证据：/data/tmp/aq_analysis/bridge_probe/report.md，
+> 含帧日志/脚本/服务端日志/全量 JSON Schema）。本节修订正文 §3/§4/§9 的四处假设，并关闭 §10 的 Q1/Q2/Q3。
+
+### 实测修正（四条，均以隔离实例往返帧为证）
+
+1. **§3.1 修订：unix socket 线上是 WebSocket，不是裸 NDJSON**。`--listen unix://PATH` 的线上协议
+  为 HTTP Upgrade + RFC6455 帧；裸 NDJSON 被 httparse 拒绝。桥的官方通道实现按 WS 客户端写
+  （参照实现 bridge_probe/scripts/wsclient.js）。initialize 的响应即就绪信号（无 type:ready 帧）；
+  未 initialize 前一切方法回 -32600。ws:// 模式自带 /readyz /healthz；非 loopback 绑定强制 --ws-auth。
+2. **§3.3/§3.4 修订：IpcRouter 与 thread-follower-* 都是 Desktop-main 的能力，不是 app-server 的**。
+  独立 app-server 不创建 ipc.sock；服务端方法表约 190 项无任何 follower 方法。桥替代 main 后必须
+  **自建 IpcRouter 等价总线并自实现 follower 语义**（把浏览器的 follow/steer/intent 翻译成
+  turn/interrupt、turn/steer 等真实方法）。§3.4"官方 thread-follower-* 命令族"表述作废。
+3. **§3.1 补充：app-server proxy 子命令整体绕开**。实测它是裸字节 stdio 中继，与 WS 化的 control
+  socket 协议失配（两种 socket 下均 Broken pipe）。多客户端统一走"同 socket 多 WS 连接"——
+  实测同一 unix socket 双连接各自 initialize 成功，thread/started 广播到所有已初始化连接。
+4. **§4-C1 强化：慢消费者的失败模式是静默丢帧**。700 条广播压力下送达仅 77 条，服务端
+  181 条 "dropping message for disconnected connection"，无断线无报错。桥的转发路径必须：
+  逐连接出站队列水位监控 + 丢帧计数告警 + 队列满主动断开慢连接（宁可断可观测，不可静默丢）。
+  另修正 C3：**thread/subscribe 不存在**（只有 unsubscribe；通知为广播制），细粒度路由以
+  unsubscribe/optOut 表达，per-thread 通知语义留待有登录态环境复核。
+
+### 已关闭的开放问题（§10 Q1/Q2/Q3）
+
+| 问题 | 决策 |
+|---|---|
+| Q1 桥崩溃降级形态 | 桥=独立 systemd 服务（Restart=always + StartLimitBurst 退避）；/api/health 暴露 bridge_status(ok/down/recovering)；桥 down 时浏览器保留只读（列表/历史走网关侧数据），新 turn 进入 30s 有限排队，超时明确报错；**禁止回落旧隐藏 renderer 链路**（防双客户端互踩）。恢复路径=重连+重新 initialize+重放订阅，列为 Phase 2 验收项 |
+| Q2 官方入口真机验证 | 已完成（本节四条修正即产物）；26.908 已具备桥所需全部能力（--listen unix/ws、多连接广播、daemon 族），**Phase 1-2 无需先升 26.930** |
+| Q3 smart-router 归属 | **独立合法第二连接**（同 socket、clientType=opencodex-router、完整 initialize 能力协商，实测可行）。L23 寄生层（opencodex.router: 前缀、tombstone、-32001、字节帧分类 clientFramesConflict）整体退役。router ephemeral 线程即用即删，与单 live attachment 约束无冲突 |
+
+### 部署与鉴权补充决策
+
+- D1 桥与网关进程解耦为两个 systemd 单元；网关重启不再牵动桥与 app-server（对 25 次 SIGTERM
+  连坐事故的结构性收口）。
+- D2 鉴权双层：浏览器 token（web 壳会话）与官方凭据（CODEX_HOME）彻底分离；桥只接受网关
+  转发的已鉴权连接，自身不面向公网。
+- D3 Phase 顺序修订：原 Phase 0（锁 26.930+符号锚定）**后移**——桥在当前 26.908 上落地
+  （Phase 1 拔浏览器模拟层 → Phase 2 socket 化+桥进程），符号锚定与 26.930 升级合并为桥稳定
+  后的独立阶段（overlay patch 在桥化后有整层退役，锚定面本身会缩小）。
+
+### 仍开放（进入 Phase 1 前需补）
+
+
+- D2 补充（用户裁决 2026-10-06 下午）：**不采用官方 gatewayOAuth/userVerification**——本系统始终免 OAuth，
+  对外认证用 API key，由配套 codex-proxy 项目承担接入与转发；桥与网关的鉴权面保持现状分层
+  （web 壳会话 token + API key），不随 26.930 的鉴权族扩张演进。
+1. per-thread 通知路由与 optOutNotificationMethods 的真实语义（需带登录态环境复核，probe 隔离
+   实例无凭据未能覆盖）。
+2. 桥自建 IpcRouter 总线的最小面（官方 bundle 依赖的 client-discovery/client-status-changed 等
+   信封是否必须在 Phase 2 提供，可由 L19 handler 表清点推导）。
+3. daemon 模式取舍：托管路径 symlink（packages/standalone/current）与直起 --listen 的运维差异，
+   建议桥先用直起 + systemd 管理，daemon 族留作升级路径。
