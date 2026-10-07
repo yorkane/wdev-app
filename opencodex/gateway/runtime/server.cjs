@@ -65,6 +65,7 @@ const {
   runExecuteIpcInvoke,
 } = require("./ipc/idempotent-read-cache.cjs");
 const { createThreadContentInvalidation } = require("./ipc/thread-content-invalidation.cjs");
+const { createShutdownDrain } = require("./shutdown-drain.cjs");
 const { workspaceRootsFromIpcPayload } = require("./ipc/workspace-root-context.cjs");
 const { createWorkspaceRootsService } = require("./ipc/workspace-roots.cjs");
 const { diagnosticError, diagnosticLog, diagnosticWarn, sanitizeDiagnosticValue, shortId } = require("./core/diagnostics.cjs");
@@ -447,13 +448,26 @@ function installShutdownHandlers(
   pluginService,
   compatibilityService,
   historyPreview,
-  hiddenRuntimeGcmSockets
+  hiddenRuntimeGcmSockets,
+  readActiveWorkSnapshot
 ) {
   let shuttingDown = false;
   let restartScheduled = false;
-  function shutdown({ exitCode = null, reason = "", signal = "" } = {}) {
+  // SIGTERM/SIGINT 排空：等运行中的 turn 收尾（activeTurnCount→0 或窗口超时）再走清理退出。
+  // OPENCODEX_SHUTDOWN_DRAIN_MS=0 可一键回到旧的立即退出行为（回滚开关）。
+  const shutdownDrain = createShutdownDrain({
+    getActiveWorkSnapshot: readActiveWorkSnapshot,
+    log: (event, details) => diagnosticLog("gateway", event, details),
+  });
+  async function shutdown({ exitCode = null, reason = "", signal = "" } = {}) {
     if (shuttingDown) return;
     shuttingDown = true;
+    const drainLabel = signal || reason || "shutdown";
+    try {
+      await shutdownDrain.run(drainLabel);
+    } catch {
+      // 排空自身异常绝不阻塞关停。
+    }
     // 退出时先释放短期 token 和待处理的官方内部请求，避免请求一直挂起。
     localFiles.dispose();
     if (pickedFiles && typeof pickedFiles.dispose === "function") pickedFiles.dispose();
@@ -499,9 +513,9 @@ function installShutdownHandlers(
     return true;
   }
 
-  process.once("SIGINT", () => shutdown({ signal: "SIGINT" }));
-  process.once("SIGTERM", () => shutdown({ signal: "SIGTERM" }));
-  app.once("before-quit", () => shutdown());
+  process.once("SIGINT", () => void shutdown({ signal: "SIGINT" }));
+  process.once("SIGTERM", () => void shutdown({ signal: "SIGTERM" }));
+  app.once("before-quit", () => void shutdown());
   return { requestRestart };
 }
 
@@ -1029,6 +1043,21 @@ async function createGateway() {
     });
   }
   let requestRestart = () => false;
+  // 活跃 turn 快照：ws-hub 回收日志与关停排空共用；只在调用时实时读路由状态。
+  const readActiveWorkSnapshot = () => {
+    try {
+      const snapshot = pluginService?.modelRouter?.turnRouteStatus?.snapshot?.();
+      const active = snapshot?.active;
+      if (!active || typeof active !== "object") return null;
+      return {
+        activeTurnCount: Number(snapshot.activeCount),
+        activeThreadIds: Object.keys(active),
+      };
+    } catch {
+      // 诊断回调绝不影响回收链路。
+      return null;
+    }
+  };
   const requestHandler = createRequestHandler({
     compatibilityService,
     historyPreview,
@@ -1072,20 +1101,7 @@ async function createGateway() {
       pluginService.smartSchedulingPresentation?.observeAppHostFrame(frame);
     },
     // 回收日志里的活跃 turn 观测：只在真正回收的那一刻实时读路由状态，模块加载期不拉取。
-    getActiveWorkSnapshot() {
-      try {
-        const snapshot = pluginService?.modelRouter?.turnRouteStatus?.snapshot?.();
-        const active = snapshot?.active;
-        if (!active || typeof active !== "object") return null;
-        return {
-          activeTurnCount: Number(snapshot.activeCount),
-          activeThreadIds: Object.keys(active),
-        };
-      } catch {
-        // 诊断回调绝不影响回收链路。
-        return null;
-      }
-    },
+    getActiveWorkSnapshot: readActiveWorkSnapshot,
     // 幂等读缓存的响应入库与失效钩子：所有 gateway→浏览器 下行帧在此被旁路观察。
     // mcp-response 按 pending 登记表入库；query-cache-invalidate（runThreadListInvalidation）
     // 与 turn 终端/thread 生命周期通知（transport INTERNAL_TURN_TERMINAL_METHODS 的官方通知形态）
@@ -1117,7 +1133,8 @@ async function createGateway() {
     pluginService,
     compatibilityService,
     historyPreview,
-    hiddenRuntimeGcmSockets
+    hiddenRuntimeGcmSockets,
+    readActiveWorkSnapshot
   );
   requestRestart = shutdownController.requestRestart;
   await listen(server);
