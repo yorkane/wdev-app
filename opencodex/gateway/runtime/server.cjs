@@ -32,6 +32,7 @@ const {
   isLoopbackHostHeader,
   loopbackHostname,
 } = require("./core/loopback-host.cjs");
+const { firstHeader, isViaAuthzGateway, resolveFileOrigin } = require("./core/file-origin.cjs");
 const { gzipIfUseful, isRequestBodyTooLargeError, readBody, send, sendJson } = require("./http/http-utils.cjs");
 const { createLocalFileService } = require("./http/local-files.cjs");
 const { createServiceRestartHandler } = require("./http/service-control.cjs");
@@ -39,11 +40,13 @@ const { handleTokenUsageRequest } = require("./http/token-usage.cjs");
 const {
   buildGatewayStatus,
   createOfficialAppHostRelay,
+  createRemoteFilePreviewForCurrentClient,
   getI18nSnapshot,
   getOfficialBundle,
   handleOfficialNotificationEvent,
   invokeOfficialIpc,
   listOfficialIpcChannels,
+  openExternalForCurrentClient,
   rejectPendingInternalResponses,
   requestContext,
   setWsHub,
@@ -115,6 +118,78 @@ const CLIENT_LOG_BODY_MAX_BYTES = 256 * 1024;
 const IPC_INVOKE_BODY_MAX_BYTES =
   Math.ceil((CODEX_WEB_PICKED_FILES_MAX_TOTAL_BYTES * 4) / 3) + 2 * 1024 * 1024;
 const GATEWAY_PLUGIN_SYNC_PENDING_COOKIE = "opencodex_gateway_plugin_sync_pending";
+
+// ---------------------------------------------------------------- 浏览器页自报的 file 域
+// 生产链路 authz 的 codex->3737 绑定开了 simulate_local：它把 Host / X-Forwarded-Host / Origin
+// 全改写成 127.0.0.1:3737（实测抓包确认，Referer 也被清掉），所以 WS 帧到达时服务端已无法反推
+// 浏览器地址栏里的域名。前端在每次 IPC 里自报 location.origin 是唯一可靠来源；但前端可能尚未
+// 升级，因此这里把最近一次成功派生的结果按 clientId 记下来，供后续拿不到信号的请求复用。
+const CLIENT_ORIGIN_TTL_MS = 6 * 60 * 60 * 1000; // 页面活着就不会换域名，6 小时足够覆盖长会话
+const CLIENT_ORIGIN_MAX_ENTRIES = 512;
+const clientOrigins = new Map(); // clientId -> { origin, expiresAt }
+// 运行期可覆盖的 TTL，只为单测留出「缓存已过期」这条分支的验证入口；生产路径恒为默认值。
+let clientOriginTtlMs = CLIENT_ORIGIN_TTL_MS;
+
+function rememberClientOrigin(clientId, origin) {
+  const id = String(clientId || "");
+  const value = String(origin || "").trim();
+  if (!id || !value) return;
+  if (clientOrigins.size >= CLIENT_ORIGIN_MAX_ENTRIES && !clientOrigins.has(id)) {
+    const oldestKey = clientOrigins.keys().next().value;
+    if (oldestKey !== undefined) clientOrigins.delete(oldestKey);
+  }
+  clientOrigins.set(id, { origin: value, expiresAt: Date.now() + clientOriginTtlMs });
+}
+
+function recallClientOrigin(clientId) {
+  const id = String(clientId || "");
+  if (!id) return "";
+  const entry = clientOrigins.get(id);
+  if (!entry) return "";
+  if (entry.expiresAt <= Date.now()) {
+    clientOrigins.delete(id);
+    return "";
+  }
+  return entry.origin;
+}
+
+/**
+ * 一次 IPC 请求里「客户端是浏览器还是桌面端」与「file 域该派生成什么」的完整判定。
+ *
+ * 单独成函数是为了把最容易串台的两条接线钉在单测里：
+ *  - recallClientOrigin 缓存命中/过期回落：未升级的前端复用旧 clientId 时，若缓存不过期，
+ *    A 节点的域名会被 B 节点的请求复用，open-url 就会打到错误节点的文件域；
+ *  - remoteBrowserClient 的两位判据：漏掉 X-Authz-* 那一路，生产链路（authz simulate_local
+ *    把 Host 改写成回环）上的拦截会整条失效。
+ *
+ * 只读 parsed / requestHeaders，不碰 req，因此可在单测里用普通对象驱动。
+ */
+function resolveRequestFileOriginContext({ parsed, clientId, requestHeaders, isLoopbackBrowserHost }) {
+  // 「远端浏览器」判据：Host 非回环，或虽然回环但带 authz 身份断言头。
+  // 生产链路 authz 的 codex->3737 绑定开了 simulate_local，把 Host 改写成 127.0.0.1:3737，
+  // 单看 Host 会把真实浏览器误判成桌面直连；X-Authz-* 是唯一没被改写的浏览器证据。
+  const remoteBrowserClient = !isLoopbackBrowserHost || isViaAuthzGateway(requestHeaders);
+  // file 域按 client -> Origin -> Referer -> X-Forwarded-Host -> Host -> 兜底 求一次。
+  // clientOrigin 由前端随 IPC 自报（location.origin），是唯一不受 authz/边缘改写影响的来源。
+  const clientOrigin =
+    firstHeader(parsed && typeof parsed.clientOrigin === "string" ? parsed.clientOrigin : "") ||
+    firstHeader(requestHeaders["x-opencodex-client-origin"]) ||
+    // 前端还没升级时复用该 client 最近一次自报成功的域名（WS 帧里 Host/Origin 已被改写成回环）。
+    recallClientOrigin(clientId);
+  const fileOriginResolution = resolveFileOrigin({
+    configured: process.env.CODEX_WEB_FILE_ORIGIN,
+    clientOrigin,
+    origin: firstHeader(requestHeaders.origin),
+    referer: firstHeader(requestHeaders.referer),
+    forwardedHost: firstHeader(requestHeaders["x-forwarded-host"]),
+    host: firstHeader(requestHeaders.host),
+    fallbackPort: PORT,
+  });
+  if (clientOrigin && fileOriginResolution.source === "client") {
+    rememberClientOrigin(clientId, clientOrigin);
+  }
+  return { clientOrigin, remoteBrowserClient, fileOriginResolution };
+}
 
 // ---------------------------------------------------------------- 客户端 JS 错误落盘
 // js-* 事件（js-error / js-unhandled-rejection / js-capability）是长期可用性埋点：
@@ -453,21 +528,29 @@ function installShutdownHandlers(
 ) {
   let shuttingDown = false;
   let restartScheduled = false;
+  let drainCompleted = false;
+  let quitGatePassed = false;
   // SIGTERM/SIGINT 排空：等运行中的 turn 收尾（activeTurnCount→0 或窗口超时）再走清理退出。
   // OPENCODEX_SHUTDOWN_DRAIN_MS=0 可一键回到旧的立即退出行为（回滚开关）。
   const shutdownDrain = createShutdownDrain({
     getActiveWorkSnapshot: readActiveWorkSnapshot,
     log: (event, details) => diagnosticLog("gateway", event, details),
   });
+  async function drainOnce(label) {
+    if (drainCompleted) return;
+    drainCompleted = true;
+    try {
+      await shutdownDrain.run(label);
+    } catch {
+      // 排空自身异常绝不阻塞关停。
+    }
+  }
+
   async function shutdown({ exitCode = null, reason = "", signal = "" } = {}) {
     if (shuttingDown) return;
     shuttingDown = true;
     const drainLabel = signal || reason || "shutdown";
-    try {
-      await shutdownDrain.run(drainLabel);
-    } catch {
-      // 排空自身异常绝不阻塞关停。
-    }
+    await drainOnce(drainLabel);
     // 退出时先释放短期 token 和待处理的官方内部请求，避免请求一直挂起。
     localFiles.dispose();
     if (pickedFiles && typeof pickedFiles.dispose === "function") pickedFiles.dispose();
@@ -515,7 +598,23 @@ function installShutdownHandlers(
 
   process.once("SIGINT", () => void shutdown({ signal: "SIGINT" }));
   process.once("SIGTERM", () => void shutdown({ signal: "SIGTERM" }));
-  app.once("before-quit", () => void shutdown());
+  // Electron 的 app.quit() 会在事件循环之外销毁窗口并退出，直接挂 drain 的 await 活不到头
+  // （2026-10-07 14:48 实证：started 落盘后进程即死）。规范解法：before-quit 先 preventDefault，
+  // 排空完成后再放行第二次 quit。
+  app.on("before-quit", (event) => {
+    if (quitGatePassed) return;
+    event.preventDefault();
+    void (async () => {
+      await drainOnce("before-quit");
+      quitGatePassed = true;
+      try {
+        shutdown({ reason: "quit_gate" });
+      } catch {}
+      try {
+        app.quit();
+      } catch {}
+    })();
+  });
   return { requestRestart };
 }
 
@@ -653,7 +752,12 @@ function createRequestHandler({
           ...requestAuthRefreshHeaders,
         },
         Buffer.from(
-          await webConfigScript({ gatewayPluginConfig: pluginService?.configStore?.snapshot?.() || null }),
+          await webConfigScript({
+            gatewayPluginConfig: pluginService?.configStore?.snapshot?.() || null,
+            // fileBaseUrl 必须按本次请求派生：公网边缘会把 Host 改写成内网域、authz 又会把
+            // Host/Origin 改写成 127.0.0.1，所以把原始请求头整体交给派生函数逐级取用。
+            requestHeaders: req.headers,
+          }),
           "utf-8"
         )
       );
@@ -766,6 +870,13 @@ async function executeIpcInvoke(
   const remoteAddress = remoteAddressFromRequest(req);
   const browserHostname = hostnameFromHostHeader(req.headers.host);
   const isLoopbackBrowserHost = isLoopbackHostHeader(req.headers.host);
+  const requestHeaders = req.headers || {};
+  const { clientOrigin, remoteBrowserClient, fileOriginResolution } = resolveRequestFileOriginContext({
+    isLoopbackBrowserHost,
+    parsed,
+    clientId,
+    requestHeaders,
+  });
   const openFileTarget = openFileTargetFromIpc(channel, payload);
   const ipcWorkspaceRoots = workspaceRootsFromIpcPayload(channel, payload);
   try {
@@ -841,8 +952,22 @@ async function executeIpcInvoke(
     const value = await requestContext.run(
       {
         browserHostname,
+        // 原始 Host（含端口）、Origin 与请求头都进 store，供 runtime 侧派生/诊断复用同一口径。
+        browserHost: firstHeader(requestHeaders.host) || "",
+        browserOrigin: firstHeader(requestHeaders.origin) || "",
+        clientOrigin,
+        requestHeaders,
+        remoteBrowserClient,
+        fileOrigin: fileOriginResolution.origin,
+        fileOriginSource: fileOriginResolution.source,
         clientId,
         createLocalFileDownload: localFiles.createLocalFileDownload,
+        // 文件读总闸：与 createLocalFileDownload 同一来源（service 实例持有 launcher 动态注册的
+        // workspace roots），保证「能不能读」和「能不能建 token」用的是同一份 allowlist。
+        isAllowedLocalDownloadPath: localFiles.isAllowedLocalDownloadPath,
+        // 预览出口的建 token 能力同样只从这一个 service 实例注入；真正的闸门在
+        // createRemoteFilePreviewForCurrentClient 里（与 open-file 拦截共用同一判据）。
+        makeLocalFilePreview: localFiles.createLocalFilePreview,
         isLoopbackBrowserHost,
         openFileTarget,
         remoteAddress,
@@ -853,11 +978,18 @@ async function executeIpcInvoke(
           remoteAddress,
           setTitle: () => true,
           openExternal: (urlToOpen) => {
-            if (urlToOpen) console.log(`[openExternal] ${urlToOpen}`);
+            // Web 端不能在服务端拉起浏览器：http(s) 交给前端新标签，本地路径走 file 域。
+            const handled = openExternalForCurrentClient(urlToOpen);
+            if (!handled && urlToOpen) {
+              // loopback 桌面端等非接管场景保留原有日志口径，便于对照历史行为。
+              console.log(`[openExternal] ${urlToOpen}`);
+            }
             return true;
           },
           // 官方 openFile 在桌面里会打开系统应用；Web 端改成短期 token 的浏览器预览链接。
-          openFile: (filePath) => localFiles.createLocalFilePreview(filePath),
+          // 建 token 之前必须过 allowlist 总闸（与 open-file 拦截同一判据），否则这条出口就是
+          // 「任意绝对路径 → /api/local-file/<token> → 任意本机字节」的第二条未闭合通道。
+          openFile: (filePath) => createRemoteFilePreviewForCurrentClient(filePath),
         })
     );
     const elapsedMs = Date.now() - startedAtMs;
@@ -1168,5 +1300,19 @@ module.exports = {
     isHiddenRuntimeGcmHoldRequest,
     // js-* 客户端错误落盘的限流判定，单独导出便于单测（纯函数，只读内存态 Map）。
     shouldLogJsError,
+    // 「远端浏览器 + file 域」两级判定的接线（recallClientOrigin / remoteBrowserClient）。
+    // resetClientOrigins / setClientOriginTtlMs 只为单测清场与覆盖过期分支，生产路径不调用。
+    resolveRequestFileOriginContext,
+    resetClientOrigins() {
+      clientOrigins.clear();
+    },
+    setClientOriginTtlMs(value) {
+      // 传有限非负数即用该 TTL（0 = 写入即过期，供单测覆盖过期分支）；其余值恢复默认。
+      const ms = Number(value);
+      clientOriginTtlMs = Number.isFinite(ms) && ms >= 0 ? ms : CLIENT_ORIGIN_TTL_MS;
+    },
+    clientOriginCount() {
+      return clientOrigins.size;
+    },
   },
 };
