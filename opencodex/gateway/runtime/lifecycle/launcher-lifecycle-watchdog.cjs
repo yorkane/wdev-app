@@ -3,7 +3,14 @@ const net = require("net");
 const { diagnosticLog, diagnosticWarn } = require("../core/diagnostics.cjs");
 const { markGatewaySilentQuit } = require("./quit-confirmation-suppressor.cjs");
 
-const FORCE_EXIT_TIMEOUT_MS = 2000;
+// 强退预算 = 基础 2s + 排空窗口：SIGTERM 后 installShutdownHandlers 会先等活跃 turn
+// 收尾（OPENCODEX_SHUTDOWN_DRAIN_MS，默认 25s），看门狗若仍按裸 2s 强退会在排空
+// 中途杀掉进程（2026-10-07 14:18/14:22 实证：drain_started 落盘后无 clear/timeout 即死）。
+const SHUTDOWN_DRAIN_BUDGET_MS = Math.min(
+  120_000,
+  Math.max(0, Number(process.env.OPENCODEX_SHUTDOWN_DRAIN_MS) || 25_000)
+);
+const FORCE_EXIT_TIMEOUT_MS = 2000 + SHUTDOWN_DRAIN_BUDGET_MS;
 
 function lifecycleFdFromEnv() {
   const rawFd = process.env.OPENCODEX_GATEWAY_LIFECYCLE_FD;
