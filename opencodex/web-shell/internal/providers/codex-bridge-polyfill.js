@@ -3662,22 +3662,24 @@
   if (typeof w.fetch === "function" && !w.__codexWebFetchPatched) {
     const originalFetch = w.fetch.bind(w);
     w.fetch = async (input, init) => {
-      // phase1（e7 L13）：不再由浏览器扮演 main——sentry-ipc://、Statsig 与遥测端点的
-      // 本地合成响应整层停用，请求原样透传（出站拦截仍由 L14 network-guard 负责）。
-      // 判定放在函数最前端：legacy 分支的后续执行顺序与今天逐行一致。
-      if (BROWSER_SIMULATION_PHASE === "phase1") return originalFetch(input, init);
-      const url =
-        typeof input === "string"
-          ? input
-          : input && typeof input === "object" && "url" in input
-            ? String(input.url || "")
-            : "";
-      if (url.startsWith("sentry-ipc://")) {
-        return new Response("{}", {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }
+    // phase1（e7 L13）：不再由浏览器扮演 main——sentry-ipc://、Statsig 与遥测端点的
+    // 本地合成响应整层停用，请求原样透传（出站拦截仍由 L14 network-guard 负责）。
+    // 判定放在函数最前端：legacy 分支的后续执行顺序与今天逐行一致。
+    const url =
+      typeof input === "string"
+        ? input
+        : input && typeof input === "object" && "url" in input
+          ? String(input.url || "")
+          : "";
+    // sentry-ipc:// 是 Electron 私有协议，任何阶段都不可能真传输；不兜底会在
+    // phase1 下被 CSP 拒绝并随 token-usage 面包屑无限刷屏（2026-10-07 241 实证）。
+    if (url.startsWith("sentry-ipc://")) {
+      return new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (BROWSER_SIMULATION_PHASE === "phase1") return originalFetch(input, init);
       if (isStatsigInitializeUrl(url)) {
         return new Response(JSON.stringify(buildStatsigInitializeResponse()), {
           status: 200,

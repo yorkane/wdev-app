@@ -242,7 +242,16 @@ test("phase1 下 window.fetch 包装不再本地合成，legacy 分支保持原�
   assert.ok(start > 0, "找不到 fetch 包装");
   const window = BRIDGE_SOURCE.slice(start, start + 1200);
   assert.ok(window.includes('if (BROWSER_SIMULATION_PHASE === "phase1") return originalFetch(input, init);'));
-  assert.ok(window.indexOf("originalFetch(input, init)") < window.indexOf('url.startsWith("sentry-ipc://")'), "phase 判定必须在所有合成分支之前");
+  // 2026-10-07 修订：sentry-ipc:// 是不可传输的 Electron 私有协议，两个阶段都空响应兜底
+  // （phase1 下不兜底会被 CSP 拒绝并无限刷屏）；phase1 透传判定只须先于其余合成分支。
+  assert.ok(
+    window.indexOf('url.startsWith("sentry-ipc://")') < window.indexOf('if (BROWSER_SIMULATION_PHASE === "phase1")'),
+    "sentry-ipc 兜底必须先于 phase 判定（两阶段都拦截）",
+  );
+  assert.ok(
+    window.indexOf('if (BROWSER_SIMULATION_PHASE === "phase1")') < window.indexOf("isStatsigInitializeUrl(url)"),
+    "phase1 透传判定必须先于其余合成分支",
+  );
 });
 
 test("L13 停用不影响 L14 所需的 Statsig payload 构造器", () => {
@@ -422,4 +431,3 @@ test("旗标缺省时两个工厂都读模块级 env 并保持 legacy 行为", (
     else process.env.OPENCODEX_BROWSER_SIMULATION_PHASE = previous;
   }
 });
-
