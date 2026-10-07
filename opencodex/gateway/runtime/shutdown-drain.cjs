@@ -58,7 +58,11 @@ function createShutdownDrain({
   // 关停期 stdout 管道缓冲可能随快速退出被截断（2026-10-07 v4 实证：三次重启仅最慢一次留下日志）。
   // 排空事件必须同步落盘，宁可重复不可丢失。
   function emit(event, details) {
-    log(event, details);
+    // 两路输出彼此独立：diagnosticLog 在关停期可能因底层流已关闭而抛错，
+    // 绝不允许它中断同步落盘（2026-10-07 13:21 实证：零输出即此路径）。
+    try {
+      log(event, details);
+    } catch {}
     if (!syncLogPath) return;
     try {
       fs.appendFileSync(
