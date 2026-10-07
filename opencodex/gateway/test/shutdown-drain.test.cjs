@@ -150,3 +150,27 @@ test("进度日志只在计数变化时触发", async () => {
   assert.equal(events.find((e) => e.event === "shutdown_drain_progress").details.previousCount, 2);
   assert.ok(events.some((e) => e.event === "shutdown_drain_clear"));
 });
+
+test("排空事件同步落盘（关停期 stdout 可能被截断）", async () => {
+  const os = require("node:os");
+  const path = require("node:path");
+  const fs = require("node:fs");
+  const syncPath = path.join(os.tmpdir(), "shutdown-drain-sync-" + process.pid + ".log");
+  const drain = createShutdownDrain({
+    getActiveWorkSnapshot: () => ({ activeTurnCount: 1, activeThreadIds: ["only-one"] }),
+    drainMs: 1,
+    pollMs: 5_000,
+    syncLogPath: syncPath,
+    setTimeoutFn: (fn) => {
+      setImmediate(fn);
+      return { unref() {} };
+    },
+    now: () => Date.now(),
+  });
+  await drain.run("SIGTERM");
+  const content = fs.readFileSync(syncPath, "utf-8");
+  const events = content.trim().split("\n").map((line) => JSON.parse(line).event);
+  assert.ok(events.includes("shutdown_drain_started"), "started 必须同步落盘");
+  assert.ok(events.includes("shutdown_drain_timeout"), "timeout 必须同步落盘");
+  fs.unlinkSync(syncPath);
+});

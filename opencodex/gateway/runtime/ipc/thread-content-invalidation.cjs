@@ -141,6 +141,7 @@ function classifyOutboundEnvelope(envelope) {
       threadId: threadIdFromPayload(payload),
       hostId: hostIdFromPayload(payload),
       terminal: TURN_TERMINAL_METHODS.has(method),
+      turnStart: method === "turn/started",
     };
   }
   if (type === "ipc-broadcast" || type === "broadcast") {
@@ -180,6 +181,10 @@ function createThreadContentInvalidation(options = {}) {
 
   // threadId -> { hostId, terminal, keyJsons:Set<string>, keys:Array<array>, timer }
   const pending = new Map();
+  // 活跃 turn 登记表：turn/started 入册、终端通知出册。供关停排空做全量传感器
+  // （model-router 的 turnRouteStatus 只覆盖路由分类 turn，不覆盖浏览器会话 turn——
+  // 2026-10-07 v4 重启注入实证：2 个活跃浏览器 turn 在快照里是 0）。
+  const activeTurns = new Map();
   let triggers = 0;
   let coalesced = 0;
   let sent = 0;
@@ -246,6 +251,13 @@ function createThreadContentInvalidation(options = {}) {
     }
     const classified = classifyOutboundEnvelope(envelope);
     if (!classified) return false;
+    if (classified.threadId) {
+      if (classified.turnStart) {
+        activeTurns.set(classified.threadId, Date.now());
+      } else if (classified.terminal) {
+        activeTurns.delete(classified.threadId);
+      }
+    }
     triggers += 1;
     if (!classified.threadId) {
       skippedNoThreadId += 1;
@@ -302,8 +314,12 @@ function createThreadContentInvalidation(options = {}) {
     pendingThreadIds() {
       return Array.from(pending.keys());
     },
+    activeTurnThreadIds() {
+      return Array.from(activeTurns.keys());
+    },
     snapshot() {
       return {
+        activeTurns: activeTurns.size,
         coalesced,
         debounceMs,
         disabled,

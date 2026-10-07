@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("fs");
+
 // SIGTERM 优雅排空：网关收到停止信号后，先等运行中的 turn 收尾再退出。
 // 背景（2026-10-07 取证）：installShutdownHandlers 原先 1.5s 强退、零排空，
 // systemctl restart 会连带 SIGTERM app-server 整棵进程树，杀死所有运行中的
@@ -21,6 +23,10 @@ function resolveDrainMs(rawValue) {
 function createShutdownDrain({
   getActiveWorkSnapshot,
   log = () => {},
+  // 默认落在网关运行时目录（服务用户可写；/var/log/codex-desktop 由 systemd 持有，服务用户建不了新文件）。
+  syncLogPath = process.env.CODEX_WEB_RUNTIME_DIR
+    ? process.env.CODEX_WEB_RUNTIME_DIR.replace(/\/+$/, "") + "/shutdown-drain.log"
+    : "/tmp/codex-shutdown-drain.log",
   drainMs = resolveDrainMs(process.env.OPENCODEX_SHUTDOWN_DRAIN_MS),
   pollMs = DEFAULT_POLL_MS,
   setTimeoutFn = (fn, ms) => setTimeout(fn, ms),
@@ -49,6 +55,21 @@ function createShutdownDrain({
     }
   }
 
+  // 关停期 stdout 管道缓冲可能随快速退出被截断（2026-10-07 v4 实证：三次重启仅最慢一次留下日志）。
+  // 排空事件必须同步落盘，宁可重复不可丢失。
+  function emit(event, details) {
+    log(event, details);
+    if (!syncLogPath) return;
+    try {
+      fs.appendFileSync(
+        syncLogPath,
+        JSON.stringify({ ts: new Date().toISOString(), event, ...details }) + "\n"
+      );
+    } catch {
+      // 同步落盘失败不影响排空流程。
+    }
+  }
+
   async function run(label = "shutdown") {
     if (!(drainMs > 0)) {
       counters.disabledRuns += 1;
@@ -57,13 +78,13 @@ function createShutdownDrain({
     const initial = readSnapshot();
     if (!initial) {
       // 没有可用快照（未注入/异常）：按旧行为直接放行，不新增故障面。
-      log("shutdown_drain_started", { label, activeTurnCount: null, skipped: "no-snapshot" });
+      emit("shutdown_drain_started", { label, activeTurnCount: null, skipped: "no-snapshot" });
       return;
     }
     counters.started += 1;
     const deadline = now() + drainMs;
     let last = initial;
-    log("shutdown_drain_started", { label, activeTurnCount: last.count, drainMs });
+    emit("shutdown_drain_started", { label, activeTurnCount: last.count, drainMs });
     while (last.count > 0 && now() < deadline) {
       await new Promise((resolve) => {
         const timer = setTimeoutFn(resolve, pollMs);
@@ -78,7 +99,7 @@ function createShutdownDrain({
       }
       if (next.count !== last.count) {
         counters.progress += 1;
-        log("shutdown_drain_progress", {
+        emit("shutdown_drain_progress", {
           label,
           activeTurnCount: next.count,
           previousCount: last.count,
@@ -89,11 +110,11 @@ function createShutdownDrain({
     }
     if (last.count === 0) {
       counters.cleared += 1;
-      log("shutdown_drain_clear", { label });
+      emit("shutdown_drain_clear", { label });
       return;
     }
     counters.timeouts += 1;
-    log("shutdown_drain_timeout", {
+    emit("shutdown_drain_timeout", {
       label,
       activeTurnCount: last.count,
       threadIds: last.threadIds.slice(0, LOGGED_THREAD_LIMIT),

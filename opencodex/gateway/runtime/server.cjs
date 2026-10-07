@@ -1046,13 +1046,16 @@ async function createGateway() {
   // 活跃 turn 快照：ws-hub 回收日志与关停排空共用；只在调用时实时读路由状态。
   const readActiveWorkSnapshot = () => {
     try {
-      const snapshot = pluginService?.modelRouter?.turnRouteStatus?.snapshot?.();
-      const active = snapshot?.active;
-      if (!active || typeof active !== "object") return null;
-      return {
-        activeTurnCount: Number(snapshot.activeCount),
-        activeThreadIds: Object.keys(active),
-      };
+      // 并集传感器：model-router 只覆盖路由分类 turn；浏览器会话 turn 由
+      // thread-content-invalidation 的通知流登记表补全（2026-10-07 v4 实证缺口）。
+      const routerActive =
+        pluginService?.modelRouter?.turnRouteStatus?.snapshot?.()?.active;
+      const registryIds = threadContentInvalidation?.activeTurnThreadIds?.() || [];
+      const ids = new Set(registryIds);
+      if (routerActive && typeof routerActive === "object") {
+        for (const id of Object.keys(routerActive)) ids.add(id);
+      }
+      return { activeTurnCount: ids.size, activeThreadIds: [...ids] };
     } catch {
       // 诊断回调绝不影响回收链路。
       return null;
