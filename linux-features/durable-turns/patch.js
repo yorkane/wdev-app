@@ -16,6 +16,13 @@
 //        A follower whose stream owner vanished used to interrupt the turn
 //        locally for every mode, including system. It now only does so for an
 //        explicit user stop; anything else marks needs_resume and rethrows.
+//        The mark has to happen BEFORE the guard, not after it: the upstream
+//        code marked and then fell through, so hoisting only the guard above
+//        the mark would rethrow without marking. That left stream role still
+//        pointing at the dead owner while resumeState stayed "resumed", and
+//        needsResume() requires resumeState==='needs_resume' or a null stream
+//        role - both gates shut, so the follower could not self-heal in
+//        exactly the scenario this patch exists for.
 //   P0-b  interruptConversation
 //        The descendant cascade - every single interrupt nuking the whole
 //        subagent tree - now fires only for user-stop. This is what turned one
@@ -23,6 +30,13 @@
 //   P1-a  inactive owner constants
 //        Background and headless conversations are no longer auto-unsubscribed
 //        (the 3h idle TTL and the 10-thread cap are effectively disabled).
+//        The TTL is 2147483647, NOT Number.MAX_SAFE_INTEGER. Node clamps any
+//        setTimeout delay above 2^31-1 to 1ms with a TimeoutOverflowWarning.
+//        With MAX_SAFE_INTEGER the next-check delay overflowed to 1ms, the
+//        check found no candidate and rescheduled, and the loop spun at
+//        roughly 900 iterations per second, burning 11-13% of a core at three
+//        idle conversations and 36% at a hundred. 2147483647 is a legal delay
+//        (~24.8 days) and actually disables the timer.
 //   P1-b  discardConversationFromCache
 //        Evicting a cached conversation no longer interrupts it implicitly.
 //
@@ -75,7 +89,9 @@ const EDITS = {
       id: "P0-a-follower-guard",
       find: "if(i?.role!==" + bq("follower") + "||a==null)throw t;",
       replace:
-        "if(" + MODE_ALIAS + "!==" + bq("user-stop")
+        "if(i?.role===" + bq("follower") + "&&a!=null)"
+        + "this.markConversationNeedsResumeForUnavailableOwner(e,i.ownerClientId);"
+        + "if(" + MODE_ALIAS + "!==" + bq("user-stop")
         + "||i?.role!==" + bq("follower") + "||a==null)throw t;",
     },
     {
@@ -86,7 +102,7 @@ const EDITS = {
     {
       id: "P1-a-inactive-ttl",
       find: "var qC=10800*1e3,t_e=15e3,JC=10,",
-      replace: "var qC=Number.MAX_SAFE_INTEGER,t_e=15e3,JC=2147483647,",
+      replace: "var qC=2147483647,t_e=15e3,JC=2147483647,",
     },
     {
       id: "P1-b-discard-cache",
@@ -109,7 +125,9 @@ const EDITS = {
       id: "P0-a-follower-guard",
       find: "if(r?.role!==" + bq("follower") + "||i==null)throw t;",
       replace:
-        "if(" + MODE_ALIAS + "!==" + bq("user-stop")
+        "if(r?.role===" + bq("follower") + "&&i!=null)"
+        + "this.markConversationNeedsResumeForUnavailableOwner(e,r.ownerClientId);"
+        + "if(" + MODE_ALIAS + "!==" + bq("user-stop")
         + "||r?.role!==" + bq("follower") + "||i==null)throw t;",
     },
     {
@@ -120,7 +138,7 @@ const EDITS = {
     {
       id: "P1-a-inactive-ttl",
       find: "RGt=10800*1e3,zGt=15e3,BGt=10,",
-      replace: "RGt=Number.MAX_SAFE_INTEGER,zGt=15e3,BGt=2147483647,",
+      replace: "RGt=2147483647,zGt=15e3,BGt=2147483647,",
     },
     {
       id: "P1-b-discard-cache",

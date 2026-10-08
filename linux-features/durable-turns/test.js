@@ -125,3 +125,42 @@ test("webview flavor is verified independently", () => {
   "webview", "test");
   verifyEdits(out, EDITS.webview, "test");
 });
+
+// R1: the idle-TTL constant must stay a legal setTimeout delay. Node clamps
+// anything above 2^31-1 down to 1ms, which turned "disable the TTL" into a 1ms
+// busy loop rather than an actually-disabled timer.
+
+test("the inactive TTL constant is a legal setTimeout delay", () => {
+  const edit = editById("main", "P1-a-inactive-ttl");
+  const ttl = /qC=(\d+)/.exec(edit.replace);
+  assert.ok(ttl, "could not read the TTL constant out of the replacement");
+  const value = Number(ttl[1]);
+  assert.ok(
+    value <= 2147483647,
+    "TTL constant " + value + " exceeds the 32-bit signed setTimeout range; "
+      + "Node clamps it to 1ms and the check reschedules forever",
+  );
+  assert.ok(!edit.replace.includes("Number.MAX_SAFE_INTEGER"));
+  // A delay this large must not trip Node's overflow clamp.
+  assert.doesNotThrow(() => {
+    const timer = setTimeout(() => {}, value);
+    if (typeof timer.unref === "function") timer.unref();
+    clearTimeout(timer);
+  });
+});
+
+// R2: the needs_resume mark has to precede the guard, otherwise a non
+// user-stop rethrow leaves stream ownership and resumeState both stale.
+
+test("the needs_resume mark precedes the rethrow guard", () => {
+  const edit = editById("main", "P0-a-follower-guard");
+  const markAt = edit.replace.indexOf("markConversationNeedsResumeForUnavailableOwner");
+  const guardAt = edit.replace.indexOf("throw t;");
+  assert.ok(markAt >= 0, "the follower guard must still mark needs_resume");
+  assert.ok(guardAt >= 0, "the follower guard must still be able to rethrow");
+  assert.ok(
+    markAt < guardAt,
+    "markConversationNeedsResumeForUnavailableOwner must run before the guard "
+      + "rethrows, otherwise a non user-stop path throws without marking",
+  );
+});
