@@ -1,0 +1,9 @@
+{
+  "id": "durable-turns",
+  "title": "Durable Turns",
+  "description": "Stop tying turn lifetime to UI client lifetime. Only an explicit user stop may interrupt a turn or cascade to subagents; background and headless conversations are never auto-unsubscribed.",
+  "defaultEnabled": false,
+  "entrypoints": {
+    "patchDescriptors": "./patch.js"
+  }
+}
