@@ -137,6 +137,41 @@ function countOf(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+// verifyEdits asserts the terminal state of a rewritten bundle instead of
+// trusting per-edit bookkeeping.
+//
+// The per-edit `out.includes(edit.replace)` short circuit is content
+// triggered, not state triggered: if the replacement text appears anywhere in
+// the bundle - a comment, a string literal, upstream code that happens to look
+// the same - the edit is silently skipped. That defeats the whole point of
+// ciPolicy required-upstream, which promises a failed build rather than a
+// half-applied patch. The worst observed case produced text referencing an
+// undeclared `__dtMode` while still reporting "already patched, skipping",
+// and node --check does not catch it because a syntax check does not resolve
+// scope; it only explodes at runtime as a ReferenceError.
+//
+// Every anchor is verified unique (exactly one occurrence in the upstream
+// bundle), so after a successful rewrite each `find` must be gone and each
+// `replace` must be present. Asserting the end state directly catches both a
+// skipped edit and a partially applied bundle, whatever caused it.
+function verifyEdits(out, edits, patchName) {
+  for (const edit of edits) {
+    const stale = countOf(out, edit.find);
+    if (stale > 0) {
+      throw new Error(
+        patchName + ": " + edit.id + " did not apply (anchor still present "
+          + stale + " time(s) after rewrite); refusing to ship a partial patch",
+      );
+    }
+    if (countOf(out, edit.replace) < 1) {
+      throw new Error(
+        patchName + ": " + edit.id + " replacement is absent after rewrite; "
+          + "refusing to ship a partial patch",
+      );
+    }
+  }
+}
+
 // applyEdits rewrites one bundle. It is idempotent: an edit whose replacement
 // is already present is skipped, so re-running over an already patched bundle
 // is a no-op. A missing or ambiguous anchor throws on purpose - the descriptor
@@ -170,6 +205,8 @@ function applyEdits(source, flavor, patchName) {
   } else {
     console.log("durable-turns: " + patchName + " already patched, skipping");
   }
+  // Always assert the end state, including on the no-op path.
+  verifyEdits(out, edits, patchName);
   return out;
 }
 
@@ -211,4 +248,5 @@ module.exports = {
   applyEdits,
   bundleHasInterruptContract,
   descriptors,
+  verifyEdits,
 };
