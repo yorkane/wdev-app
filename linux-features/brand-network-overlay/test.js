@@ -153,16 +153,18 @@ test("statsig: initialize payload has the full legal shape and the official gate
   assert.equal(body.has_updates, true);
   assert.equal(typeof body.time, "number");
   assert.equal(body.hash_used, "djb2");
-  // feature gates: 3903742690 / 505458 / artifacts all true.
+  // feature gates: 3903742690 / 505458 / artifacts / 4039078146 all true.
   assert.equal(body.feature_gates["3903742690"].value, true);
   assert.equal(body.feature_gates["505458"].value, true);
   assert.equal(body.feature_gates["artifacts"].value, true);
+  // 4039078146 gates the sidebar "View activity" entry (PIo/NIo); missing it hides the button.
+  assert.equal(body.feature_gates["4039078146"].value, true);
   for (const name of Object.keys(body.feature_gates)) {
     assert.equal(body.feature_gates[name].rule_id, "gateway_override");
     assert.deepEqual(body.feature_gates[name].secondary_exposures, []);
   }
   const dyn = body.dynamic_configs["statsig_default_enable_features"].value;
-  assert.deepEqual(dyn, { "3903742690": true, "505458": true, artifacts: true });
+  assert.deepEqual(dyn, { "3903742690": true, "505458": true, artifacts: true, "4039078146": true });
   // i18n layer 72216192.
   assert.deepEqual(body.layer_configs["72216192"].value, { enable_i18n: true, locale_source: "IDE" });
   assert.deepEqual(body.param_stores, {});

@@ -2138,6 +2138,13 @@ test("browser Statsig defaults preserve the official new-worktree capability", (
   assert.match(BRIDGE_SOURCE, /STATSIG_DEFAULT_FEATURE_OVERRIDES\s*=\s*\{[\s\S]*?"505458": true/);
 });
 
+test("browser Statsig defaults keep the sidebar activity-view entry visible", () => {
+  // 4039078146 是官方侧栏「查看活动 / 关闭活动视图」入口门（NIo/PIo 判定）。
+  // 出网受限环境下该门只能由本地快照打开；缺失时 PIo() 回落 'off'，入口整块不渲染，
+  // 用户既进不了活动视图也退不出来（2026-10-08 235.t 实证：xc.status=allowed、仅该门为 false）。
+  assert.match(BRIDGE_SOURCE, /STATSIG_DEFAULT_FEATURE_OVERRIDES\s*=\s*\{[\s\S]*?"4039078146": true/);
+});
+
 test("token usage passive parsing bounds wide and cyclic payload traversal", () => {
   const compatibilityHits = [];
   const window = {

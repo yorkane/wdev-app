@@ -8,8 +8,10 @@
 //     (net.fetch hook + OPENCODEX_STATSIG_INITIALIZE_DELAY_MS pacing)
 //
 // Numeric contract (do not change without updating both call sites):
-//   - feature gates: 3903742690, 505458, artifacts -> all true;
-//     505458 is the official "new worktree" entry gate.
+//   - feature gates: 3903742690, 505458, artifacts, 4039078146 -> all true;
+//     505458 is the official "new worktree" entry gate; 4039078146 gates the
+//     sidebar "View activity" / "Close activity view" entry, whose PIo() probe
+//     falls back to "off" (button not rendered at all) when the gate is absent.
 //   - i18n layer "72216192": { enable_i18n: true, locale_source: "IDE" }.
 //   - initialize responses: has_updates true with the full field set
 //     (feature_gates / dynamic_configs / layer_configs / param_stores /
@@ -32,6 +34,9 @@ const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
   "3903742690": true,
   "505458": true,
   artifacts: true,
+  // 4039078146：官方侧栏“查看活动 / 关闭活动视图”入口门（PIo/NIo 判定）。
+  // 该门缺失时 NIo() 返回 false，PIo() 回落 'off'，侧栏活动入口整块不渲染。
+  "4039078146": true,
 };
 const DEFAULT_INITIALIZE_DELAY_MS = 400;
 const INITIALIZE_DELAY_ENV = "CODEX_DESKTOP_STATSIG_INITIALIZE_DELAY_MS";

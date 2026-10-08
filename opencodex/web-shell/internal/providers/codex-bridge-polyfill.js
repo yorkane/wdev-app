@@ -486,6 +486,8 @@
     // 官方新会话的“新工作树”入口由该门控制；Web 本地快照必须保留桌面端已有能力。
     "505458": true,
     artifacts: true,
+    // 官方侧栏「查看活动 / 关闭活动视图」入口由该门控制；缺失时侧栏活动入口整块不渲染。
+    "4039078146": true,
   };
   const clientId =
     w.__OpenCodexCurrentProviderScope?.clientId ||

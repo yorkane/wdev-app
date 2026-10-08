@@ -1828,6 +1828,8 @@ const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
   "3903742690": true,
   "505458": true,
   artifacts: true,
+  // 4039078146：官方侧栏「查看活动 / 关闭活动视图」入口门；缺失时侧栏活动入口整块不渲染。
+  "4039078146": true,
 };
 
 // 构造与 polyfill.buildStatsigInitializeResponse 同形状的合法初始化响应，供无出口环境下本地兜底。
