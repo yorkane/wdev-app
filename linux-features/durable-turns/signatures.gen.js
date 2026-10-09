@@ -9,19 +9,29 @@
 // free and no rule can depend on a bundle file name or a minified identifier.
 
 const CB = String.fromCharCode(96);
+const DQ = String.fromCharCode(34);
 const T = (name) => "{CAP:" + name + "}";
+
+// A quote-char capture for one protocol literal, shared between the upstream
+// shape and the template. The bundler rotates between backtick and double quote
+// between releases, and the patched side has to keep the byte that was there:
+// the forward pass renders the captured character, and the revert pass reads it
+// back out of the patched text. Hard-coding one flavour made the double-quoted
+// flavour byte-irreversible (review F8).
+const QC = "[" + CB + DQ + "]";
+const Q = (name, literal) => "{NCAP:" + name + "|" + QC + "}" + literal + "{BACK:" + name + "}";
 
 // ---- shared fragments -------------------------------------------------------
 
 // if (<role>?.role !== `follower` || <reason> == null) throw <err>;
 const FOLLOWER_GATE =
-  "if(" + T("role") + "?.role!=={LIT:follower}||" + T("reason") + "==null)throw " + T("err") + ";";
+  "if(" + T("role") + "?.role!==" + Q("qf", "follower") + "||" + T("reason") + "==null)throw " + T("err") + ";";
 
 // (<mode> === `user-stop`
 //    ? <mgr>.interruptSubagentDescendantsInBackground(<conv>)
 //    : await <mgr>.interruptSubagentDescendants(<conv>))
 const CASCADE =
-  "(" + T("mode") + "==={LIT:user-stop}?" + T("mgr")
+  "(" + T("mode") + "===" + Q("qs", "user-stop") + "?" + T("mgr")
   + ".interruptSubagentDescendantsInBackground(" + T("conv") + ")"
   + ":await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))";
 
@@ -118,6 +128,13 @@ const library = {
           "{LIT:timeout},{LIT:request-version-mismatch},{LIT:no-client-found}",
           "{B}conversationId:",
           "{LIT:turn/interrupt}",
+          // The P0-a template hard-codes the two members below into the
+          // bytes it injects. This is the mirror of the __dtMode incident:
+          // upstream renames them, the shape still binds, and the injected
+          // call silently points at nothing. Anything the template
+          // hard-codes from upstream is an invariant (review F3).
+          "this.markConversationNeedsResumeForUnavailableOwner(",
+          "ownerClientId",
         ],
       },
       edits: [
@@ -141,9 +158,9 @@ const library = {
           // resumeState === "needs_resume" or a null stream role, so both resume
           // gates stay shut in exactly the scenario this rule exists for.
           template:
-            "if(<role>?.role===" + CB + "follower" + CB + "&&<reason>!=null)"
+            "if(<role>?.role===" + Q("qf", "follower") + "&&<reason>!=null)"
             + "this.markConversationNeedsResumeForUnavailableOwner(<conv>,<role>.ownerClientId);"
-            + "if(__dtMode!==" + CB + "user-stop" + CB + "||<role>?.role!==" + CB + "follower" + CB
+            + "if(__dtMode!==" + CB + "user-stop" + CB + "||<role>?.role!==" + Q("qf", "follower")
             + "||<reason>==null)throw <err>;",
         },
       ],
@@ -154,9 +171,13 @@ const library = {
           "if({ID}?.role==={LIT:follower}&&{ID}!=null)this.markConversationNeedsResumeForUnavailableOwner(",
           "if(__dtMode!=={LIT:user-stop}||{ID}?.role!=={LIT:follower}||{ID}==null)throw ",
         ],
-        // Load-bearing order, not style: mark, then rethrow.
+        // Load-bearing order, not style: mark, then rethrow. The middle
+        // token is the glue: the mark call has to be immediately followed
+        // by the guard, so a decoy .ownerClientId); sitting elsewhere
+        // cannot fake the sequence on its own (review F7).
         ordered: [
-          ".ownerClientId);",
+          "this.markConversationNeedsResumeForUnavailableOwner(",
+          ".ownerClientId);if(__dtMode!==",
           "if(__dtMode!=={LIT:user-stop}",
         ],
       },
@@ -190,7 +211,7 @@ const library = {
           // The counter makes the suppression observable at runtime instead of
           // only inferable from logs.
           template:
-            "(<mode>===" + CB + "user-stop" + CB + "?<mgr>.interruptSubagentDescendantsInBackground(<conv>)"
+            "(<mode>===" + Q("qs", "user-stop") + "?<mgr>.interruptSubagentDescendantsInBackground(<conv>)"
             + ":(globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0))",
         },
       ],
@@ -311,11 +332,12 @@ const library = {
             // only the quote character rotates, and a quoted segment captures the
             // quote it matched so the revert writes back the byte that was there.
             "try{await {CAP:sendMgr}.sendRequest({CAP:eph}&&{CAP:durable}?"
-            + "{LIT:thread/stop}:{LIT:thread/unsubscribe},{threadId:{CAP:id}},{timeoutMs:{CAP:timeout}})",
+            + Q("qstop", "thread/stop") + ":" + Q("qunsub", "thread/unsubscribe")
+            + ",{threadId:{CAP:id}},{timeoutMs:{CAP:timeout}})",
           template:
             "try{await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod="
             + "(globalThis.__dtDiscardMethod||0)+1,(<eph>&&<durable>)&&!1?"
-            + CB + "thread/stop" + CB + ":" + CB + "thread/unsubscribe" + CB
+            + Q("qstop", "thread/stop") + ":" + Q("qunsub", "thread/unsubscribe")
             + "),{threadId:<id>},{timeoutMs:<timeout>})",
         },
         {
@@ -329,12 +351,12 @@ const library = {
             // leading brace is what abuts the await. {BACK:id} resolves against
             // the region opener's capture, so the send is tied to the very
             // conversation the region was accepted for.
-            "}await {CAP:sendMgr}.sendRequest({LIT:thread/unsubscribe},"
+            "}await {CAP:sendMgr}.sendRequest(" + Q("qunsub", "thread/unsubscribe") + ","
             + "{B}threadId:{BACK:id}{E},{B}timeoutMs:{CAP:timeout}{E})",
           template:
             "}await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod="
             + "(globalThis.__dtDiscardMethod||0)+1,!1?" + CB + "thread/stop" + CB + ":"
-            + CB + "thread/unsubscribe" + CB + "),{threadId:<id>},{timeoutMs:<timeout>})",
+            + Q("qunsub", "thread/unsubscribe") + "),{threadId:<id>},{timeoutMs:<timeout>})",
         },
       ],
       assertions: {

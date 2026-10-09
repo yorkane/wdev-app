@@ -46,9 +46,13 @@ const path = require("node:path");
 
 const { execFileSync } = require("node:child_process");
 
-const { applyRewrites } = require("./lib/chunks.js");
+const {
+  BASELINE_SUFFIX: SCRATCH_BASELINE_SUFFIX,
+  TEMP_SUFFIX: SCRATCH_TEMP_SUFFIX,
+  applyRewrites,
+} = require("./lib/chunks.js");
 const { findCarriers } = require("./lib/locate.js");
-const { BOUND, DRIFTED, REMOVED, planCarrier } = require("./lib/plan.js");
+const { assertVariantGroup, BOUND, DRIFTED, REMOVED, planCarrier } = require("./lib/plan.js");
 const { assertReversible, patternSegments, templateSegments } = require("./lib/segments.js");
 const { reverseRule } = require("./lib/reverse.js");
 
@@ -85,6 +89,10 @@ function loadLibrary(options = {}) {
       // reverted, and finding that out at revert time is too late.
       assertReversible(patternSegments(edit.find), templateSegments(edit.template), rule.id + "/" + edit.id);
     }
+    // A variant group is all-or-nothing data. Half-tagging it silently
+    // degrades the both-variants-bound and no-variant-bound checks at once,
+    // so the shape of the group is a load-time invariant, not a plan-time one.
+    assertVariantGroup(rule);
   }
   return parsed;
 }
@@ -116,19 +124,41 @@ function formatExcerpt(plan) {
 // The check is self-calibrating: a chunk that already fails `node --check` in its
 // pristine form (an ES module read as a script, for instance) is not evidence of
 // anything, so only a pristine-passes / patched-fails transition is a failure.
-function runNodeCheck(filePath) {
+function runNodeCheck(nodeExec, filePath) {
+  let error;
   try {
-    execFileSync(process.execPath, ["--check", filePath], { stdio: "pipe", maxBuffer: 4 * 1024 * 1024 });
+    execFileSync(nodeExec, ["--check", filePath], { stdio: "pipe", maxBuffer: 4 * 1024 * 1024 });
     return { ok: true, detail: null };
-  } catch (error) {
-    return { ok: false, detail: String(error.stderr || error.message).split("\n").slice(0, 3).join(" | ") };
+  } catch (caught) {
+    error = caught;
   }
+  // A process that ran and exited non-zero reported a parse result. A process
+  // that never ran (spawn ENOENT/EPERM, killed by a signal, stdout overflow)
+  // reported nothing, and recording it as ok:false makes the gate read as
+  // "upstream does not parse either", which silently switches it off. It throws
+  // instead, and writeCarrier turns that into a restore plus a build failure.
+  const status = typeof error.status === "number" ? error.status : null;
+  const signal = error.signal == null ? null : error.signal;
+  if (status == null || signal != null) {
+    throw new Error("durable-turns: the syntax gate could not run " + nodeExec
+      + " --check on " + filePath + " (" + String(error.code ?? error.name ?? "error")
+      + (signal != null ? ", killed by " + signal : "") + ")"
+      + "; refusing to patch with an unarmed gate");
+  }
+  return { ok: false, detail: String(error.stderr || error.message).split("\n").slice(0, 3).join(" | ") };
 }
 
-function verifySyntax(carrier, pristineCopy) {
-  const baseline = runNodeCheck(pristineCopy);
-  if (!baseline.ok) return;
-  const after = runNodeCheck(carrier.filePath);
+function verifySyntax(carrier, pristineCopy, nodeExec) {
+  const baseline = runNodeCheck(nodeExec, pristineCopy);
+  if (!baseline.ok) {
+    // Calibrating the gate needs a baseline the parser accepts. Returning here
+    // used to be the silent path; a gate that is quietly off is indistinguishable
+    // from one that passed, so the carrier is refused instead.
+    throw new Error("durable-turns: the syntax gate cannot calibrate on " + carrier.relPath
+      + ": the pristine baseline does not pass `node --check` (" + baseline.detail + ")"
+      + "; refusing to ship a chunk the parser never accepted");
+  }
+  const after = runNodeCheck(nodeExec, carrier.filePath);
   if (!after.ok) {
     throw new Error("durable-turns: patched " + carrier.relPath
       + " no longer parses (upstream did): " + after.detail);
@@ -160,24 +190,31 @@ function readAt(filePath, rewrite) {
 // bytes if they do not parse. A gate that fires after the write would otherwise
 // leave a broken chunk on disk for the next stage to package, which is the exact
 // failure ciPolicy required-upstream exists to prevent.
-function writeCarrier(carrier, rewrites) {
+function writeCarrier(carrier, rewrites, nodeExec) {
   if (rewrites.length === 0) return;
   // The suffix has to stay .js: the baseline goes through the same parser, and an
   // unknown extension makes node --check reject the file for the wrong reason, which
   // reads as "upstream did not parse either" and silently disables the gate.
-  const backup = carrier.filePath + ".durable-turns.baseline.js";
+  const backup = carrier.filePath + SCRATCH_BASELINE_SUFFIX;
+  const temp = carrier.filePath + SCRATCH_TEMP_SUFFIX;
+  // Leftovers from an interrupted run: a stale baseline ends in .js and holds the
+  // whole contract, so it would be screened as a pseudo-carrier, and a stale temp
+  // file would be packed into the published asar by the packaging stage.
+  fs.rmSync(backup, { force: true });
+  fs.rmSync(temp, { force: true });
   fs.copyFileSync(carrier.filePath, backup);
   const restore = () => {
     fs.copyFileSync(backup, carrier.filePath);
   };
   try {
     applyRewrites(carrier.filePath, rewrites);
-    verifySyntax(carrier, backup);
+    verifySyntax(carrier, backup, nodeExec);
   } catch (error) {
     restore();
     throw error;
   } finally {
     fs.rmSync(backup, { force: true });
+    fs.rmSync(temp, { force: true });
   }
 }
 
@@ -190,6 +227,7 @@ function patchTree(extractedDir, options = {}) {
   const library = options.library ?? loadLibrary(options);
   const mode = options.mode ?? "apply";
   const dryRun = mode !== "apply";
+  const nodeExec = options.nodeExec ?? process.execPath;
   const carriers = findCarriers(extractedDir, library);
   const report = {
     extractedDir,
@@ -200,6 +238,10 @@ function patchTree(extractedDir, options = {}) {
     failures: [],
   };
 
+  // Zero carriers is the loudest possible drift signal -- upstream rotated one of
+  // the four contract symbols or moved the logic out of the scanned directories --
+  // and it used to return here, which the descriptor mapped to already-applied and
+  // both CI gates read as green. The entry now reaches the unified throw below.
   if (carriers.length === 0) {
     report.failures.push({
       rule: "(carrier)",
@@ -207,7 +249,6 @@ function patchTree(extractedDir, options = {}) {
       status: REMOVED,
       reason: "no chunk under " + library.scan.dirs.join(", ") + " holds the turn-lifecycle contract",
     });
-    return report;
   }
 
   for (const carrier of carriers) {
@@ -227,7 +268,7 @@ function patchTree(extractedDir, options = {}) {
     if (planned.rewrites.length === 0) continue;
 
     if (!dryRun) {
-      writeCarrier(carrier, planned.rewrites);
+      writeCarrier(carrier, planned.rewrites, nodeExec);
       if (bytesDiffer(carrier.filePath, planned.rewrites)) report.changedFiles.push(carrier.relPath);
     }
   }
@@ -272,7 +313,7 @@ function reverseTree(extractedDir, options = {}) {
     if (report.failures.length > 0) continue;
     if (rewrites.length === 0) continue;
     if (options.mode !== "dry-run") {
-      writeCarrier(carrier, rewrites);
+      writeCarrier(carrier, rewrites, options.nodeExec ?? process.execPath);
       if (bytesDiffer(carrier.filePath, rewrites)) report.changedFiles.push(carrier.relPath);
     }
   }
@@ -316,6 +357,9 @@ function buildDescriptors(options = {}) {
       targetSummary: "all-linux (symbol located, no bundle file name)",
       apply(extractedDir) {
         const report = patchTree(extractedDir, { library, mode: "apply" });
+        if (report.carriers.length === 0) {
+          throw new Error("durable-turns: no turn-lifecycle carrier in " + extractedDir);
+        }
         const changed = report.changedFiles.length > 0;
         const applied = report.plans.filter((plan) => plan.status === BOUND && !plan.applied).length;
         console.log("durable-turns: " + applied + " edit(s) applied across " + report.carriers.length

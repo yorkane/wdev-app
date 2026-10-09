@@ -37,7 +37,9 @@
           "this.sendThreadFollowerRequest({ID},{LIT:thread-follower-interrupt-turn}",
           "{LIT:timeout},{LIT:request-version-mismatch},{LIT:no-client-found}",
           "{B}conversationId:",
-          "{LIT:turn/interrupt}"
+          "{LIT:turn/interrupt}",
+          "this.markConversationNeedsResumeForUnavailableOwner(",
+          "ownerClientId"
         ]
       },
       "edits": [
@@ -48,13 +50,13 @@
         },
         {
           "id": "P0-a-follower-guard",
-          "find": "if({CAP:role}?.role!=={LIT:follower}||{CAP:reason}==null)throw {CAP:err};",
-          "template": "if(<role>?.role===`follower`&&<reason>!=null)this.markConversationNeedsResumeForUnavailableOwner(<conv>,<role>.ownerClientId);if(__dtMode!==`user-stop`||<role>?.role!==`follower`||<reason>==null)throw <err>;"
+          "find": "if({CAP:role}?.role!=={NCAP:qf|[`\"]}follower{BACK:qf}||{CAP:reason}==null)throw {CAP:err};",
+          "template": "if(<role>?.role==={NCAP:qf|[`\"]}follower{BACK:qf}&&<reason>!=null)this.markConversationNeedsResumeForUnavailableOwner(<conv>,<role>.ownerClientId);if(__dtMode!==`user-stop`||<role>?.role!=={NCAP:qf|[`\"]}follower{BACK:qf}||<reason>==null)throw <err>;"
         }
       ],
       "assertions": {
         "gone": [
-          "if({CAP:role}?.role!=={LIT:follower}||{CAP:reason}==null)throw {CAP:err};"
+          "if({CAP:role}?.role!=={NCAP:qf|[`\"]}follower{BACK:qf}||{CAP:reason}==null)throw {CAP:err};"
         ],
         "present": [
           "{B}let __dtMode={ID};",
@@ -62,7 +64,8 @@
           "if(__dtMode!=={LIT:user-stop}||{ID}?.role!=={LIT:follower}||{ID}==null)throw "
         ],
         "ordered": [
-          ".ownerClientId);",
+          "this.markConversationNeedsResumeForUnavailableOwner(",
+          ".ownerClientId);if(__dtMode!==",
           "if(__dtMode!=={LIT:user-stop}"
         ]
       }
@@ -92,13 +95,13 @@
       "edits": [
         {
           "id": "P0-b-cascade",
-          "find": "({CAP:mode}==={LIT:user-stop}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))",
-          "template": "(<mode>===`user-stop`?<mgr>.interruptSubagentDescendantsInBackground(<conv>):(globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0))"
+          "find": "({CAP:mode}==={NCAP:qs|[`\"]}user-stop{BACK:qs}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))",
+          "template": "(<mode>==={NCAP:qs|[`\"]}user-stop{BACK:qs}?<mgr>.interruptSubagentDescendantsInBackground(<conv>):(globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0))"
         }
       ],
       "assertions": {
         "gone": [
-          "({CAP:mode}==={LIT:user-stop}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))"
+          "({CAP:mode}==={NCAP:qs|[`\"]}user-stop{BACK:qs}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))"
         ],
         "present": [
           "globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0"
@@ -209,15 +212,15 @@
           "id": "P1-c-discard-ternary",
           "variant": "discard-method",
           "variantKey": "upgrade",
-          "find": "try{await {CAP:sendMgr}.sendRequest({CAP:eph}&&{CAP:durable}?{LIT:thread/stop}:{LIT:thread/unsubscribe},{threadId:{CAP:id}},{timeoutMs:{CAP:timeout}})",
-          "template": "try{await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,(<eph>&&<durable>)&&!1?`thread/stop`:`thread/unsubscribe`),{threadId:<id>},{timeoutMs:<timeout>})"
+          "find": "try{await {CAP:sendMgr}.sendRequest({CAP:eph}&&{CAP:durable}?{NCAP:qstop|[`\"]}thread/stop{BACK:qstop}:{NCAP:qunsub|[`\"]}thread/unsubscribe{BACK:qunsub},{threadId:{CAP:id}},{timeoutMs:{CAP:timeout}})",
+          "template": "try{await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,(<eph>&&<durable>)&&!1?{NCAP:qstop|[`\"]}thread/stop{BACK:qstop}:{NCAP:qunsub|[`\"]}thread/unsubscribe{BACK:qunsub}),{threadId:<id>},{timeoutMs:<timeout>})"
         },
         {
           "id": "P1-c-discard-unsubscribe",
           "variant": "discard-method",
           "variantKey": "plain",
-          "find": "}await {CAP:sendMgr}.sendRequest({LIT:thread/unsubscribe},{B}threadId:{BACK:id}{E},{B}timeoutMs:{CAP:timeout}{E})",
-          "template": "}await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,!1?`thread/stop`:`thread/unsubscribe`),{threadId:<id>},{timeoutMs:<timeout>})"
+          "find": "}await {CAP:sendMgr}.sendRequest({NCAP:qunsub|[`\"]}thread/unsubscribe{BACK:qunsub},{B}threadId:{BACK:id}{E},{B}timeoutMs:{CAP:timeout}{E})",
+          "template": "}await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,!1?`thread/stop`:{NCAP:qunsub|[`\"]}thread/unsubscribe{BACK:qunsub}),{threadId:<id>},{timeoutMs:<timeout>})"
         }
       ],
       "assertions": {

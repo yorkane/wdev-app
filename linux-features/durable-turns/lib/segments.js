@@ -182,6 +182,16 @@ function templateSegments(template) {
       index = open + 1;
       continue;
     }
+    if (directive != null && directive.startsWith("BACK:")) {
+      // A template re-emits a name the upstream side captured. As a backref it
+      // renders that name and, on a revert pass, matches it without opening a
+      // second capture of the same name -- which would not even compile.
+      if (pending.length > 0) chunks.push(pending);
+      chunks.push({ back: directive.slice(5) });
+      pending = "";
+      index = open + 1;
+      continue;
+    }
     pending += template[index];
     index += 1;
   }
@@ -189,6 +199,11 @@ function templateSegments(template) {
   for (const chunk of chunks) {
     if (typeof chunk === "string") {
       segments.push(...placeholdersIn(chunk));
+      continue;
+    }
+    if (chunk.back != null) {
+      assertGroupName(chunk.back, "BACK");
+      segments.push({ kind: "ref", name: chunk.back });
       continue;
     }
     const splitAt = chunk.ncap.indexOf("|");
@@ -268,6 +283,13 @@ function segmentsSource(segments) {
         + "\\k<" + quoteGroup + ">";
     }
     if (segment.kind === "group") {
+      // A name a shape already captured is a backreference, not a second
+      // capture of the same group (which would not even compile). This is
+      // the rule that turns a repeated <placeholder> into one capture plus a
+      // reference, and it lets a template re-emit one quote capture -- the
+      // follower literal copied into two guards, both arms of the discard
+      // ternary -- without opening the group twice.
+      if (captured.has(segment.name)) return "\\k<" + segment.name + ">";
       captured.add(segment.name);
       return "(?<" + segment.name + ">" + (segment.source || IDENT) + ")";
     }

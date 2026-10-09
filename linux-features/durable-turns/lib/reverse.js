@@ -9,7 +9,7 @@
 // why the library insists on reversibility up front (assertReversible).
 
 const { BOUND, resolveRegion } = require("./locate.js");
-const { dominantQuote, excerptFor } = require("./plan.js");
+const { assertVariantGroup, dominantQuote, excerptFor } = require("./plan.js");
 const {
   compileSegments,
   patternSegments,
@@ -116,8 +116,7 @@ function reverseRule(carrier, rule, scan) {
   // ever applies, so the others are expected to be absent here; a non-variant
   // rule has to find every one of its edits or the tree is in a half-patched
   // state that no revert may guess at.
-  const variantMembers = rule.edits.filter((edit) => edit.variant != null);
-  const isVariantRule = variantMembers.length > 1 && variantMembers.length === rule.edits.length;
+  const isVariantRule = assertVariantGroup(rule);
   if (isVariantRule ? planned.length !== 1 : unmatched.length > 0) {
     return {
       ...base,

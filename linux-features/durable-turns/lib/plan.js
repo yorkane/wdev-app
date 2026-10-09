@@ -113,6 +113,29 @@ function countMatches(text, re) {
   return count;
 }
 
+// A variant rule is all-or-nothing: every edit in the group carries the same
+// `variant` tag and a distinct `variantKey`. A half-tagged group silently
+// degrades both checks -- "bound more than one variant" and "no variant bound"
+// are decided from the member count, so an untagged member makes the rule look
+// like an ordinary all-edits-must-bind rule. Decided once, from the data.
+function assertVariantGroup(rule) {
+  const tagged = rule.edits.filter((edit) => edit.variant != null);
+  if (tagged.length === 0) return false;
+  if (tagged.length !== rule.edits.length || tagged.length < 2) {
+    throw new Error("durable-turns: rule " + rule.id + " has a partial variant group ("
+      + tagged.length + " of " + rule.edits.length + " edits tagged); a variant must tag every edit");
+  }
+  const groups = new Set(tagged.map((edit) => edit.variant));
+  const keys = tagged.map((edit) => rule.variantGroup + "/" + edit.variant + "/" + edit.variantKey);
+  if (groups.size !== 1) {
+    throw new Error("durable-turns: rule " + rule.id + " mixes variant groups: " + [...groups].join(", "));
+  }
+  if (new Set(keys).size !== keys.length) {
+    throw new Error("durable-turns: rule " + rule.id + " repeats a variantKey");
+  }
+  return true;
+}
+
 function bindEdits(body, rule, scopeGroups) {
   const bindings = [];
   for (const edit of rule.edits) {
@@ -192,8 +215,7 @@ function planRule(carrier, rule, scan, mode) {
       + ambiguous.map((b) => b.edit.id + "=" + b.hits.length + "x").join(", ") + ")");
   }
 
-  const variantMembers = rule.edits.filter((edit) => edit.variant != null);
-  const isVariantRule = variantMembers.length > 1 && variantMembers.length === rule.edits.length;
+  const isVariantRule = assertVariantGroup(rule);
   const boundKeys = bound.map((entry) => entry.edit.variantKey).filter(Boolean);
 
   if (isVariantRule && boundKeys.length > 1) {
@@ -305,6 +327,7 @@ module.exports = {
   DRIFTED,
   REMOVED,
   assertEndState,
+  assertVariantGroup,
   dominantQuote,
   excerptFor,
   planCarrier,

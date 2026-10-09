@@ -573,3 +573,216 @@ test("apply through the descriptor reports the carriers it touched", () => {
   assert.equal(again.changed, false);
   assert.equal(descriptor.status(again).status, "already-applied");
 });
+
+// ---- W11 loudness regressions (review W9: F1/F2/F3/F7/F8 + small items) ----
+//
+// Every gate below guards the same property: the patch must fail LOUD when it
+// did not actually take, because ciPolicy required-upstream means "a build that
+// shipped an unpatched or broken bundle must not look green". These were added
+// from /data/tmp/debt/W9-review.md and are the red-before-green contracts for
+// F1 (zero carriers), F2 (syntax gate self-disabling), F3 (template-depends-on
+// upstream members not asserted), F7 (decoyable ordered anchor), F8 (double
+// quote flavour not byte-reversible), plus the two small hardenings.
+
+const { assertEndState: assertEndStateOf } = require("./lib/plan.js");
+const {
+  criticalFailuresFromReport,
+  createPatchReport,
+  enabledFeatureFailuresFromReport,
+  reportHasPatchChanges,
+} = require("../../scripts/lib/patch-report.js");
+const { patchExtractedApp } = require("../../scripts/patches/runner.js");
+
+const CARRIER_SYMBOLS = [
+  "interruptConversationSelf",
+  "discardConversationFromCache",
+  "interruptSubagentDescendantsInBackground",
+  "shouldKeepConversationLoaded",
+];
+
+function everyScannedJs(dir) {
+  const out = [];
+  for (const rel of feature.loadLibrary().scan.dirs) {
+    const rootDir = path.join(dir, rel);
+    if (!fs.existsSync(rootDir)) continue;
+    const stack = [rootDir];
+    while (stack.length > 0) {
+      const d = stack.pop();
+      for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile() && entry.name.endsWith(".js")) out.push(full);
+      }
+    }
+  }
+  return out;
+}
+
+// Upstream rotating the four contract names (or moving them out of the scanned
+// directories) is the exact drift this feature exists to catch at carrier grain.
+function stripCarrierSymbols(dir) {
+  for (const file of everyScannedJs(dir)) {
+    let text = fs.readFileSync(file, "latin1");
+    for (const symbol of CARRIER_SYMBOLS) {
+      text = text.split(symbol).join(symbol.slice(0, 4) + "_GONE_" + symbol.slice(4));
+    }
+    fs.writeFileSync(file, text, "latin1");
+  }
+}
+
+// ---- F1: zero carriers must be a build failure, never already-applied ------
+
+test("zero carriers fail the build instead of reporting already-applied", () => {
+  const dir = tree("zero-carriers");
+  stripCarrierSymbols(dir);
+  assert.equal(feature.findCarriers(dir, feature.loadLibrary()).length, 0);
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }),
+    /refusing to ship a partial patch/);
+  const [descriptor] = feature.buildDescriptors();
+  assert.throws(() => descriptor.apply(dir), /durable-turns/);
+});
+
+test("the repository pipeline records failed-required, not already-applied, for a zero-carrier tree", () => {
+  const dir = tree("zero-carriers-pipeline");
+  stripCarrierSymbols(dir);
+  const config = path.join(dir, "features.json");
+  fs.writeFileSync(config, JSON.stringify({ enabled: ["durable-turns"] }));
+  const report = createPatchReport();
+  patchExtractedApp(dir, {
+    report,
+    featuresRoot: path.join(__dirname, ".."),
+    featuresConfigPath: config,
+    internalFeatureIds: [],
+  });
+  const entries = report.patches.filter((patch) => String(patch.name).includes("durable-turns"));
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].status, "failed-required");
+  assert.ok(criticalFailuresFromReport(report).length > 0, "--enforce-critical would stay silent");
+  assert.ok(enabledFeatureFailuresFromReport(report).length > 0, "the enabled-feature gate would stay silent");
+  assert.equal(reportHasPatchChanges(report), false);
+  for (const text of Object.values(readTree(dir))) {
+    assert.ok(!text.includes("__dtMode"), "the tree was touched despite zero carriers");
+  }
+});
+
+// ---- F2: the syntax gate may never switch itself off -----------------------
+
+test("a node --check that cannot run fails the build and restores the carrier", () => {
+  const dir = tree("gate-unrunnable");
+  const expected = readTree(tree("gate-unrunnable-ref"));
+  const library = mutatedLibrary((lib) => {
+    const edit = lib.rules.find((rule) => rule.id === "P1-c").edits[1];
+    edit.template = edit.template.replace("{timeoutMs:<timeout>})", "{timeoutMs:<timeout>");
+  });
+  // A node that cannot be spawned is NOT evidence that upstream does not parse.
+  // Before the fix both fell into ok:false and verifySyntax skipped silently.
+  assert.throws(
+    () => feature.patchTree(dir, { library, mode: "apply", nodeExec: "/nonexistent/durable-turns-node" }),
+    /syntax gate could not run/,
+  );
+  assert.deepEqual(readTree(dir), expected);
+});
+
+test("a baseline that really fails node --check refuses the gate instead of bypassing it", () => {
+  const dir = tree("baseline-unparsable");
+  const file = path.join(dir, ".vite/build", "x1.js");
+  fs.writeFileSync(file, fs.readFileSync(file, "latin1") + ";@@@not-javascript@@@", "latin1");
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }),
+    /does not pass .node --check|cannot calibrate/);
+});
+
+// ---- F3: template-hard-coded upstream members belong in the invariants -----
+
+test("renaming the members the P0-a template calls reports DRIFTED, not applied", () => {
+  const dir = tree("f3-rename");
+  const file = path.join(dir, ".vite/build", "x1.js");
+  let text = fs.readFileSync(file, "latin1");
+  text = text.split("markConversationNeedsResumeForUnavailableOwner").join("markConversationNeedsResumeGONE");
+  text = text.split("ownerClientId").join("ownerClientX");
+  fs.writeFileSync(file, text, "latin1");
+  const report = feature.patchTree(dir, { mode: "check" });
+  const failed = report.failures.filter((failure) => failure.rule === "P0-a");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].status, DRIFTED);
+  assert.match(failed[0].reason, /invariant/i);
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }),
+    /refusing to ship a partial patch/);
+});
+
+// ---- F7: the ordered anchor must not be satisfiable by a decoy -------------
+
+test("the P0-a order cannot be faked by a decoy .ownerClientId); ahead of the throw", () => {
+  const rule = feature.loadLibrary().rules.find((candidate) => candidate.id === "P0-a");
+  const head = "async interruptConversationSelf(e,t,r){let __dtMode=t;let i=this.getStreamRole(e);catch(t){"
+    + "let r=n.Uo(t),a=[" + BT + "timeout" + BT + "].find(x=>r.includes(x));";
+  const mark = "if(i?.role===" + BT + "follower" + BT + "&&a!=null)"
+    + "this.markConversationNeedsResumeForUnavailableOwner(e,i.ownerClientId);";
+  const guard = "if(__dtMode!==" + BT + "user-stop" + BT + "||i?.role!==" + BT + "follower" + BT
+    + "||a==null)throw t;";
+  const tail = "this.markConversationNeedsResumeForUnavailableOwner(e,i.ownerClientId),this.logger.warning(0)}}updateConversationState:";
+  // The genuine patched layout must always pass.
+  assertEndStateOf(head + mark + guard + tail, rule, "P0-a-good");
+  // The mark hoisted ABOVE the throw with a decoy .ownerClientId); below it is
+  // the layout the guard exists for: order looks right, behaviour is broken.
+  const decoy = "this.preClean(e,i.ownerClientId);";
+  const wrong = head + decoy + guard + mark + "this.logger.warning(1)}}updateConversationState:";
+  assert.throws(() => assertEndStateOf(wrong, rule, "P0-a-decoy"), /ordering/);
+});
+
+// ---- F8: the double-quote flavour must round-trip at the byte level ---------
+
+test("a double-quoted chunk applies with its own quotes and reverts byte-exactly", () => {
+  const dir = tree("double-quote");
+  const ref = tree("double-quote-ref");
+  for (const rel of [".vite/build/x1.js", "webview/assets/x2.js"]) {
+    const file = path.join(dir, rel);
+    const reference = path.join(ref, rel);
+    const flipped = fs.readFileSync(reference, "latin1").replace(/`([^`\n]*)`/g, (all, inner) => {
+      return inner === "" ? all : '"' + inner + '"';
+    });
+    fs.writeFileSync(file, flipped, "latin1");
+  }
+  const before = readTree(dir);
+  assert.ok(before[".vite/build/x1.js"].includes("\"thread/unsubscribe\""), "flavour flip failed");
+  feature.patchTree(dir, { mode: "apply" });
+  const patched = readTree(dir);
+  // The upstream protocol literal that pre-existed in the chunk must keep the
+  // quote the chunk really used (F8: the old forward pass hardcoded backticks,
+  // so a double-quoted chunk came back corrupted after a revert). The plain
+  // flavour's thread/stop arm is text this patcher introduces -- the
+  // upstream shape never says it -- so the reachable unsubscribe literal is
+  // what carries the chunk's own quote on both flavours.
+  for (const rel of Object.keys(patched)) {
+    assert.ok(patched[rel].includes("\"thread/unsubscribe\""), rel + " rotated the reachable literal away from the chunk quote style");
+    assert.ok(patched[rel].includes("__dtDiscardMethod"), rel + " lost the discard marker");
+  }
+  assert.ok(patched["webview/assets/x2.js"].includes("\"thread/stop\""), "the upgrade flavour lost its own double-quoted stop literal");
+  const report = feature.reverseTree(dir, { mode: "apply" });
+  assert.deepEqual(report.failures, []);
+  assert.deepEqual(readTree(dir), before, "the double-quote flavour is not byte-reversible");
+});
+
+// ---- small items: scratch-file hygiene and variant-group integrity ---------
+
+test("stale durable-turns scratch files are neither carriers nor left behind", () => {
+  const dir = tree("stale-scratch");
+  const real = path.join(dir, ".vite/build", "x1.js");
+  fs.copyFileSync(real, real + ".durable-turns.baseline.js");
+  fs.writeFileSync(real + ".durable-turns.tmp", "junk", "latin1");
+  const carriers = feature.findCarriers(dir, feature.loadLibrary()).map((carrier) => carrier.relPath);
+  assert.equal(carriers.filter((rel) => rel.includes(".durable-turns.")).length, 0,
+    "a crash leftover was scanned as a pseudo carrier");
+  const report = feature.patchTree(dir, { mode: "apply" });
+  assert.deepEqual(report.failures, []);
+  assert.equal(fs.existsSync(real + ".durable-turns.baseline.js"), false, "baseline leftover");
+  assert.equal(fs.existsSync(real + ".durable-turns.tmp"), false, "tmp leftover");
+});
+
+test("a variant rule whose group is only half present is rejected at load", () => {
+  const library = mutatedLibrary((lib) => {
+    delete lib.rules.find((rule) => rule.id === "P1-c").edits[1].variant;
+  });
+  const file = path.join(tree("variant-load"), "signatures.json");
+  fs.writeFileSync(file, JSON.stringify(library));
+  assert.throws(() => feature.loadLibrary({ signaturesPath: file }), /variant/i);
+});

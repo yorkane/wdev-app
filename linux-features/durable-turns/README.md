@@ -129,7 +129,10 @@ unrecoverable.
 * **Parseable** - the patched chunk must still pass `node --check` when the
   pristine one did. The gate fires before the write is committed and restores the
   previous bytes on failure; without it a dropped paren once shipped a
-  `try{}` with no `catch`.
+  `try{}` with no `catch`. The gate can never disarm itself: a
+  `node --check` that did not actually run (spawn failed, killed by a signal)
+  and a baseline the parser already rejects both fail the build, because a
+  quietly-off gate is indistinguishable from a gate that passed.
 * **Streaming** - bundles are consumed in 4MB blocks with 256KB overlap, so a
   10MB single-line chunk is never held in memory to run a regex over it.
 
@@ -154,7 +157,7 @@ current source around it, and a caret at the failed anchor:
     node --test linux-features/*/test.js      # repository gate (scripts/ci/run-node-checks.sh)
     node --test linux-features/durable-turns/test.js
 
-The suite is 34 cases over a synthetic two-flavour bundle: carrier selection,
+The suite is 44 cases over a synthetic two-flavour bundle: carrier selection,
 variant exclusivity, terminal-state and ordering assertions, byte-identical
 re-apply, byte-identical revert, the parse gate including its restore path,
 ambiguous duplicate regions, rejected irreversible rules at load time, chunk

@@ -17,7 +17,10 @@ function listJsFiles(rootDir, fileSuffix) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile() && entry.name.endsWith(fileSuffix)) out.push(full);
+      // Scratch files staged next to a carrier are not candidates: a baseline
+      // left by an interrupted run ends in .js and holds the whole contract, so
+      // screening it as a carrier would report drift about a file we wrote.
+      else if (entry.isFile() && entry.name.endsWith(fileSuffix) && !entry.name.includes(".durable-turns.")) out.push(full);
     }
   }
   return out.sort();

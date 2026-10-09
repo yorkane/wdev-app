@@ -14,6 +14,13 @@
 const fs = require("node:fs");
 
 const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024;
+
+// Scratch names used next to a carrier while a rewrite is staged. The baseline
+// keeps the .js suffix on purpose (node --check must reject it for the right
+// reason), so the scanner has to exclude it by name; the temp file is what the
+// asar packer would otherwise sweep into the published build.
+const BASELINE_SUFFIX = ".durable-turns.baseline.js";
+const TEMP_SUFFIX = ".durable-turns.tmp";
 const DEFAULT_OVERLAP_BYTES = 256 * 1024;
 const COPY_BLOCK_BYTES = 1024 * 1024;
 
@@ -135,7 +142,7 @@ function applyRewrites(filePath, rewrites) {
   }
 
   const size = fs.statSync(filePath).size;
-  const tempPath = filePath + ".durable-turns.tmp";
+  const tempPath = filePath + TEMP_SUFFIX;
   const readFd = fs.openSync(filePath, "r");
   const writeFd = fs.openSync(tempPath, "w", 0o644);
   let failed = false;
@@ -185,10 +192,12 @@ function applyRewrites(filePath, rewrites) {
 }
 
 module.exports = {
+  BASELINE_SUFFIX,
   COPY_BLOCK_BYTES,
   containsAllSymbols,
   DEFAULT_CHUNK_BYTES,
   DEFAULT_OVERLAP_BYTES,
+  TEMP_SUFFIX,
   applyRewrites,
   forEachMatch,
   readRegion,
