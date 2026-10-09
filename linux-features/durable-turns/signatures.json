@@ -1,0 +1,235 @@
+{
+  "schemaVersion": 1,
+  "featureId": "durable-turns",
+  "scan": {
+    "dirs": [
+      ".vite/build",
+      "webview/assets"
+    ],
+    "fileSuffix": ".js",
+    "chunkBytes": 4194304,
+    "overlapBytes": 262144
+  },
+  "carrierSymbols": [
+    "interruptConversationSelf",
+    "discardConversationFromCache",
+    "interruptSubagentDescendantsInBackground",
+    "shouldKeepConversationLoaded"
+  ],
+  "rules": [
+    {
+      "id": "P0-a",
+      "title": "a follower whose stream owner vanished interrupts the turn locally only for an explicit user stop",
+      "markers": [
+        "__dtMode"
+      ],
+      "region": {
+        "open": [
+          "async interruptConversationSelf({CAP:conv},{CAP:mode},{CAP:expected}){B}",
+          "async interruptConversationSelf({CAP:conv},{CAP:mode},{CAP:expected}){B}let __dtMode={ID};"
+        ],
+        "close": [
+          "updateConversationState:"
+        ],
+        "span": 4200,
+        "excerptBefore": 240,
+        "invariants": [
+          "this.sendThreadFollowerRequest({ID},{LIT:thread-follower-interrupt-turn}",
+          "{LIT:timeout},{LIT:request-version-mismatch},{LIT:no-client-found}",
+          "{B}conversationId:",
+          "{LIT:turn/interrupt}"
+        ]
+      },
+      "edits": [
+        {
+          "id": "P0-a-mode-alias",
+          "find": "async interruptConversationSelf({CAP:conv},{CAP:mode},{CAP:expected}){B}{NOT:let __dtMode=}",
+          "template": "async interruptConversationSelf(<conv>,<mode>,<expected>){let __dtMode=<mode>;"
+        },
+        {
+          "id": "P0-a-follower-guard",
+          "find": "if({CAP:role}?.role!=={LIT:follower}||{CAP:reason}==null)throw {CAP:err};",
+          "template": "if(<role>?.role===`follower`&&<reason>!=null)this.markConversationNeedsResumeForUnavailableOwner(<conv>,<role>.ownerClientId);if(__dtMode!==`user-stop`||<role>?.role!==`follower`||<reason>==null)throw <err>;"
+        }
+      ],
+      "assertions": {
+        "gone": [
+          "if({CAP:role}?.role!=={LIT:follower}||{CAP:reason}==null)throw {CAP:err};"
+        ],
+        "present": [
+          "{B}let __dtMode={ID};",
+          "if({ID}?.role==={LIT:follower}&&{ID}!=null)this.markConversationNeedsResumeForUnavailableOwner(",
+          "if(__dtMode!=={LIT:user-stop}||{ID}?.role!=={LIT:follower}||{ID}==null)throw "
+        ],
+        "ordered": [
+          ".ownerClientId);",
+          "if(__dtMode!=={LIT:user-stop}"
+        ]
+      }
+    },
+    {
+      "id": "P0-b",
+      "title": "the subagent descendant cascade fires only for an explicit user stop",
+      "markers": [
+        "__dtCascadeUserStopOnly"
+      ],
+      "region": {
+        "open": [
+          "async interruptConversation({CAP:conv},{CAP:mode}={LIT:system},{CAP:expected}){B}"
+        ],
+        "close": [
+          "async interruptSubagentDescendants({ID}){B}"
+        ],
+        "span": 1600,
+        "excerptBefore": 160,
+        "invariants": [
+          "this.interruptConversationSelf(",
+          "!=={LIT:descendant-cleanup}",
+          "?.role!=={LIT:follower}",
+          "{LIT:user-stop}"
+        ]
+      },
+      "edits": [
+        {
+          "id": "P0-b-cascade",
+          "find": "({CAP:mode}==={LIT:user-stop}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))",
+          "template": "(<mode>===`user-stop`?<mgr>.interruptSubagentDescendantsInBackground(<conv>):(globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0))"
+        }
+      ],
+      "assertions": {
+        "gone": [
+          "({CAP:mode}==={LIT:user-stop}?{CAP:mgr}.interruptSubagentDescendantsInBackground({CAP:conv}):await {BACK:mgr}.interruptSubagentDescendants({BACK:conv}))"
+        ],
+        "present": [
+          "globalThis.__dtCascadeUserStopOnly=(globalThis.__dtCascadeUserStopOnly||0)+1,void 0"
+        ],
+        "ordered": []
+      }
+    },
+    {
+      "id": "P1-a",
+      "title": "the inactive-owner idle TTL and thread cap no longer recycle background conversations",
+      "markers": [],
+      "region": {
+        "open": [
+          "{CAP:ttl}={NCAP:ttlVal|108e5|10800\\*1e3},{CAP:check}={NCAP:checkVal|15e3|15\\d{3}},{CAP:cap}=10{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}",
+          "{CAP:ttl}=2147483647,{CAP:check}=15e3,{CAP:cap}=2147483647/*durable-turns upstream-throttle {RAW:[^/]*}*/{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}"
+        ],
+        "close": [
+          "maxInactiveOwnerThreads:"
+        ],
+        "span": 8000,
+        "excerptBefore": 160,
+        "invariants": [
+          "=class{B}{ID};inactiveOwnerConversationSinceById=new Map",
+          "ttlExpired:"
+        ]
+      },
+      "edits": [
+        {
+          "id": "P1-a-throttle-constants",
+          "find": "{CAP:ttl}={NCAP:ttlVal|108e5|10800\\*1e3},{CAP:check}={NCAP:checkVal|15e3|15\\d{3}},{CAP:cap}=10{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}",
+          "template": "<ttl>=2147483647,<check>=15e3,<cap>=2147483647/*durable-turns upstream-throttle {NCAP:ttlVal|[^/\\s]+} {NCAP:checkVal|[^/\\s]+}*/"
+        }
+      ],
+      "assertions": {
+        "gone": [
+          "{CAP:ttl}={NCAP:ttlVal|108e5|10800\\*1e3},{CAP:check}={NCAP:checkVal|15e3|15\\d{3}},{CAP:cap}=10{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}"
+        ],
+        "present": [
+          "{CAP:ttl}=2147483647,{CAP:check}=15e3,{CAP:cap}=2147483647/*durable-turns upstream-throttle {RAW:[^/]*}*/{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}"
+        ],
+        "ordered": []
+      }
+    },
+    {
+      "id": "P1-b",
+      "title": "discarding a cached conversation no longer interrupts an in-progress turn",
+      "markers": [
+        "__dtNoDiscardKill"
+      ],
+      "region": {
+        "open": [
+          "async function {CAP:helper}({manager:{CAP:mgr},conversationId:{CAP:id},ephemeral:{CAP:eph},isDurableHost:{CAP:durable}}){B}",
+          "async discardConversationFromCache({CAP:id}){B}"
+        ],
+        "close": [
+          "{LIT:thread_not_found}",
+          "{B}reason:{LIT:discard}"
+        ],
+        "span": 1600,
+        "excerptBefore": 240,
+        "invariants": [
+          "{LIT:Failed to interrupt discarded conversation}",
+          "{LIT:thread/unsubscribe}"
+        ]
+      },
+      "edits": [
+        {
+          "id": "P1-b-implicit-interrupt",
+          "find": "if({CAP:cand}!=null&&{CAP:pred}({BACK:cand}))try{await {NCAP:mgr|this|[A-Za-z_$][\\w$]*}.interruptConversation({CAP:id})",
+          "template": "if(<cand>!=null&&(globalThis.__dtNoDiscardKill=(globalThis.__dtNoDiscardKill||0)+1,!1&&<pred>(<cand>)))try{await <mgr>.interruptConversation(<id>)"
+        }
+      ],
+      "assertions": {
+        "gone": [
+          "if({CAP:cand}!=null&&{CAP:pred}({BACK:cand}))try{await {NCAP:mgr|this|[A-Za-z_$][\\w$]*}.interruptConversation({CAP:id})"
+        ],
+        "present": [
+          "globalThis.__dtNoDiscardKill=(globalThis.__dtNoDiscardKill||0)+1,!1&&"
+        ],
+        "ordered": []
+      }
+    },
+    {
+      "id": "P1-c",
+      "title": "the discard path never sends thread/stop, so losing a view cannot really stop a durable turn",
+      "markers": [
+        "__dtDiscardMethod"
+      ],
+      "variantGroup": "discard-method",
+      "region": {
+        "open": [
+          "async function {CAP:helper}({manager:{CAP:mgr},conversationId:{CAP:id},ephemeral:{CAP:eph},isDurableHost:{CAP:durable}}){B}",
+          "async discardConversationFromCache({CAP:id}){B}"
+        ],
+        "close": [
+          "{LIT:thread_not_found}",
+          "{B}reason:{LIT:discard}"
+        ],
+        "span": 1600,
+        "excerptBefore": 240,
+        "invariants": [
+          "{LIT:Failed to interrupt discarded conversation}",
+          "{LIT:thread/unsubscribe}"
+        ]
+      },
+      "edits": [
+        {
+          "id": "P1-c-discard-ternary",
+          "variant": "discard-method",
+          "variantKey": "upgrade",
+          "find": "try{await {CAP:sendMgr}.sendRequest({CAP:eph}&&{CAP:durable}?{LIT:thread/stop}:{LIT:thread/unsubscribe},{threadId:{CAP:id}},{timeoutMs:{CAP:timeout}})",
+          "template": "try{await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,(<eph>&&<durable>)&&!1?`thread/stop`:`thread/unsubscribe`),{threadId:<id>},{timeoutMs:<timeout>})"
+        },
+        {
+          "id": "P1-c-discard-unsubscribe",
+          "variant": "discard-method",
+          "variantKey": "plain",
+          "find": "}await {CAP:sendMgr}.sendRequest({LIT:thread/unsubscribe},{B}threadId:{BACK:id}{E},{B}timeoutMs:{CAP:timeout}{E})",
+          "template": "}await <sendMgr>.sendRequest((globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,!1?`thread/stop`:`thread/unsubscribe`),{threadId:<id>},{timeoutMs:<timeout>})"
+        }
+      ],
+      "assertions": {
+        "gone": [
+          "{ID}&&{ID}?{LIT:thread/stop}"
+        ],
+        "present": [
+          "globalThis.__dtDiscardMethod=(globalThis.__dtDiscardMethod||0)+1,",
+          "!1?{LIT:thread/stop}:{LIT:thread/unsubscribe}"
+        ],
+        "ordered": []
+      }
+    }
+  ]
+}

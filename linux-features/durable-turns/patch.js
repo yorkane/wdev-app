@@ -1,270 +1,348 @@
+"use strict";
+
 // durable-turns ASAR patch.
 //
 // Codex Desktop ties the lifetime of a turn to the lifetime of a UI client.
 // Every automatic interrupt path in the upstream bundles encodes one
-// assumption: "nobody is watching, so stop the work". That assumption is
-// inverted for the OpenCodex web deployment, where many concurrent browser
-// viewers plus background and headless sessions are the normal case and
-// losing a viewer is routine rather than exceptional.
+// assumption: nobody is watching, so stop the work. That assumption is inverted
+// for the OpenCodex web deployment, where many concurrent browser viewers plus
+// background and headless sessions are the normal case and losing a viewer is
+// routine rather than exceptional. Measured on the 235.t production box, the
+// gateway logged 888 orphaned app-host relays against only 470 reattachments,
+// and one lost viewer took down 15 threads inside a single second, because a
+// plain interrupt cascades to the whole subagent tree. The turn itself runs in
+// the long-lived app-server process, so a viewer going away is not a reason to
+// stop working.
 //
-// The same source ships twice - once in the main-process bundle
-// (.vite/build/main-*.js) and once in the webview entry bundle
-// (webview/assets/app-initial-*.js) - with identical logic but different
-// minified identifiers, so every edit carries a per-flavor anchor.
+// Why this file no longer contains an anchor string.
 //
-//   P0-a  interruptConversationSelf
-//        A follower whose stream owner vanished used to interrupt the turn
-//        locally for every mode, including system. It now only does so for an
-//        explicit user stop; anything else marks needs_resume and rethrows.
-//        The mark has to happen BEFORE the guard, not after it: the upstream
-//        code marked and then fell through, so hoisting only the guard above
-//        the mark would rethrow without marking. That left stream role still
-//        pointing at the dead owner while resumeState stayed "resumed", and
-//        needsResume() requires resumeState==='needs_resume' or a null stream
-//        role - both gates shut, so the follower could not self-heal in
-//        exactly the scenario this patch exists for.
-//   P0-b  interruptConversation
-//        The descendant cascade - every single interrupt nuking the whole
-//        subagent tree - now fires only for user-stop. This is what turned one
-//        lost viewer into a dozen dead sessions.
-//   P1-a  inactive owner constants
-//        Background and headless conversations are no longer auto-unsubscribed
-//        (the 3h idle TTL and the 10-thread cap are effectively disabled).
-//        The TTL is 2147483647, NOT Number.MAX_SAFE_INTEGER. Node clamps any
-//        setTimeout delay above 2^31-1 to 1ms with a TimeoutOverflowWarning.
-//        With MAX_SAFE_INTEGER the next-check delay overflowed to 1ms, the
-//        check found no candidate and rescheduled, and the loop spun at
-//        roughly 900 iterations per second, burning 11-13% of a core at three
-//        idle conversations and 36% at a hundred. 2147483647 is a legal delay
-//        (~24.8 days) and actually disables the timer.
-//   P1-b  discardConversationFromCache
-//        Evicting a cached conversation no longer interrupts it implicitly.
+// The previous implementation anchored on exact minified strings inside
+// fixed-name files (main-*.js, app-initial-*.js). On 2026-10-08 the 241.t
+// fleet moved from upstream 26.908.40834 to 26.1002.52244, roughly 94 releases,
+// and every anchor went to zero: upstream re-chunked the bundle, moving the
+// main-process code from main-DaMR-wdT.js into bootstrap-*.js and the webview
+// logic from app-initial-*.js into app-shared-*.js. What did not drift is the
+// symbol surface: interruptConversationSelf, discardConversationFromCache,
+// shouldKeepConversationLoaded and interruptSubagentDescendants all survived
+// 94 releases untouched. Only file names and minified locals rotate.
 //
-// ciPolicy is required-upstream on purpose: if a future Codex build renames
-// any anchor, the build must fail rather than ship a half-applied fix. The
-// two bundles are patched through separate descriptors, so drift in either
-// one is caught.
-
-"use strict";
-
-const BT = String.fromCharCode(96);
-
-const CASCADE_MARKER = "__dtCascadeUserStopOnly";
-const DISCARD_MARKER = "__dtNoDiscardKill";
-const MODE_ALIAS = "__dtMode";
-
-function bq(s) {
-  return BT + s + BT;
-}
-
-const CASCADE_FIND =
-  "(t===" + bq("user-stop")
-  + "?this.interruptSubagentDescendantsInBackground(e)"
-  + ":await this.interruptSubagentDescendants(e))";
-
-const CASCADE_REPLACE =
-  "(t===" + bq("user-stop")
-  + "?this.interruptSubagentDescendantsInBackground(e)"
-  + ":(globalThis." + CASCADE_MARKER
-  + "=(globalThis." + CASCADE_MARKER + "||0)+1,void 0))";
-
-function discardReplace() {
-  return "async discardConversationFromCache(e){"
-    + "let t=this.getConversation(e);"
-    + "if(t!=null&&(globalThis." + DISCARD_MARKER
-    + "=(globalThis." + DISCARD_MARKER + "||0)+1,!1))"
-    + "try{await this.interruptConversation(e)}";
-}
-
-const EDITS = {
-  main: [
-    {
-      id: "P0-a-mode-alias",
-      find: "async interruptConversationSelf(e,t,r){let i=this.getStreamRole(e);",
-      replace:
-        "async interruptConversationSelf(e,t,r){let " + MODE_ALIAS
-        + "=t;let i=this.getStreamRole(e);",
-    },
-    {
-      id: "P0-a-follower-guard",
-      find: "if(i?.role!==" + bq("follower") + "||a==null)throw t;",
-      replace:
-        "if(i?.role===" + bq("follower") + "&&a!=null)"
-        + "this.markConversationNeedsResumeForUnavailableOwner(e,i.ownerClientId);"
-        + "if(" + MODE_ALIAS + "!==" + bq("user-stop")
-        + "||i?.role!==" + bq("follower") + "||a==null)throw t;",
-    },
-    {
-      id: "P0-b-cascade",
-      find: CASCADE_FIND,
-      replace: CASCADE_REPLACE,
-    },
-    {
-      id: "P1-a-inactive-ttl",
-      find: "var qC=10800*1e3,t_e=15e3,JC=10,",
-      replace: "var qC=2147483647,t_e=15e3,JC=2147483647,",
-    },
-    {
-      id: "P1-b-discard-cache",
-      find:
-        "async discardConversationFromCache(e){"
-        + "let t=this.getConversation(e);"
-        + "if(t!=null&&LC(t))try{await this.interruptConversation(e)}",
-      replace: discardReplace(),
-    },
-  ],
-  webview: [
-    {
-      id: "P0-a-mode-alias",
-      find: "async interruptConversationSelf(e,t,n){let r=this.getStreamRole(e);",
-      replace:
-        "async interruptConversationSelf(e,t,n){let " + MODE_ALIAS
-        + "=t;let r=this.getStreamRole(e);",
-    },
-    {
-      id: "P0-a-follower-guard",
-      find: "if(r?.role!==" + bq("follower") + "||i==null)throw t;",
-      replace:
-        "if(r?.role===" + bq("follower") + "&&i!=null)"
-        + "this.markConversationNeedsResumeForUnavailableOwner(e,r.ownerClientId);"
-        + "if(" + MODE_ALIAS + "!==" + bq("user-stop")
-        + "||r?.role!==" + bq("follower") + "||i==null)throw t;",
-    },
-    {
-      id: "P0-b-cascade",
-      find: CASCADE_FIND,
-      replace: CASCADE_REPLACE,
-    },
-    {
-      id: "P1-a-inactive-ttl",
-      find: "RGt=10800*1e3,zGt=15e3,BGt=10,",
-      replace: "RGt=2147483647,zGt=15e3,BGt=2147483647,",
-    },
-    {
-      id: "P1-b-discard-cache",
-      find:
-        "async discardConversationFromCache(e){"
-        + "let t=this.getConversation(e);"
-        + "if(t!=null&&ov(t))try{await this.interruptConversation(e)}",
-      replace: discardReplace(),
-    },
-  ],
-};
-
-function countOf(haystack, needle) {
-  return haystack.split(needle).length - 1;
-}
-
-// verifyEdits asserts the terminal state of a rewritten bundle instead of
-// trusting per-edit bookkeeping.
+// So the architecture is:
+//   1. scan every chunk under .vite/build and webview/assets and pick the
+//      carriers by the symbols they hold -- no file name is ever matched,
+//   2. locate each rule by structural signature (function head, branch shape,
+//      call sequence) inside its region -- no bare string anchor,
+//   3. rewrite, then assert the terminal state: the old shape gone and the new
+//      shape present, per rule, per carrier,
+//   4. --check reports BOUND / DRIFTED / REMOVED per rule with a source excerpt
+//      of the area, so drift is judged by reading a few hundred bytes instead
+//      of grepping a bundle with 19k files.
 //
-// The per-edit `out.includes(edit.replace)` short circuit is content
-// triggered, not state triggered: if the replacement text appears anywhere in
-// the bundle - a comment, a string literal, upstream code that happens to look
-// the same - the edit is silently skipped. That defeats the whole point of
-// ciPolicy required-upstream, which promises a failed build rather than a
-// half-applied patch. The worst observed case produced text referencing an
-// undeclared `__dtMode` while still reporting "already patched, skipping",
-// and node --check does not catch it because a syntax check does not resolve
-// scope; it only explodes at runtime as a ReferenceError.
-//
-// Every anchor is verified unique (exactly one occurrence in the upstream
-// bundle), so after a successful rewrite each `find` must be gone and each
-// `replace` must be present. Asserting the end state directly catches both a
-// skipped edit and a partially applied bundle, whatever caused it.
-function verifyEdits(out, edits, patchName) {
-  for (const edit of edits) {
-    const stale = countOf(out, edit.find);
-    if (stale > 0) {
-      throw new Error(
-        patchName + ": " + edit.id + " did not apply (anchor still present "
-          + stale + " time(s) after rewrite); refusing to ship a partial patch",
-      );
-    }
-    if (countOf(out, edit.replace) < 1) {
-      throw new Error(
-        patchName + ": " + edit.id + " replacement is absent after rewrite; "
-          + "refusing to ship a partial patch",
-      );
-    }
-  }
-}
+// The rules themselves are data: signatures.json, generated by
+// signatures.gen.js. ciPolicy stays required-upstream, so an unbound or
+// ambiguous rule fails the build instead of shipping a half-applied patch.
 
-// applyEdits rewrites one bundle. It is idempotent: an edit whose replacement
-// is already present is skipped, so re-running over an already patched bundle
-// is a no-op. A missing or ambiguous anchor throws on purpose - the descriptor
-// is registered as required-upstream, so drift breaks the build instead of
-// quietly shipping a partial fix.
-function applyEdits(source, flavor, patchName) {
-  if (typeof source !== "string") return source;
-  const edits = EDITS[flavor];
-  if (edits == null) throw new Error(patchName + ": unknown bundle flavor " + flavor);
-  let out = source;
-  let applied = 0;
-  for (const edit of edits) {
-    if (out.includes(edit.replace)) continue;
-    const hits = countOf(out, edit.find);
-    if (hits === 0) {
-      throw new Error(
-        patchName + ": anchor missing for " + edit.id
-          + " (upstream bundle drifted; refusing to ship a partial patch)",
-      );
-    }
-    if (hits > 1) {
-      throw new Error(
-        patchName + ": anchor for " + edit.id + " is ambiguous (" + hits + " matches)",
-      );
-    }
-    out = out.replace(edit.find, edit.replace);
-    applied += 1;
-  }
-  if (applied > 0) {
-    console.log("durable-turns: applied " + applied + "/" + edits.length + " edits to " + patchName);
-  } else {
-    console.log("durable-turns: " + patchName + " already patched, skipping");
-  }
-  // Always assert the end state, including on the no-op path.
-  verifyEdits(out, edits, patchName);
-  return out;
-}
+const fs = require("node:fs");
+const path = require("node:path");
 
-function bundleHasInterruptContract(source) {
-  return typeof source === "string"
-    && source.includes("interruptConversationSelf")
-    && source.includes("discardConversationFromCache")
-    && source.includes("interruptSubagentDescendantsInBackground");
-}
+const { execFileSync } = require("node:child_process");
 
-const descriptors = [
-  {
-    id: "durable-turns-main-bundle",
-    phase: "main-bundle",
-    order: 20_700,
-    ciPolicy: "required-upstream",
-    missingDescription: "main bundle (interruptConversationSelf / discardConversationFromCache)",
-    skipDescription: "durable-turns main-bundle turn lifetime patch",
-    apply: (source) => applyEdits(source, "main", "durable-turns main-bundle"),
-  },
-  {
-    id: "durable-turns-webview-entry",
-    phase: "webview-asset",
-    order: 20_701,
-    ciPolicy: "required-upstream",
-    pattern: /^app-initial-[^.]+\.js$/,
-    assetMatch: bundleHasInterruptContract,
-    missingDescription: "webview app-initial entry bundle (interruptConversationSelf contract)",
-    skipDescription: "durable-turns webview turn lifetime patch",
-    apply: (source) => applyEdits(source, "webview", "durable-turns webview entry"),
-  },
+const { applyRewrites } = require("./lib/chunks.js");
+const { findCarriers } = require("./lib/locate.js");
+const { BOUND, DRIFTED, REMOVED, planCarrier } = require("./lib/plan.js");
+const { assertReversible, patternSegments, templateSegments } = require("./lib/segments.js");
+const { reverseRule } = require("./lib/reverse.js");
+
+const SIGNATURES_PATH = path.join(__dirname, "signatures.json");
+const FEATURE_ID = "durable-turns";
+
+// Markers the patch introduces. They double as runtime counters, which makes a
+// suppression observable from the console instead of only inferable from logs.
+const MARKERS = [
+  "__dtMode",
+  "__dtCascadeUserStopOnly",
+  "__dtNoDiscardKill",
+  "__dtDiscardMethod",
 ];
 
+function loadLibrary(options = {}) {
+  const file = options.signaturesPath ?? SIGNATURES_PATH;
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error("durable-turns: cannot read signature library " + file + ": " + error.message);
+  }
+  if (parsed == null || typeof parsed !== "object" || !Array.isArray(parsed.rules) || parsed.rules.length === 0) {
+    throw new Error("durable-turns: signature library " + file + " is malformed");
+  }
+  for (const rule of parsed.rules) {
+    if (typeof rule.id !== "string" || !Array.isArray(rule.edits) || rule.edits.length === 0) {
+      throw new Error("durable-turns: rule in " + file + " is malformed");
+    }
+    for (const edit of rule.edits) {
+      // Load-time reversibility check: an edit whose patched side does not
+      // retain every identifier the upstream side consumes can never be
+      // reverted, and finding that out at revert time is too late.
+      assertReversible(patternSegments(edit.find), templateSegments(edit.template), rule.id + "/" + edit.id);
+    }
+  }
+  return parsed;
+}
+
+function summarise(plan) {
+  return {
+    rule: plan.ruleId,
+    file: plan.file,
+    status: plan.status,
+    applied: plan.applied === true,
+    edits: plan.rewrites.length + "/" + plan.editsTotal,
+    variants: plan.variants && plan.variants.length > 0 ? plan.variants.join("/") : undefined,
+    reason: plan.why ?? undefined,
+  };
+}
+
+function formatExcerpt(plan) {
+  if (plan.excerpt == null) return "";
+  const caret = " ".repeat(Math.max(0, Math.min(plan.excerpt.caretColumn ?? 0, 3800))) + "^";
+  return [
+    "    region offset " + plan.excerpt.offset + " (caret marks the failed anchor)",
+    "    " + plan.excerpt.text.replace(/\n/g, " "),
+    "    " + caret,
+  ].join("\n");
+}
+
+// Syntax gate. A rewrite is text spliced into working JavaScript, so the cheapest
+// proof that it did not break the chunk is to let the parser look at the result.
+// The check is self-calibrating: a chunk that already fails `node --check` in its
+// pristine form (an ES module read as a script, for instance) is not evidence of
+// anything, so only a pristine-passes / patched-fails transition is a failure.
+function runNodeCheck(filePath) {
+  try {
+    execFileSync(process.execPath, ["--check", filePath], { stdio: "pipe", maxBuffer: 4 * 1024 * 1024 });
+    return { ok: true, detail: null };
+  } catch (error) {
+    return { ok: false, detail: String(error.stderr || error.message).split("\n").slice(0, 3).join(" | ") };
+  }
+}
+
+function verifySyntax(carrier, pristineCopy) {
+  const baseline = runNodeCheck(pristineCopy);
+  if (!baseline.ok) return;
+  const after = runNodeCheck(carrier.filePath);
+  if (!after.ok) {
+    throw new Error("durable-turns: patched " + carrier.relPath
+      + " no longer parses (upstream did): " + after.detail);
+  }
+}
+
+// Whether a rewrite actually moved bytes. An edit whose replacement equals the
+// text it replaced is legitimate, and counting it as a change would make an
+// already-patched tree look dirty.
+function bytesDiffer(filePath, rewrites) {
+  for (const rewrite of rewrites) {
+    if (readAt(filePath, rewrite) !== rewrite.replacement) return true;
+  }
+  return false;
+}
+
+function readAt(filePath, rewrite) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(rewrite.end - rewrite.start);
+    fs.readSync(fd, buffer, 0, buffer.length, rewrite.start);
+    return buffer.toString("latin1");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Applies rewrites and gates the result on the parser, restoring the previous
+// bytes if they do not parse. A gate that fires after the write would otherwise
+// leave a broken chunk on disk for the next stage to package, which is the exact
+// failure ciPolicy required-upstream exists to prevent.
+function writeCarrier(carrier, rewrites) {
+  if (rewrites.length === 0) return;
+  // The suffix has to stay .js: the baseline goes through the same parser, and an
+  // unknown extension makes node --check reject the file for the wrong reason, which
+  // reads as "upstream did not parse either" and silently disables the gate.
+  const backup = carrier.filePath + ".durable-turns.baseline.js";
+  fs.copyFileSync(carrier.filePath, backup);
+  const restore = () => {
+    fs.copyFileSync(backup, carrier.filePath);
+  };
+  try {
+    applyRewrites(carrier.filePath, rewrites);
+    verifySyntax(carrier, backup);
+  } catch (error) {
+    restore();
+    throw error;
+  } finally {
+    fs.rmSync(backup, { force: true });
+  }
+}
+
+// Plans and, unless dry-run, writes every rule for one extracted bundle tree.
+//
+// A rule has to bind in every carrier: upstream ships the same turn-lifecycle
+// logic twice, once per process side, and patching only one of them is a
+// partial fix of exactly the kind that got shipped before.
+function patchTree(extractedDir, options = {}) {
+  const library = options.library ?? loadLibrary(options);
+  const mode = options.mode ?? "apply";
+  const dryRun = mode !== "apply";
+  const carriers = findCarriers(extractedDir, library);
+  const report = {
+    extractedDir,
+    mode,
+    carriers: carriers.map((carrier) => carrier.relPath),
+    plans: [],
+    changedFiles: [],
+    failures: [],
+  };
+
+  if (carriers.length === 0) {
+    report.failures.push({
+      rule: "(carrier)",
+      file: null,
+      status: REMOVED,
+      reason: "no chunk under " + library.scan.dirs.join(", ") + " holds the turn-lifecycle contract",
+    });
+    return report;
+  }
+
+  for (const carrier of carriers) {
+    const planned = planCarrier(carrier, library.rules, library.scan, mode);
+    for (const plan of planned.plans) report.plans.push(summarise(plan));
+    for (const plan of planned.failed) {
+      report.failures.push({
+        rule: plan.ruleId,
+        file: plan.file,
+        status: plan.status,
+        reason: plan.why ?? null,
+        excerpt: plan.excerpt ?? null,
+      });
+    }
+
+    if (planned.failed.length > 0) continue;
+    if (planned.rewrites.length === 0) continue;
+
+    if (!dryRun) {
+      writeCarrier(carrier, planned.rewrites);
+      if (bytesDiffer(carrier.filePath, planned.rewrites)) report.changedFiles.push(carrier.relPath);
+    }
+  }
+
+  if (!dryRun && report.failures.length > 0) {
+    const detail = report.failures.map((failure) => {
+      const where = failure.file == null ? failure.rule : failure.rule + " in " + failure.file;
+      const lines = ["  " + failure.status + " " + where + ": " + failure.reason];
+      const withExcerpt = plannedFor(report, failure);
+      if (withExcerpt != null) lines.push(formatExcerpt(withExcerpt));
+      return lines.join("\n");
+    }).join("\n");
+    throw new Error("durable-turns: refusing to ship a partial patch.\n" + detail);
+  }
+
+  return report;
+}
+
+// Re-derives the excerpt for a failed rule so the CLI can print source, without
+// keeping excerpts on every successful plan.
+function plannedFor(report, failure) {
+  if (failure.excerpt == null) return null;
+  return { excerpt: failure.excerpt };
+}
+
+// Reverts every rule, back to the upstream bytes.
+function reverseTree(extractedDir, options = {}) {
+  const library = options.library ?? loadLibrary(options);
+  const carriers = findCarriers(extractedDir, library);
+  const report = { extractedDir, mode: "reverse", carriers: carriers.map((c) => c.relPath), plans: [], changedFiles: [], failures: [] };
+  for (const carrier of carriers) {
+    const rewrites = [];
+    for (const rule of library.rules) {
+      const plan = reverseRule(carrier, rule, library.scan);
+      report.plans.push({ rule: rule.id, file: carrier.relPath, status: plan.status, applied: plan.applied === true, edits: plan.rewrites.length + "/" + rule.edits.length });
+      if (plan.status !== BOUND) {
+        report.failures.push({ rule: rule.id, file: carrier.relPath, status: plan.status, reason: plan.why ?? null });
+        continue;
+      }
+      for (const rewrite of plan.rewrites) rewrites.push(rewrite);
+    }
+    if (report.failures.length > 0) continue;
+    if (rewrites.length === 0) continue;
+    if (options.mode !== "dry-run") {
+      writeCarrier(carrier, rewrites);
+      if (bytesDiffer(carrier.filePath, rewrites)) report.changedFiles.push(carrier.relPath);
+    }
+  }
+  return report;
+}
+
+function formatReport(report) {
+  const lines = [
+    "durable-turns " + report.mode + " against " + report.extractedDir,
+    "  carriers: " + (report.carriers.length > 0 ? report.carriers.join(", ") : "(none)"),
+  ];
+  for (const plan of report.plans) {
+    lines.push("  " + pad(plan.status, 8) + plan.rule + "  " + plan.file + "  edits=" + plan.edits
+      + (plan.variants ? "  variant=" + plan.variants : "")
+      + (plan.applied ? "  (already applied)" : ""));
+  }
+  for (const failure of report.failures) {
+    lines.push("  " + failure.status + " " + failure.rule + (failure.file ? " in " + failure.file : "") + ": " + failure.reason);
+  }
+  return lines.join("\n");
+}
+
+function pad(value, width) {
+  const text = String(value);
+  return text.length >= width ? text + " " : text + " ".repeat(width - text.length);
+}
+
+// The patch runs as one extracted-app descriptor rather than a main-bundle plus
+// an asset descriptor, because both of those phases presuppose a file name and
+// the whole point of the rewrite is that no file name is trusted any more.
+function buildDescriptors(options = {}) {
+  const library = options.library ?? loadLibrary(options);
+  return [
+    {
+      id: "durable-turns",
+      phase: "extracted-app:pre-webview",
+      order: 20_700,
+      ciPolicy: "required-upstream",
+      missingDescription: "turn-lifecycle carrier chunk (interruptConversationSelf / discardConversationFromCache)",
+      skipDescription: "durable-turns turn lifetime patch",
+      targetSummary: "all-linux (symbol located, no bundle file name)",
+      apply(extractedDir) {
+        const report = patchTree(extractedDir, { library, mode: "apply" });
+        const changed = report.changedFiles.length > 0;
+        const applied = report.plans.filter((plan) => plan.status === BOUND && !plan.applied).length;
+        console.log("durable-turns: " + applied + " edit(s) applied across " + report.carriers.length
+          + " carrier(s) in " + path.basename(String(extractedDir)));
+        return { changed, applied, carriers: report.carriers.length };
+      },
+      status(result) {
+        if (result == null) return { status: "failed-required", reason: "durable-turns produced no result" };
+        if (result.changed) return { status: "applied", reason: null };
+        return { status: "already-applied", reason: null };
+      },
+    },
+  ];
+}
+
 module.exports = {
-  CASCADE_MARKER,
-  DISCARD_MARKER,
-  EDITS,
-  MODE_ALIAS,
-  applyEdits,
-  bundleHasInterruptContract,
-  descriptors,
-  verifyEdits,
+  BOUND,
+  DRIFTED,
+  FEATURE_ID,
+  MARKERS,
+  REMOVED,
+  SIGNATURES_PATH,
+  buildDescriptors,
+  descriptors: buildDescriptors(),
+  findCarriers,
+  formatReport,
+  loadLibrary,
+  patchTree,
+  reverseTree,
 };
