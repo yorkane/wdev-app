@@ -47,6 +47,11 @@ structure, and treats file names as an implementation detail of a release.
    `webview/assets` is screened, and a chunk is a carrier only when it holds the
    whole turn-lifecycle contract (`carrierSymbols` in the library). No rule,
    region, or scan entry names a bundle file, and a regression test asserts it.
+   Each rule additionally declares `expectedCarriers` -- how many carriers it
+   must bind (currently 2, one per process side). The patcher compares the
+   tree-level BOUND count against the declaration: fewer is DRIFTED (see the
+   "Half-apply gate" section below), more is a printed note, never a build
+   failure.
 2. **Locate by structural signature, never by bare string.** Inside a carrier a
    rule names a region: an `open` anchor (function head), a patch-neutral `close`
    token, and `invariants` that must hold between them. Edits then bind by shape
@@ -109,6 +114,39 @@ than only inferable from logs: `globalThis.__dtCascadeUserStopOnly`,
 `globalThis.__dtNoDiscardKill`, `globalThis.__dtDiscardMethod`, plus the
 `__dtMode` alias in `interruptConversationSelf`.
 
+## Half-apply gate (`expectedCarriers`)
+
+Upstream ships the same turn lifecycle twice, one carrier per process side, so
+a rule has to bind twice. Every per-carrier check passes on a tree where one
+side simply vanished -- the surviving carrier binds all five rules -- which
+used to mean `apply` and `--check` both reported success for a bundle whose
+other half was never patched. That is a silent half-apply, and it is the hole
+`expectedCarriers` closes.
+
+The expectation is **declared data, not a constant**: each rule in
+`signatures.gen.js` carries `expectedCarriers: 2`, versioned together with the
+signatures. A hardcoded `carriers >= 2` in the patcher would false-alarm the
+day upstream legitimately collapses the duplicate to one copy; with the
+declaration, that future is a one-line library change. The consequences:
+
+* bound **fewer** than expected, with the scan itself short of carriers --
+  DRIFTED, and the message names the expectation, the actual count, and the
+  missing side in contract symbols plus a per-directory census (which scanned
+  chunks still hold which symbols distinguishes "moved away" from "renamed in
+  place"). Apply refuses to write; `--check` exits 1.
+* bound **more** than expected -- not a failure (an upstream release that grew
+  a third copy is legitimate), but the surplus is recorded in `report.notes` and
+  printed as `NOTE ...` by the CLI so an upgrade can be audited.
+* the field **absent** (an older or hand-written library) -- the default is
+  **2** (`DEFAULT_EXPECTED_CARRIERS` in patch.js, the current known value).
+* a declaration that is not a positive integer -- rejected at library load,
+  never silently floored to the default.
+
+Carriers are planned first and committed only after this audit passes, so a
+failure writes nothing; a write that fails mid-commit (syntax gate) restores
+every carrier from its snapshot, so the tree is all-patched or all-upstream.
+
+
 P1-a also records the values it replaced in a block comment
 (`/*durable-turns upstream-throttle 108e5 15e3*/`). A revert renders the upstream
 bytes out of the patched text, and an opaque numeric alternation would hold no
@@ -117,8 +155,10 @@ unrecoverable.
 
 ## Safety properties, and how they are checked
 
-* **required-upstream** - a rule that does not bind, binds ambiguously, or cannot
-  reach its end state throws; the build fails rather than shipping a partial fix.
+* **required-upstream** - a rule that does not bind, binds ambiguously, cannot
+  reach its end state, or binds fewer carriers than its declared
+  `expectedCarriers` throws; the build fails rather than shipping a partial
+  fix -- including the partial fix where one entire process side is missing.
 * **Idempotent** - a second apply is a byte-identical no-op. Region `open`
   accepts both the upstream head and this patcher's own output, and P0-a's
   upstream-form anchor carries a `{NOT:let __dtMode=}` guard.
@@ -157,11 +197,16 @@ current source around it, and a caret at the failed anchor:
     node --test linux-features/*/test.js      # repository gate (scripts/ci/run-node-checks.sh)
     node --test linux-features/durable-turns/test.js
 
-The suite is 44 cases over a synthetic two-flavour bundle: carrier selection,
+The suite is 53 cases over a synthetic two-flavour bundle: carrier selection,
 variant exclusivity, terminal-state and ordering assertions, byte-identical
 re-apply, byte-identical revert, the parse gate including its restore path,
 ambiguous duplicate regions, rejected irreversible rules at load time, chunk
-boundary behaviour, and the CLI exit codes and excerpts.
+boundary behaviour, the CLI exit codes and excerpts, and the half-apply gate:
+a tree that lost one process side fails apply and `--check` with the
+expectation/actual/symbol census in the message, a third carrier degrades to a
+note, the declaration (not a constant) drives the gate, an omitted declaration
+falls back to the documented default of 2, and a nonsensical declaration is
+rejected at load.
 
 To check against real bundles, unpack both and run the CLI; both upstream
 releases are regression fixtures:

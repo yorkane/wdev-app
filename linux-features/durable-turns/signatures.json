@@ -23,6 +23,7 @@
       "markers": [
         "__dtMode"
       ],
+      "expectedCarriers": 2,
       "region": {
         "open": [
           "async interruptConversationSelf({CAP:conv},{CAP:mode},{CAP:expected}){B}",
@@ -76,6 +77,7 @@
       "markers": [
         "__dtCascadeUserStopOnly"
       ],
+      "expectedCarriers": 2,
       "region": {
         "open": [
           "async interruptConversation({CAP:conv},{CAP:mode}={LIT:system},{CAP:expected}){B}"
@@ -113,6 +115,7 @@
       "id": "P1-a",
       "title": "the inactive-owner idle TTL and thread cap no longer recycle background conversations",
       "markers": [],
+      "expectedCarriers": 2,
       "region": {
         "open": [
           "{CAP:ttl}={NCAP:ttlVal|108e5|10800\\*1e3},{CAP:check}={NCAP:checkVal|15e3|15\\d{3}},{CAP:cap}=10{FWD:,{ID}=class{B}params;inactiveOwnerConversationSinceById=new Map}",
@@ -151,6 +154,7 @@
       "markers": [
         "__dtNoDiscardKill"
       ],
+      "expectedCarriers": 2,
       "region": {
         "open": [
           "async function {CAP:helper}({manager:{CAP:mgr},conversationId:{CAP:id},ephemeral:{CAP:eph},isDurableHost:{CAP:durable}}){B}",
@@ -191,6 +195,7 @@
         "__dtDiscardMethod"
       ],
       "variantGroup": "discard-method",
+      "expectedCarriers": 2,
       "region": {
         "open": [
           "async function {CAP:helper}({manager:{CAP:mgr},conversationId:{CAP:id},ephemeral:{CAP:eph},isDurableHost:{CAP:durable}}){B}",

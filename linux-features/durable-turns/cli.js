@@ -131,6 +131,7 @@ function main(argv) {
       carriers: report.carriers,
       plans: report.plans,
       failures: report.failures,
+      notes: report.notes ?? [],
       ok: report.failures.length === 0,
     }, null, 2) + "\n");
   } else {

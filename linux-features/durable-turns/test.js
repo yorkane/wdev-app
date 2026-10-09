@@ -786,3 +786,220 @@ test("a variant rule whose group is only half present is rejected at load", () =
   fs.writeFileSync(file, JSON.stringify(library));
   assert.throws(() => feature.loadLibrary({ signaturesPath: file }), /variant/i);
 });
+
+
+// ---- W12 half-apply gate: declared carrier expectations (review W9 C10-4) --
+//
+// Upstream ships the turn-lifecycle logic twice, one carrier per process side,
+// and every per-carrier check passes on a tree where one side vanished
+// entirely -- the remaining carrier binds all five rules, so apply reported
+// success (green --check, exit 0) for a bundle whose webview half was never
+// patched. The gate is declarative: each rule declares expectedCarriers in
+// the signature library, the patcher compares the tree-level BOUND count
+// against it, and only under-binding fails. A hardcoded "carriers >= 2" in
+// code would false-alarm the day upstream legitimately collapses the
+// duplicate; a number in the library is auditable data that moves with the
+// signatures.
+
+function oneSided(dir) {
+  fs.rmSync(path.join(dir, "webview/assets/x2.js"), { force: true });
+  return dir;
+}
+
+test("the signature library declares the carrier contract as data", () => {
+  const library = feature.loadLibrary();
+  assert.equal(feature.DEFAULT_EXPECTED_CARRIERS, 2, "the README default moved");
+  for (const rule of library.rules) {
+    assert.equal(rule.expectedCarriers, 2, rule.id + " lost its carrier declaration");
+  }
+  // The generator remains the single source of truth: the committed
+  // signatures.json must stay byte-identical to `node signatures.gen.js`.
+  const generated = execFileSync(process.execPath,
+    [path.join(__dirname, "signatures.gen.js")], { encoding: "utf8" });
+  const committed = fs.readFileSync(path.join(__dirname, "signatures.json"), "utf8");
+  assert.equal(committed, generated, "signatures.json is not what signatures.gen.js emits");
+});
+
+test("a tree that lost one process side fails apply without writing", () => {
+  const dir = tree("half-apply-apply");
+  const pristine = readTree(tree("half-apply-pristine-ref"));
+  oneSided(dir);
+  // Red before W12: this reported success (0 failures) and patched the one
+  // side it could see. Green now: loud throw, and the surviving carrier is
+  // untouched, because planning and the audit run before any write commits.
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }),
+    /refusing to ship a partial patch/);
+  assert.equal(fs.readFileSync(path.join(dir, ".vite/build/x1.js"), "latin1"),
+    pristine[".vite/build/x1.js"], "the failed apply wrote the surviving carrier");
+});
+
+test("the half-apply failure names the expectation, the actual, and the symbols", () => {
+  const dir = tree("half-apply-message");
+  oneSided(dir);
+  const report = feature.patchTree(dir, { mode: "check" });
+  for (const rule of feature.loadLibrary().rules) {
+    const failed = report.failures.filter((f) => f.rule === rule.id && f.file === null);
+    assert.equal(failed.length, 1, rule.id + " missed the carrier-count DRIFTED");
+    assert.equal(failed[0].status, DRIFTED);
+    assert.match(failed[0].reason, /expected 2 carrier\(s\), bound 1/);
+    // "which carrier's symbols are missing": the gap is described by the
+    // contract symbols and the per-directory census, not by a file name.
+    assert.match(failed[0].reason, /interruptConversationSelf/);
+    assert.match(failed[0].reason, /discardConversationFromCache/);
+    assert.match(failed[0].reason, /shouldKeepConversationLoaded/);
+    assert.match(failed[0].reason, /interruptSubagentDescendantsInBackground/);
+    assert.match(failed[0].reason, /webview\/assets/);
+  }
+  const run = runCli(["--check", dir]);
+  assert.equal(run.code, 1, "--check stayed green on a half-patched tree");
+  assert.match(run.stdout, /DRIFTED\s+P0-a/);
+});
+
+test("one side losing the contract symbols without losing its file is loud too", () => {
+  const dir = tree("half-apply-rename");
+  const file = path.join(dir, "webview/assets/x2.js");
+  let text = fs.readFileSync(file, "latin1");
+  for (const symbol of CARRIER_SYMBOLS) {
+    text = text.split(symbol).join(symbol.slice(0, 4) + "_GONE_" + symbol.slice(4));
+  }
+  fs.writeFileSync(file, text, "latin1");
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }),
+    /expected 2 carrier\(s\), bound 1/);
+  const run = runCli(["--check", dir]);
+  assert.equal(run.code, 1);
+});
+
+test("a third carrier is a note, not a build failure", () => {
+  const dir = tree("over-bind");
+  const x2 = fs.readFileSync(path.join(dir, "webview/assets/x2.js"), "latin1");
+  fs.writeFileSync(path.join(dir, "webview/assets", "x3.js"), x2, "latin1");
+  const report = feature.patchTree(dir, { mode: "apply" });
+  assert.deepEqual(report.failures, [], "an upstream copy-count upgrade broke the build");
+  assert.equal(report.changedFiles.length, 3);
+  assert.equal(report.notes.length, feature.loadLibrary().rules.length);
+  for (const note of report.notes) assert.match(note, /bound 3 carriers, more than the expected 2/);
+  const run = runCli(["--check", dir]);
+  assert.equal(run.code, 0, "--check must stay green while noting the surplus");
+  assert.match(run.stdout, /NOTE rule P0-a bound 3 carriers/);
+  const json = JSON.parse(runCli(["--check", dir, "--json"]).stdout);
+  assert.equal(json.notes.length, feature.loadLibrary().rules.length);
+});
+
+test("the expectation is data: expectedCarriers changes what fails", () => {
+  // A collapsed upstream (one carrier) is legal the moment the library says
+  // so -- this is the false-alarm that a hardcoded carriers >= 2 would cause.
+  const oneSidedTree = tree("declared-one");
+  oneSided(oneSidedTree);
+  const relaxed = mutatedLibrary((lib) => {
+    for (const rule of lib.rules) rule.expectedCarriers = 1;
+  });
+  const report = feature.patchTree(oneSidedTree, { library: relaxed, mode: "apply" });
+  assert.deepEqual(report.failures, []);
+  assert.equal(report.changedFiles.length, 1);
+  // And a rule declared for three carriers on a two-carrier tree fails loud,
+  // proving the number (not a constant 2) drives the gate.
+  const strict = mutatedLibrary((lib) => {
+    lib.rules.find((rule) => rule.id === "P1-a").expectedCarriers = 3;
+  });
+  const dir = tree("declared-three");
+  const strictReport = feature.patchTree(dir, { library: strict, mode: "check" });
+  const failed = strictReport.failures.filter((f) => f.rule === "P1-a" && f.file === null);
+  assert.equal(failed.length, 1);
+  assert.match(failed[0].reason, /expected 3 carrier\(s\), bound 2/);
+});
+
+test("an omitted declaration falls back to the documented default of 2", () => {
+  const dir = tree("default-two");
+  oneSided(dir);
+  const stripped = mutatedLibrary((lib) => {
+    for (const rule of lib.rules) delete rule.expectedCarriers;
+  });
+  assert.throws(() => feature.patchTree(dir, { library: stripped, mode: "apply" }),
+    /expected 2 carrier\(s\), bound 1/);
+});
+
+test("a nonsensical carrier declaration is rejected when the library loads", () => {
+  for (const bad of [0, -1, 1.5, "2"]) {
+    const library = mutatedLibrary((lib) => {
+      lib.rules.find((rule) => rule.id === "P0-a").expectedCarriers = bad;
+    });
+    const file = path.join(tree("bad-declaration"), "signatures.json");
+    fs.writeFileSync(file, JSON.stringify(library));
+    assert.throws(() => feature.loadLibrary({ signaturesPath: file }),
+      /expectedCarriers.*positive integer|positive integer/);
+  }
+});
+
+test("a screened-but-unbound carrier is reported once, by file, not twice by count", () => {
+  // When a carrier is still screened (it holds the contract symbols) but a
+  // rule cannot bind there, the per-carrier plan already records DRIFTED with
+  // the file name and source excerpt. The tree audit adds nothing on top --
+  // the carriers still number what the library expects, and duplicating the
+  // complaint as a count-only failure would bury the one message that names
+  // the file and shows the area.
+  const dir = tree("audit-noise");
+  const file = path.join(dir, "webview/assets/x2.js");
+  let text = fs.readFileSync(file, "latin1");
+  // Rotate the cascade head out of the region anchor. interruptConversation
+  // is not a contract symbol -- interruptConversationSelf is -- so x2 stays a
+  // carrier and P0-b fails at the per-carrier grain.
+  text = text.replace("async interruptConversation(e,t=", "async interruptConversationRenamed(e,t=");
+  fs.writeFileSync(file, text, "latin1");
+  const report = feature.patchTree(dir, { mode: "check" });
+  const p0b = report.failures.filter((f) => f.rule === "P0-b");
+  assert.equal(p0b.length, 1, "the per-carrier failure was duplicated or lost");
+  assert.equal(p0b[0].file, "webview/assets/x2.js");
+  assert.equal(report.failures.filter((f) => f.file === null).length, 0,
+    "the audit added a count-only duplicate for a failure that already names its file");
+  assert.throws(() => feature.patchTree(dir, { mode: "apply" }), /refusing to ship a partial patch/);
+});
+
+
+test("the repository pipeline records failed-required for a half-carrier tree", () => {
+  // The CI gate must not package a bundle that only got one side patched.
+  // descriptor.apply reuses patchTree, so the audit throw has to surface as
+  // failed-required (and trip --enforce-critical), not already-applied.
+  const dir = tree("half-apply-pipeline");
+  oneSided(dir);
+  const config = path.join(dir, "features.json");
+  fs.writeFileSync(config, JSON.stringify({ enabled: ["durable-turns"] }));
+  const report = createPatchReport();
+  patchExtractedApp(dir, {
+    report,
+    featuresRoot: path.join(__dirname, ".."),
+    featuresConfigPath: config,
+    internalFeatureIds: [],
+  });
+  const entries = report.patches.filter((patch) => String(patch.name).includes("durable-turns"));
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].status, "failed-required");
+  assert.ok(criticalFailuresFromReport(report).length > 0, "--enforce-critical would stay silent");
+  assert.ok(enabledFeatureFailuresFromReport(report).length > 0, "the enabled-feature gate would stay silent");
+  assert.equal(reportHasPatchChanges(report), false, "the half tree was written despite the failure");
+  assert.ok(!fs.readFileSync(path.join(dir, ".vite/build/x1.js"), "latin1").includes("__dtMode"),
+    "the surviving carrier was patched anyway");
+});
+
+// ---- commit-phase rollback across carriers ---------------------------------
+
+test("a syntax gate that fires on the second carrier restores the first", () => {
+  // The gate is per-carrier and runs at commit time. When it fires halfway,
+  // the earlier carrier must not stay patched while the later one reverts --
+  // a mixed tree where one process side runs the patched logic and the other
+  // the upstream logic is a new species of half-apply, and it used to be the
+  // exact behaviour of the interleaved plan-and-write loop.
+  const dir = tree("mixed-commit");
+  const before = readTree(dir);
+  const library = mutatedLibrary((lib) => {
+    // The upgrade flavour only exists in the webview carrier, so the first
+    // carrier commits cleanly and the second one trips the parser.
+    const edit = lib.rules.find((rule) => rule.id === "P1-c").edits[0];
+    edit.template = edit.template.replace("{timeoutMs:<timeout>})", "{timeoutMs:<timeout>");
+  });
+  assert.throws(() => feature.patchTree(dir, { library, mode: "apply" }), /no longer parses/);
+  assert.deepEqual(readTree(dir), before, "the commit loop left a mixed tree");
+  const leftovers = fs.readdirSync(path.join(dir, ".vite/build"))
+    .filter((name) => name.includes(".durable-turns."));
+  assert.deepEqual(leftovers, [], "commit snapshots leaked into the tree");
+});
+

@@ -21,6 +21,19 @@ const T = (name) => "{CAP:" + name + "}";
 const QC = "[" + CB + DQ + "]";
 const Q = (name, literal) => "{NCAP:" + name + "|" + QC + "}" + literal + "{BACK:" + name + "}";
 
+// How many carriers a rule is expected to bind.
+//
+// Today upstream ships the turn-lifecycle logic twice -- once in the
+// main-process chunk, once in the webview chunk -- so the honest number is 2,
+// and a rule that binds only one of them is a half-applied fix of exactly the
+// kind that once shipped green. The value is declared per rule rather than
+// hardcoded in the patcher, so that when upstream really does collapse the
+// duplicate -- or adds a third copy -- the expectation travels with the library
+// as auditable versioned data instead of becoming a false alarm. patch.js uses
+// DEFAULT_EXPECTED_CARRIERS (also 2) for a rule that omits the field.
+const EXPECTED_CARRIERS = 2;
+
+
 // ---- shared fragments -------------------------------------------------------
 
 // if (<role>?.role !== `follower` || <reason> == null) throw <err>;
@@ -108,6 +121,7 @@ const library = {
       id: "P0-a",
       title: "a follower whose stream owner vanished interrupts the turn locally only for an explicit user stop",
       markers: ["__dtMode"],
+      expectedCarriers: EXPECTED_CARRIERS,
       region: {
         // Both the upstream header and this patcher's own output open the
         // region, which is what makes a second apply a byte-identical no-op.
@@ -187,6 +201,7 @@ const library = {
       id: "P0-b",
       title: "the subagent descendant cascade fires only for an explicit user stop",
       markers: ["__dtCascadeUserStopOnly"],
+      expectedCarriers: EXPECTED_CARRIERS,
       region: {
         open: ["async interruptConversation({CAP:conv},{CAP:mode}={LIT:system},{CAP:expected}){B}"],
         // The cascade sits in the finally block of interruptConversation; the
@@ -228,6 +243,7 @@ const library = {
       id: "P1-a",
       title: "the inactive-owner idle TTL and thread cap no longer recycle background conversations",
       markers: [],
+      expectedCarriers: EXPECTED_CARRIERS,
       region: {
         open: [THROTTLE_CONSTANTS, THROTTLE_CONSTANTS_DISABLED],
         // The throttle constants and the log payload that names them both live
@@ -268,6 +284,7 @@ const library = {
       id: "P1-b",
       title: "discarding a cached conversation no longer interrupts an in-progress turn",
       markers: ["__dtNoDiscardKill"],
+      expectedCarriers: EXPECTED_CARRIERS,
       region: {
         open: [DISCARD_HELPER_OPEN, DISCARD_INLINE_OPEN],
         close: DISCARD_CLOSES,
@@ -304,6 +321,7 @@ const library = {
       title: "the discard path never sends thread/stop, so losing a view cannot really stop a durable turn",
       markers: ["__dtDiscardMethod"],
       variantGroup: "discard-method",
+      expectedCarriers: EXPECTED_CARRIERS,
       region: {
         open: [DISCARD_HELPER_OPEN, DISCARD_INLINE_OPEN],
         close: DISCARD_CLOSES,

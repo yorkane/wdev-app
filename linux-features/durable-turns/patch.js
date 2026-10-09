@@ -50,14 +50,43 @@ const {
   BASELINE_SUFFIX: SCRATCH_BASELINE_SUFFIX,
   TEMP_SUFFIX: SCRATCH_TEMP_SUFFIX,
   applyRewrites,
+  containsAllSymbols,
 } = require("./lib/chunks.js");
-const { findCarriers } = require("./lib/locate.js");
+const { findCarriers, listJsFiles } = require("./lib/locate.js");
 const { assertVariantGroup, BOUND, DRIFTED, REMOVED, planCarrier } = require("./lib/plan.js");
 const { assertReversible, patternSegments, templateSegments } = require("./lib/segments.js");
 const { reverseRule } = require("./lib/reverse.js");
 
 const SIGNATURES_PATH = path.join(__dirname, "signatures.json");
 const FEATURE_ID = "durable-turns";
+
+// Rollback snapshots for the commit loop. Distinct from writeCarrier's own
+// baseline/temp scratch names (they sit beside the carrier and must not
+// collide), and the ".durable-turns." infix keeps an interrupted run's
+// leftovers out of the carrier screen.
+const COMMIT_SNAPSHOT_SUFFIX = ".durable-turns.commit-snapshot.js";
+
+// Fallback for a rule that omits expectedCarriers. Upstream ships the turn
+// lifecycle twice (main-process chunk + webview chunk), so a rule that binds
+// only one side is a silent half-apply; the loud failure below is decided
+// against the per-rule declaration in the library, and this default is what
+// keeps an older or hand-edited library honest. Documented in README.md.
+const DEFAULT_EXPECTED_CARRIERS = 2;
+
+// The carrier expectation is library data, not a patcher constant: a rule
+// declares how many carriers it must bind (currently 5 rules x 2 carriers),
+// so when upstream really does collapse the duplicate -- or grows a third
+// copy -- the number is versioned with the signatures instead of becoming a
+// false alarm baked into code. Absent means DEFAULT_EXPECTED_CARRIERS.
+function expectedCarriersOf(rule) {
+  const declared = rule.expectedCarriers;
+  if (declared == null) return DEFAULT_EXPECTED_CARRIERS;
+  if (!Number.isInteger(declared) || declared < 1) {
+    throw new Error("durable-turns: rule " + rule.id + " declares expectedCarriers "
+      + JSON.stringify(declared) + "; it must be a positive integer");
+  }
+  return declared;
+}
 
 // Markers the patch introduces. They double as runtime counters, which makes a
 // suppression observable from the console instead of only inferable from logs.
@@ -83,6 +112,11 @@ function loadLibrary(options = {}) {
     if (typeof rule.id !== "string" || !Array.isArray(rule.edits) || rule.edits.length === 0) {
       throw new Error("durable-turns: rule in " + file + " is malformed");
     }
+    // The carrier expectation is validated at load time, next to the rule it
+    // belongs to: a declared number that is not a positive integer is a data
+    // error, not a drift condition, and must never be quietly floored to the
+    // default (that is how a 0 or "2" turns the half-apply gate back off).
+    expectedCarriersOf(rule);
     for (const edit of rule.edits) {
       // Load-time reversibility check: an edit whose patched side does not
       // retain every identifier the upstream side consumes can never be
@@ -237,6 +271,11 @@ function patchTree(extractedDir, options = {}) {
     changedFiles: [],
     failures: [],
   };
+  // Carriers are planned first and written only after the tree-level audit
+  // below passes, so every failure the planner can see -- an unbound rule, an
+  // ambiguous region, an under-bound carrier count -- is decided before a
+  // single byte moves.
+  const staged = [];
 
   // Zero carriers is the loudest possible drift signal -- upstream rotated one of
   // the four contract symbols or moved the logic out of the scanned directories --
@@ -267,11 +306,26 @@ function patchTree(extractedDir, options = {}) {
     if (planned.failed.length > 0) continue;
     if (planned.rewrites.length === 0) continue;
 
-    if (!dryRun) {
-      writeCarrier(carrier, planned.rewrites, nodeExec);
-      if (bytesDiffer(carrier.filePath, planned.rewrites)) report.changedFiles.push(carrier.relPath);
-    }
+    // Stage, do not commit: every carrier is planned and the tree-level
+    // audit runs first, so a rule that ends up under-bound -- or a syntax
+    // gate that fires on the second carrier -- cannot leave the first
+    // carrier rewritten on disk. Writing here produced a mixed tree that
+    // only self-healed if someone thought to run a revert.
+    staged.push({ carrier, rewrites: planned.rewrites });
   }
+
+  // Half-apply gate. Every rule declares in the library how many carriers it
+  // is expected to bind (expectedCarriers; DEFAULT_EXPECTED_CARRIERS when the
+  // field is absent). Upstream ships the turn lifecycle twice, once per
+  // process side, so a tree where only one side binds -- because the other
+  // side's chunk was renamed out of the symbol screen, moved out of scan.dirs,
+  // or deleted -- reports success in every per-carrier check and is exactly
+  // the silent half-apply ciPolicy required-upstream forbids. The expectation
+  // lives in the library (data, versioned with the signatures) rather than as
+  // a hardcoded carriers >= 2 in the patcher, so that an upstream release
+  // which really does collapse the duplicate is a one-line data change and not
+  // a false build failure.
+  auditCarrierCounts(report, library, extractedDir);
 
   if (!dryRun && report.failures.length > 0) {
     const detail = report.failures.map((failure) => {
@@ -284,7 +338,125 @@ function patchTree(extractedDir, options = {}) {
     throw new Error("durable-turns: refusing to ship a partial patch.\n" + detail);
   }
 
+  // Commit phase. Everything the planner and the carrier audit could decide
+  // was decided without a byte moving; what remains is the write loop itself.
+  // It used to interleave with planning, so a failure on the second carrier
+  // (the syntax gate firing mid-way is the realistic one) left the first
+  // carrier patched and the second pristine -- a mixed tree that only
+  // self-healed if somebody remembered to run a revert. Each write now takes
+  // a snapshot under the .durable-turns. scratch namespace before touching
+  // the carrier, and any commit failure restores every snapshot before
+  // rethrowing, so the tree is all-patched or all-upstream.
+  if (!dryRun) commitStaged(staged, report, nodeExec);
+
   return report;
+}
+
+function commitStaged(staged, report, nodeExec) {
+  const snapshots = [];
+  try {
+    for (const { carrier, rewrites } of staged) {
+      const snapshot = carrier.filePath + COMMIT_SNAPSHOT_SUFFIX;
+      fs.rmSync(snapshot, { force: true });
+      fs.copyFileSync(carrier.filePath, snapshot);
+      snapshots.push({ carrier, snapshot });
+      writeCarrier(carrier, rewrites, nodeExec);
+      if (bytesDiffer(carrier.filePath, rewrites)) report.changedFiles.push(carrier.relPath);
+    }
+  } catch (error) {
+    for (const { carrier, snapshot } of snapshots) {
+      if (fs.existsSync(snapshot)) fs.copyFileSync(snapshot, carrier.filePath);
+    }
+    throw error;
+  } finally {
+    for (const { snapshot } of snapshots) fs.rmSync(snapshot, { force: true });
+  }
+}
+
+// Compares each rule's BOUND carrier count against its declared expectation.
+// Runs in every mode (check, dry-run, apply): a --check that stays green on a
+// half-carrier tree would send the operator to the build to learn what the
+// drift report already knew. The zero-carrier case is already recorded as a
+// (carrier) REMOVED failure above, and this audit repeats it per rule so a
+// rule-level report never reads "0 carriers" as a mystery.
+function auditCarrierCounts(report, library, extractedDir) {
+  report.notes = report.notes ?? [];
+  const boundByRule = new Map();
+  for (const plan of report.plans) {
+    if (plan.status !== BOUND) continue;
+    if (!boundByRule.has(plan.rule)) boundByRule.set(plan.rule, []);
+    boundByRule.get(plan.rule).push(plan.file);
+  }
+  for (const rule of library.rules) {
+    const expected = expectedCarriersOf(rule);
+    const bound = boundByRule.get(rule.id) ?? [];
+    if (bound.length === expected) continue;
+    // Under-binding is only *unexplained* by the per-carrier failures when the
+    // scan itself found fewer carriers than the rule needs: a carrier that was
+    // screened but failed the rule already reports DRIFTED/REMOVED with its
+    // file name and excerpt. A carrier that is not screened at all -- renamed,
+    // moved, or its directory deleted -- produces no plan at all, and without
+    // this audit the tree would look fine.
+    if (bound.length < expected && report.carriers.length < expected) {
+      report.failures.push({
+        rule: rule.id,
+        file: null,
+        status: DRIFTED,
+        reason: "expected " + expected + " carrier(s), bound " + bound.length
+          + " [" + (bound.length === 0 ? "none" : bound.join(", ")) + "]"
+          + "; " + carrierGapNote(extractedDir, library, report.carriers),
+        excerpt: null,
+      });
+    } else if (bound.length > expected) {
+      // Over-binding is diagnosis, not failure: an upstream release that
+      // grows a third copy of the turn lifecycle is legitimate, and the build
+      // must not die on it. The surplus is named in report.notes so --check
+      // and --json leave something to audit.
+      report.notes.push("rule " + rule.id + " bound " + bound.length
+        + " carriers, more than the expected " + expected + ": " + bound.join(", "));
+    }
+  }
+}
+
+// Names the gap in symbols, which is the only way a half-vanished side can be
+// described once its file name is no longer on disk to point at. The carrier
+// contract is the symbol set, so the message recites the contract and the
+// per-directory census: where the contract still holds, and in the case where
+// a scanned directory has stopped producing a carrier, which contract symbols
+// its chunks still hold (a rename of one symbol reads differently from the
+// deletion of the directory, and the operator should not have to guess).
+// This only runs on the failure path, so the census cost is bounded to trees
+// that are already refusing to build.
+function carrierGapNote(extractedDir, library, carriers) {
+  const contract = library.carrierSymbols;
+  const parts = ["carrier contract: every chunk holding " + contract.join(", ")
+    + " must carry the rule"];
+  const carrierSet = new Set(carriers);
+  const census = [];
+  for (const rel of library.scan.dirs) {
+    const abs = path.join(extractedDir, rel);
+    const files = listJsFiles(abs, library.scan.fileSuffix);
+    const inDir = files.map((file) => path.relative(extractedDir, file));
+    const hit = inDir.filter((r) => carrierSet.has(r));
+    census.push(rel + ": " + inDir.length + " chunk(s), " + hit.length + " carrier(s)");
+    if (hit.length === 0 && inDir.length > 0) {
+      // The side that should hold a carrier produced none. Check whether any
+      // of its chunks still speak part of the contract -- that distinguishes
+      // "moved away" from "renamed in place" without naming a single file in
+      // the signature library.
+      const partials = [];
+      for (const file of files) {
+        const held = contract.filter((symbol) => containsAllSymbols(file, [symbol], library.scan));
+        if (held.length > 0 && held.length < contract.length) {
+          partials.push(path.relative(extractedDir, file) + " holds "
+            + held.join(",") + " (missing " + contract.filter((s) => !held.includes(s)).join(",") + ")");
+        }
+      }
+      if (partials.length > 0) parts.push("partial contract chunks in " + rel + ": " + partials.join(" ; "));
+    }
+  }
+  parts.push("census: " + census.join(" | "));
+  return parts.join("; ");
 }
 
 // Re-derives the excerpt for a failed rule so the CLI can print source, without
@@ -333,6 +505,9 @@ function formatReport(report) {
   for (const failure of report.failures) {
     lines.push("  " + failure.status + " " + failure.rule + (failure.file ? " in " + failure.file : "") + ": " + failure.reason);
   }
+  for (const note of report.notes ?? []) {
+    lines.push("  NOTE " + note);
+  }
   return lines.join("\n");
 }
 
@@ -377,6 +552,7 @@ function buildDescriptors(options = {}) {
 
 module.exports = {
   BOUND,
+  DEFAULT_EXPECTED_CARRIERS,
   DRIFTED,
   FEATURE_ID,
   MARKERS,
