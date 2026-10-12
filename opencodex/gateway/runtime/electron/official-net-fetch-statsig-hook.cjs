@@ -19,9 +19,18 @@ const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
   "3903742690": true,
   "505458": true,
   artifacts: true,
-  // 4039078146：官方侧栏「查看活动 / 关闭活动视图」入口门（PIo/NIo 判定）。
-  // 该门缺失时 NIo() 返回 false，PIo() 回落 off，侧栏活动入口整块不渲染。
+  // 4039078146：官方侧栏“查看活动 / 关闭活动视图”入口门；缺失时侧栏活动入口整块不渲染。
   "4039078146": true,
+  // 2026-10-12 A 类前端门（依据 doc/hidden-features-by-conversion-20261012.md）：
+  // 1052186321+580984490 对话内 HTML 卡片提问渲染；3528415127 侧栏固定页签/projectless；
+  // 4157559322/817118786 线程分享/表情；3698563163/2108304519 外部 Agent 配置导入。
+  "1052186321": true,
+  "580984490": true,
+  "3528415127": true,
+  "4157559322": true,
+  "817118786": true,
+  "3698563163": true,
+  "2108304519": true,
 };
 // 官方 bundle 在 authed-route 模块初始化时调用 app-primary 的 side-effect 导出。真实网络下 Statsig
 // 初始化有 100ms+ 往返，天然给官方 side-effect 模块留出注册窗口；若 0ms 返回会抢跑，概率性触发

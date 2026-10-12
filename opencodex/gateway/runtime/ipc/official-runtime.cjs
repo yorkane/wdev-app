@@ -43,6 +43,19 @@ const { hiddenTrayHookStatus, installOfficialTrayHook } = require("../electron/o
 const { installOfficialNetFetchStatsigHook } = require("../electron/official-net-fetch-statsig-hook.cjs");
 const { getSiteConfig, urlPolicy } = require("../core/site-config.cjs");
 const { appendAuditEvent } = require("../core/network-audit.cjs");
+const {
+  fileUrlForPath,
+  isSafeExternalUrl,
+  firstHeader,
+  isViaAuthzGateway,
+  resolveFileOrigin,
+} = require("../core/file-origin.cjs");
+const { isAllowedLocalDownloadPath: allowlistAllowsLocalDownloadPath } = require("../http/local-files.cjs");
+const {
+  isInterceptableOpenFileTarget,
+  isOpenInAppTarget,
+  normalizeOpenFileTarget,
+} = require("./open-file-context.cjs");
 const { createOfficialLiveObserver } = require("./official-live-observer.cjs");
 const {
   gateway: gatewayPointRefs,
@@ -332,8 +345,71 @@ function spawnArgList(args) {
   return Array.isArray(args) ? args.map((item) => String(item)) : [];
 }
 
+/**
+ * 远端浏览器打开的页面里，任何「用桌面外部工具打开」的请求都必须由 gateway 接管：
+ * 服务端既没有文件管理器也没有 Default app，原生执行只会静默失败。
+ * 覆盖的 target 见 open-file-context.cjs 的 INTERCEPTABLE_OPEN_FILE_TARGETS。
+ *
+ * 「远端浏览器」的判据必须同时容纳两种部署形态（见 server.cjs 里 remoteBrowserClient 的算式）：
+ *  - Host 非回环：gateway 直接暴露给浏览器（无 authz 改写）；
+ *  - Host 是回环但带 X-Authz-* 断言头：生产链路里 authz 的 codex->3737 绑定开了 simulate_local，
+ *    它把 Host/X-Forwarded-Host/Origin 全部改写成 127.0.0.1:3737，只看 Host 会把真实浏览器误判成桌面直连，
+ *    拦截永远不生效。authz 断言头是唯一没被改写的浏览器证据。
+ * 真正的桌面端直连（本机 3737，无 authz 头）仍然保持原生行为，不被劫持成浏览器跳转。
+ */
+function isRemoteBrowserStore(store) {
+  if (!store) return false;
+  // server.cjs 已经把两条判据合并成布尔值；没有它时退回旧判据，保持既有调用方与单测可用。
+  if (typeof store.remoteBrowserClient === "boolean") return store.remoteBrowserClient;
+  if (store.isLoopbackBrowserHost === false) return true;
+  return isViaAuthzGateway(store.requestHeaders);
+}
+
 function shouldInterceptRemoteFileManagerStore(store) {
-  return !!store && store.isLoopbackBrowserHost === false && store.openFileTarget === "fileManager";
+  return isRemoteBrowserStore(store) && isInterceptableOpenFileTarget(store.openFileTarget);
+}
+
+// Windows 盘符（C:\）形状上是「协议:」，必须先排除才能按 URL 处理。
+const WINDOWS_DRIVE_PREFIX = /^[a-zA-Z]:[\\/]/;
+
+function schemeOfCandidate(value) {
+  const text = String(value || "");
+  if (WINDOWS_DRIVE_PREFIX.test(text)) return "";
+  const match = text.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function sendOpenUrlToCurrentClient(url, kind, diagnosticSummary = {}) {
+  // 前端契约：codex-web:open-url + { url, kind: "file" | "link" }；前端优先消费这条通道。
+  return sendCurrentClientGatewayEvent(
+    "codex-web:open-url",
+    { url, kind },
+    { kind, urlLength: url.length, ...diagnosticSummary }
+  );
+}
+
+/**
+ * /codex-web-config.js 用的 file 域派生。server.cjs 会把这次请求的 Origin/Host 放进 options，
+ * 这样配置脚本里的 fileBaseUrl 与 IPC 路径上的 open-url 用同一套优先级。
+ * available=false 表示只派生到本机回环兜底，远端浏览器用不上，前端应当自行回退。
+ */
+function fileOriginForWebConfig(options = {}) {
+  const headers =
+    options.requestHeaders && typeof options.requestHeaders === "object" ? options.requestHeaders : {};
+  const resolved = resolveFileOrigin({
+    configured: options.fileOriginConfigured !== undefined
+      ? options.fileOriginConfigured
+      : process.env.CODEX_WEB_FILE_ORIGIN,
+    // 前端自报优先，其次依次读请求头里可能保住浏览器 host 的几个字段。
+    clientOrigin:
+      firstHeader(options.clientOrigin) || firstHeader(headers["x-opencodex-client-origin"]),
+    origin: firstHeader(options.requestOrigin) || firstHeader(headers.origin),
+    referer: firstHeader(headers.referer),
+    forwardedHost: firstHeader(headers["x-forwarded-host"]),
+    host: firstHeader(options.requestHost) || firstHeader(headers.host),
+    fallbackPort: PORT,
+  });
+  return { ...resolved, available: resolved.source !== "fallback" };
 }
 
 function currentRequestStore() {
@@ -376,6 +452,35 @@ function emitRemoteFileDownloadError(reason, filePath) {
   );
 }
 
+/**
+ * 「用外部工具打开」这条链上唯一的文件读总闸。
+ *
+ * 拦截命中后 gateway 会做两件把本机文件交出去的事：①把绝对路径拼成 file 域 URL 下发给浏览器，
+ * ②用 createLocalFileDownload 换回一个能直接流字节的 /api/local-file/<token>。
+ * 两者都必须在同一把尺子下过 allowlist —— 否则已认证的远端页面发一条 open-file IPC
+ * （target=systemDefault + /etc/shadow 之类的路径）就能读到任意本机文件。
+ *
+ * 判据复用 HTTP 侧既有的 localFiles.isAllowedLocalDownloadPath（workspace roots + 已授权临时目录），
+ * 优先用 store 上注入的那一份：service 实例持有 launcher 注册的动态 workspace roots，
+ * 模块级导出的那一份只看得到环境变量，两处口径必须一致，所以注入缺失时才退化到模块级。
+ */
+function isRemoteOpenPathAllowed(normalizedPath, store) {
+  // 判据本身出错时按「不允许」处理：这条链上默认放行等于开闸，注入进来的实现同样不可信。
+  try {
+    if (store && typeof store.isAllowedLocalDownloadPath === "function") {
+      return Boolean(store.isAllowedLocalDownloadPath(normalizedPath));
+    }
+    return Boolean(allowlistAllowsLocalDownloadPath(normalizedPath, workspaceRootsFromEnv()));
+  } catch (error) {
+    diagnosticWarn("official-runtime", "remote_file_open_allowlist_failed", {
+      error: error instanceof Error ? error.message : String(error),
+      clientId: shortId((store && store.clientId) || ""),
+      fileName: path.basename(normalizedPath),
+    });
+    return false;
+  }
+}
+
 function createSuccessfulSpawnStub() {
   const child = new EventEmitter();
   child.stdin = null;
@@ -396,9 +501,13 @@ function fileManagerPathFromSpawn(command, normalizedArgs) {
   const commandName = path.basename(String(command || "")).toLowerCase();
   const args = Array.isArray(normalizedArgs) ? normalizedArgs.map((item) => String(item)) : [];
   if (!commandName || args.length === 0) return "";
+  // macOS 的 fileManager 用 `open -R <path>` 定位，Default app 用 `open <path|url>`；
+  // 后者只有单个非旗标参数时才认定它是打开目标，多参数（如 open -a App file）不猜测语义。
   if (commandName === "open") {
     const revealIndex = args.indexOf("-R");
-    return revealIndex >= 0 ? args[revealIndex + 1] || "" : "";
+    if (revealIndex >= 0) return args[revealIndex + 1] || "";
+    const targets = args.filter((item) => item && !item.startsWith("-"));
+    return targets.length === 1 ? targets[0] : "";
   }
   if (
     commandName === "xdg-open" ||
@@ -411,16 +520,49 @@ function fileManagerPathFromSpawn(command, normalizedArgs) {
   return "";
 }
 
-function maybeInterceptRemoteFileManagerOpen(filePath) {
+/**
+ * 远端浏览器打开本机文件失败时的统一反馈：前端已有降级链（popup 被拦→当前标签+可关提示条；
+ * 派生不出→rejected toast），服务端这一侧绝不能哑火，否则用户「点了没反应」。
+ * reason 走既有 codex-web:download-file-error 通道，形状与 emitRemoteFileDownloadError 一致。
+ */
+function reportRemoteOpenFailure(reason, filePath, store, extra = {}) {
+  diagnosticWarn("official-runtime", "remote_file_open_denied", {
+    reason,
+    clientId: shortId((store && store.clientId) || ""),
+    target: (store && store.openFileTarget) || "",
+    fileName: filePath ? path.basename(filePath) : "",
+    ...extra,
+  });
+  return emitRemoteFileDownloadError(reason, filePath);
+}
+
+/**
+ * 远端浏览器请求「用外部工具打开」时的统一转发入口，候选可能是本地路径，也可能是 URL
+ * （Default app 打开链接就是 xdg-open https://… 这样的 spawn）。
+ * 返回 true 表示已接管、原生动作必须被吞掉；false 表示这次不属于远端场景，原样放行。
+ */
+function maybeInterceptRemoteFileManagerOpen(candidate) {
   const store = currentRequestStore();
   if (!shouldInterceptRemoteFileManagerStore(store)) return false;
   recordRuntimeCompatibilityHit(gatewayPointRefs.remoteFileManager);
   recordRuntimeCompatibilityHit(gatewayPointRefs.shellOpen);
-  const normalizedPath = typeof filePath === "string" ? filePath : String(filePath || "");
-  if (!normalizedPath) {
+  const normalizedCandidate = typeof candidate === "string" ? candidate : String(candidate || "");
+  if (!normalizedCandidate) {
     emitRemoteFileDownloadError("empty_path", "");
     return true;
   }
+  // URL 型候选（Default app 打开链接）只走 open-url；本地路径走 file 域 + 兼容下载通道。
+  if (isHttpUrlCandidate(normalizedCandidate)) return interceptRemoteOpenUrl(normalizedCandidate, store);
+  if (isUnsafeOpenScheme(normalizedCandidate)) {
+    // 服务端 exec 这些协议没有任何意义，且会被前端误当成本地文件；拦截后只记日志。
+    diagnosticWarn("official-runtime", "remote_open_url_scheme_dropped", {
+      scheme: schemeOfCandidate(normalizedCandidate),
+      clientId: shortId(store.clientId || ""),
+      target: store.openFileTarget || "",
+    });
+    return true;
+  }
+  const normalizedPath = normalizedCandidate;
   try {
     const stats = fs.statSync(normalizedPath);
     if (!stats.isFile()) {
@@ -431,6 +573,15 @@ function maybeInterceptRemoteFileManagerOpen(filePath) {
     emitRemoteFileDownloadError("not_found", normalizedPath);
     return true;
   }
+  // 总闸：路径不在 workspace roots / 已授权临时目录内时，既不下发 file 域 URL，也不建 token。
+  // 必须放在 sendRemoteFileOpenUrl 与 createLocalFileDownload 之前 —— 两条外泄路径一起关。
+  if (!isRemoteOpenPathAllowed(normalizedPath, store)) {
+    reportRemoteOpenFailure("path_not_allowed", normalizedPath, store);
+    return true;
+  }
+  // 新通道：优先让前端在 file- 域里 web 打开（可渲染 md、可拖动播放视频）。
+  sendRemoteFileOpenUrl(normalizedPath, store);
+  // 旧通道：download-file 语义原样保留，供未升级前端与「确实想下载」的场景使用。
   if (typeof store.createLocalFileDownload !== "function") {
     emitRemoteFileDownloadError("download_unavailable", normalizedPath);
     return true;
@@ -454,6 +605,184 @@ function maybeInterceptRemoteFileManagerOpen(filePath) {
     emitRemoteFileDownloadError("download_failed", normalizedPath);
   }
   return true;
+}
+
+function isHttpUrlCandidate(value) {
+  const scheme = schemeOfCandidate(value);
+  return scheme === "http" || scheme === "https";
+}
+
+function isUnsafeOpenScheme(value) {
+  const scheme = schemeOfCandidate(value);
+  // 空 scheme＝本地路径；file 由 fileUrlForPath 归一化处理，不属于危险协议。
+  if (!scheme || scheme === "file" || scheme === "http" || scheme === "https") return false;
+  return true;
+}
+
+/**
+ * 把本地路径转发成 file- 域 URL；派生退化到本机回环时不发事件（远端浏览器打不开）。
+ *
+ * 这里是所有「本机路径 → 浏览器」出口的汇合点（open-file 拦截、openExternal、编辑器降级），
+ * 因此文件读总闸也放在这一层：任何调用方都不能绕过 allowlist 把绝对路径拼进 file 域 URL。
+ *
+ * options.reportFailure：本函数没有其它可用通道时（openExternal / 编辑器降级）由它给前端一个
+ * 失败 toast；maybeInterceptRemoteFileManagerOpen 不调这个开关，因为它随后还会发 download-file，
+ * 那时用户已经拿到了能用的下载，再叠一条失败提示只会变成误导噪音。
+ */
+function sendRemoteFileOpenUrl(filePath, store, options = {}) {
+  const normalizedPath = String(filePath || "");
+  if (!isRemoteOpenPathAllowed(normalizedPath, store)) {
+    if (options.reportFailure) reportRemoteOpenFailure("path_not_allowed", normalizedPath, store);
+    return false;
+  }
+  const resolved = resolveFileOrigin({
+    configured: process.env.CODEX_WEB_FILE_ORIGIN,
+    // server.cjs 正常路径会把完整请求头放进 store；这里同步复算一次，保证单测与旁路入口口径一致。
+    clientOrigin: store && store.clientOrigin,
+    origin: store && store.browserOrigin,
+    referer: store && store.requestHeaders && firstHeader(store.requestHeaders.referer),
+    forwardedHost: store && store.requestHeaders && firstHeader(store.requestHeaders["x-forwarded-host"]),
+    host: store && (store.browserHost || store.browserHostname),
+    fallbackPort: PORT,
+  });
+  // server.cjs 已经按请求头算过一次；store 里的值优先，避免两处口径漂移。
+  const explicit = store && typeof store.fileOrigin === "string" ? store.fileOrigin.trim() : "";
+  const origin = explicit || resolved.origin;
+  const source = explicit ? store.fileOriginSource || "request" : resolved.source;
+  const url = fileUrlForPath(origin, filePath);
+  if (!url) {
+    if (options.reportFailure) reportRemoteOpenFailure("unsafe_path", filePath, store, { fileOriginSource: source });
+    else {
+      diagnosticWarn("official-runtime", "remote_file_open_url_unavailable", {
+        fileName: path.basename(filePath),
+        fileOriginSource: source,
+        reason: "unsafe_path",
+      });
+    }
+    return false;
+  }
+  if (source === "fallback") {
+    // 拿不到公网/内网 codex 域时不发 open-url，避免把 127.0.0.1 塞进远端浏览器新标签。
+    diagnosticLog("official-runtime", "remote_file_open_url_skipped", {
+      fileName: path.basename(filePath),
+      fileOriginSource: source,
+    });
+    // 退化到本机回环对远端浏览器等于「点了没反应」，必须给前端一个可展示的失败入口。
+    if (options.reportFailure) emitRemoteFileDownloadError("file_origin_unavailable", filePath);
+    return false;
+  }
+  const delivered = sendOpenUrlToCurrentClient(url, "file", {
+    fileName: path.basename(filePath),
+    fileOriginSource: source,
+    remoteBrowserHost: store && store.browserHostname ? store.browserHostname : "",
+  });
+  if (delivered) {
+    diagnosticLog("official-runtime", "remote_file_open_url_forwarded", {
+      clientId: shortId((store && store.clientId) || ""),
+      fileName: path.basename(filePath),
+      fileOriginSource: source,
+    });
+  } else if (options.reportFailure) {
+    // ws 推送失败（连接已断、clientId 过期）同样是静默失败场景，交给前端 toast。
+    emitRemoteFileDownloadError("open_url_undelivered", filePath);
+  }
+  return delivered;
+}
+
+/** 远端浏览器请求打开 http(s) 链接：交给前端新标签，绝不在服务端起浏览器。 */
+function interceptRemoteOpenUrl(url, store) {
+  if (!isSafeExternalUrl(url)) {
+    diagnosticWarn("official-runtime", "remote_open_url_rejected", {
+      scheme: schemeOfCandidate(url),
+      urlLength: url.length,
+      clientId: shortId((store && store.clientId) || ""),
+    });
+    return true;
+  }
+  const delivered = sendOpenUrlToCurrentClient(url, "link", {
+    remoteBrowserHost: store && store.browserHostname ? store.browserHostname : "",
+  });
+  diagnosticLog("official-runtime", "remote_open_url_link_forwarded", {
+    clientId: shortId((store && store.clientId) || ""),
+    delivered,
+    urlLength: url.length,
+  });
+  return true;
+}
+
+/**
+ * server.cjs 的 openExternal / openFile 出口：桌面端会在服务端拉起外部程序，
+ * Web 端必须改成浏览器新标签。非 loopback 才接管，直连 3737 的桌面端保持原生。
+ */
+function openExternalForCurrentClient(target) {
+  const store = currentRequestStore();
+  // 与 shouldInterceptRemoteFileManagerStore 同一判据：只有确认是远端浏览器才接管。
+  if (!isRemoteBrowserStore(store)) return false;
+  const value = typeof target === "string" ? target : String(target || "");
+  if (!value) return false;
+  recordRuntimeCompatibilityHit(gatewayPointRefs.remoteFileManager);
+  if (isHttpUrlCandidate(value)) return interceptRemoteOpenUrl(value, store);
+  if (isUnsafeOpenScheme(value)) {
+    diagnosticWarn("official-runtime", "remote_open_url_scheme_dropped", {
+      scheme: schemeOfCandidate(value),
+      clientId: shortId(store.clientId || ""),
+    });
+    return true;
+  }
+  // 本地路径交给 file 域（含 allowlist 总闸）。无论转发成败都返回 true：这条链已被 isRemoteBrowserStore
+  // 确认为远端浏览器，服务端本身不可能打开系统应用，返回 false 会让官方原生 shell.openExternal
+  // 在服务器上真的去拉起 xdg-open。失败反馈由 reportFailure 补发，绝不让用户点了没反应。
+  sendRemoteFileOpenUrl(value, store, { reportFailure: true });
+  return true;
+}
+
+/**
+ * server.cjs 注入给官方 runtime 的 openFile 出口：桌面端会打开系统应用，
+ * Web 端改成短期 token 的浏览器预览链接（createLocalFilePreview → /api/local-file/<token>）。
+ *
+ * 这条出口与「拦截总闸」是同一个漏洞的两半：createLocalFilePreview 建出来的 token 同样能被
+ * serveLocalFile 直接流回任意本机字节，因此建 token 之前必须过 isRemoteOpenPathAllowed 这同一把尺子。
+ * 判据只有一份实现（本函数与 maybeInterceptRemoteFileManagerOpen / sendRemoteFileOpenUrl 共用），
+ * 出现第二份实现就是这个洞复发的原因 —— 两侧口径漂移等于留了一条绕过 allowlist 的建 token 通道。
+ *
+ * 返回形状沿用 createLocalFilePreview（{opened, name, url, downloadUrl, expiresAtMs}），
+ * 被拒时 opened=false 并按既有 codex-web:download-file-error 通道给前端一条可展示的失败原因，
+ * 绝不静默返回（否则用户「点了没反应」）。
+ */
+function createRemoteFilePreviewForCurrentClient(filePath) {
+  const store = currentRequestStore();
+  const value = typeof filePath === "string" ? filePath : String(filePath || "");
+  const fileName = value ? path.basename(value) : "";
+  if (!value) {
+    emitRemoteFileDownloadError("empty_path", "");
+    return { opened: false, name: "", reason: "empty_path" };
+  }
+  // 总闸：不在 workspace roots / 已授权临时目录内的路径，一个 token 都不许建。
+  // 判据自身抛错时按「不允许」处理（fail-closed），逻辑集中在 isRemoteOpenPathAllowed 一处。
+  if (!isRemoteOpenPathAllowed(value, store)) {
+    reportRemoteOpenFailure("path_not_allowed", value, store, { exit: "openFile" });
+    return { opened: false, name: fileName, reason: "path_not_allowed" };
+  }
+  if (typeof store.makeLocalFilePreview !== "function") {
+    emitRemoteFileDownloadError("preview_unavailable", value);
+    return { opened: false, name: fileName, reason: "preview_unavailable" };
+  }
+  try {
+    const preview = store.makeLocalFilePreview(value);
+    diagnosticLog("official-runtime", "remote_file_preview_issued", {
+      clientId: shortId(store.clientId || ""),
+      fileName,
+      remoteBrowserHost: store.browserHostname || "",
+    });
+    return preview;
+  } catch (error) {
+    diagnosticWarn("official-runtime", "remote_file_preview_failed", {
+      error: error instanceof Error ? error.message : String(error),
+      fileName,
+    });
+    emitRemoteFileDownloadError("preview_failed", value);
+    return { opened: false, name: fileName, reason: "preview_failed" };
+  }
 }
 
 function execFileOptionsFromArgs(args, options) {
@@ -550,6 +879,98 @@ function decorateHiddenAppServerChild(child) {
   }
 }
 
+// 编辑器/终端目标 id -> 官方可能 spawn 的可执行文件名（归一化：去掉 .exe/.cmd、只留字母数字、小写）。
+// 只用于「确认这次 spawn 就是本次 open-in 动作」的保守匹配；不在表里的目标不猜语义，放行走原生实现。
+const OPEN_IN_APP_BINARY_ALIASES = Object.freeze({
+  vscode: ["code", "codium"],
+  vscodeinsiders: ["codeinsiders"],
+  cursor: ["cursor"],
+  windsurf: ["windsurf", "code"],
+  zed: ["zed"],
+  sublimetext: ["subl", "sublimetext"],
+  atom: ["atom"],
+  githubdesktop: ["githubdesktop"],
+  visualstudio: ["devenv"],
+  webstorm: ["webstorm"],
+  pycharm: ["pycharm"],
+  phpstorm: ["phpstorm"],
+  intellij: ["idea", "intellij"],
+  goland: ["goland"],
+  rider: ["rider"],
+  rustrover: ["rustrover"],
+  androidstudio: ["androidstudio"],
+  terminal: ["xterm", "gnometerminalsystemterminal", "kitty", "alacritty", "st"],
+  iterm: ["iterm", "iterm2"],
+  warp: ["warp"],
+  cmder: ["cmder"],
+  gitbash: ["bash", "gitbash"],
+  wsl: ["wsl", "wsl.exe"],
+  windowsterminal: ["wt", "wt.exe", "windowsterminal"],
+});
+
+function normalizeBinaryName(value) {
+  const base = path.basename(String(value || "")).toLowerCase();
+  return base.replace(/\.(exe|cmd|bat)$/, "").replace(/[^a-z0-9]/g, "");
+}
+
+function openInAppSpawnLooksLikeTarget(command, normalizedArgs, target) {
+  const aliases = OPEN_IN_APP_BINARY_ALIASES[target] || [];
+  const commandName = normalizeBinaryName(command);
+  if (commandName === target.replace(/[^a-z0-9]/g, "")) return true;
+  if (aliases.includes(commandName)) return true;
+  // 官方也可能通过 wrapper 拉起（如 `flatpak run com.jetbrains.WebStorm`），
+  // 官方也可能通过 wrapper 拉起（如 `flatpak run com.jetbrains.WebStorm`）：这时目标 id 出现在
+  // 参数里，且常写成反向 DNS。取最后一个点号分段再比一次，仍只在明确的 wrapper 命令下生效。
+  if (commandName === "flatpak" || commandName === "xdgsettings" || commandName === "gio") {
+    const wanted = target.replace(/[^a-z0-9]/g, "");
+    return (Array.isArray(normalizedArgs) ? normalizedArgs : []).some((item) => {
+      const base = String(item || "").toLowerCase().split(".").pop();
+      return normalizeBinaryName(base) === wanted;
+    });
+  }
+  return false;
+}
+
+/**
+ * 远端浏览器请求「在编辑器/终端里打开」时吞掉服务端 spawn。
+ * 判据同时要求：确认是远端浏览器、openFileTarget 属于编辑器/终端族、且这次 spawn 的可执行文件
+ * 与该目标对得上。任一不满足都放行，避免误伤 app-server 之外的正常子进程。
+ */
+function shouldSuppressRemoteOpenInAppSpawn(normalizedArgs, command) {
+  const store = currentRequestStore();
+  if (!isRemoteBrowserStore(store)) return false;
+  const target = normalizeOpenFileTarget(store.openFileTarget);
+  if (!isOpenInAppTarget(target)) return false;
+  if (!openInAppSpawnLooksLikeTarget(command, normalizedArgs, target)) return false;
+  recordRuntimeCompatibilityHit(gatewayPointRefs.remoteFileManager);
+  recordRuntimeCompatibilityHit(gatewayPointRefs.shellOpen);
+  const firstTarget = (Array.isArray(normalizedArgs) ? normalizedArgs : []).find(
+    (item) => item && !item.startsWith("-") && item !== command
+  );
+  if (firstTarget) sendRemoteOpenInAppFallback(firstTarget, store);
+  diagnosticLog("official-runtime", "remote_open_in_app_spawn_suppressed", {
+    clientId: shortId(store.clientId || ""),
+    target,
+    command: path.basename(String(command || "")),
+  });
+  return true;
+}
+
+/** 编辑器打不开时至少让远端浏览器看到文件本身；目录等打不开的目标给前端一个失败入口。 */
+function sendRemoteOpenInAppFallback(candidate, store) {
+  const value = String(candidate || "");
+  if (!value) return false;
+  if (isHttpUrlCandidate(value)) return interceptRemoteOpenUrl(value, store);
+  if (isUnsafeOpenScheme(value)) return false;
+  try {
+    if (!fs.statSync(value).isFile()) return false;
+  } catch {
+    return false;
+  }
+  // 编辑器/终端降级：这是本次点击唯一的出口，被总闸拒绝时也要给前端一个失败提示。
+  return sendRemoteFileOpenUrl(value, store, { reportFailure: true });
+}
+
 function redirectHiddenAppServerSpawn(originalSpawn, bundle, self, command, args, options, rawArguments) {
   const spawnOptions = spawnOptionsFromArgs(args, options);
   const normalizedArgs = spawnArgList(args);
@@ -559,6 +980,10 @@ function redirectHiddenAppServerSpawn(originalSpawn, bundle, self, command, args
   }
   const fileManagerPath = fileManagerPathFromSpawn(command, normalizedArgs);
   if (fileManagerPath && maybeInterceptRemoteFileManagerOpen(fileManagerPath)) {
+    return createSuccessfulSpawnStub();
+  }
+  // 编辑器/终端 open-in：远端浏览器触发时服务端绝不能真的拉起程序（官方会 spawn code/iterm 等）。
+  if (shouldSuppressRemoteOpenInAppSpawn(normalizedArgs, command)) {
     return createSuccessfulSpawnStub();
   }
   return originalSpawn.apply(self, rawArguments);
@@ -1408,6 +1833,16 @@ function installRemoteFileManagerOpenHooks() {
       return originalOpenPath(targetPath);
     };
   }
+  if (typeof shell.openExternal === "function") {
+    const originalOpenExternal = shell.openExternal.bind(shell);
+    shell.openExternal = function patchedOpenExternal(url) {
+      // 服务端没有浏览器：远端浏览器触发的 openExternal 一律转成前端新标签。
+      // 判据只用 isLoopbackBrowserHost===false（比文件类闸门更宽），因为点链接时
+      // openFileTarget 是空的；直连 3737 的桌面端与非请求上下文仍走原生实现。
+      if (openExternalForCurrentClient(String(url || ""))) return Promise.resolve(true);
+      return originalOpenExternal(url);
+    };
+  }
 }
 
 function payloadFromArgs(args) {
@@ -1828,8 +2263,18 @@ const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
   "3903742690": true,
   "505458": true,
   artifacts: true,
-  // 4039078146：官方侧栏「查看活动 / 关闭活动视图」入口门；缺失时侧栏活动入口整块不渲染。
+  // 4039078146：官方侧栏“查看活动 / 关闭活动视图”入口门；缺失时侧栏活动入口整块不渲染。
   "4039078146": true,
+  // 2026-10-12 A 类前端门（依据 doc/hidden-features-by-conversion-20261012.md）：
+  // 1052186321+580984490 对话内 HTML 卡片提问渲染；3528415127 侧栏固定页签/projectless；
+  // 4157559322/817118786 线程分享/表情；3698563163/2108304519 外部 Agent 配置导入。
+  "1052186321": true,
+  "580984490": true,
+  "3528415127": true,
+  "4157559322": true,
+  "817118786": true,
+  "3698563163": true,
+  "2108304519": true,
 };
 
 // 构造与 polyfill.buildStatsigInitializeResponse 同形状的合法初始化响应，供无出口环境下本地兜底。
@@ -3117,10 +3562,17 @@ async function webConfigScript(options = {}) {
     options.gatewayPluginConfig && typeof options.gatewayPluginConfig === "object"
       ? options.gatewayPluginConfig
       : null;
+  // fileBaseUrl 让前端能本地拼出 file- 域 URL（不用每个文件都等一次 ws 事件）。
+  // 派生只用请求头（Origin/Host）与 CODEX_WEB_FILE_ORIGIN，不读 requestContext store。
+  const fileOriginResolution = fileOriginForWebConfig(options);
   return `(() => {
   window.__CODEX_WEB_CONFIG__ = {
     gatewayBaseUrl: location.origin,
     gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
+    // fileBaseUrl 是 authz 文件直取域；空串表示当前请求派生不出浏览器可用的 file 域，前端自行退化。
+    fileBaseUrl: ${JSON.stringify(fileOriginResolution.available ? fileOriginResolution.origin : "")},
+    // 派生命中层级（configured/origin/host），供前端与诊断页解释这个域名从哪来。
+    fileBaseUrlSource: ${JSON.stringify(fileOriginResolution.available ? fileOriginResolution.source : "")},
     workspaceRoots: ${JSON.stringify(workspaceRootsFromEnv())},
     homeDir: ${JSON.stringify(os.homedir())},
     // brand.name 是界面上要展示的品牌名；network 是允许拦截的出站域名清单。
@@ -3294,11 +3746,13 @@ function listOfficialIpcChannels() {
 module.exports = {
   buildGatewayStatus,
   createOfficialAppHostRelay,
+  createRemoteFilePreviewForCurrentClient,
   getI18nSnapshot,
   getOfficialBundle,
   handleOfficialNotificationEvent,
   invokeOfficialIpc,
   listOfficialIpcChannels,
+  openExternalForCurrentClient,
   rejectPendingInternalResponses,
   requestContext,
   setWsHub,
@@ -3309,6 +3763,14 @@ module.exports = {
     configureOfficialWebContentsListenerBudget,
     deliverOfficialAppHostMessage,
     fileManagerPathFromSpawn,
+    isHttpUrlCandidate,
+    isUnsafeOpenScheme,
+    maybeInterceptRemoteFileManagerOpen,
+    openInAppSpawnLooksLikeTarget,
+    shouldSuppressRemoteOpenInAppSpawn,
+    schemeOfCandidate,
+    sendRemoteFileOpenUrl,
+    fileOriginForWebConfig,
     normalizeInitialSidebarBootstrap,
     OfficialChunkedMessageReceiver,
     officialDesktopIpcSocketPaths,

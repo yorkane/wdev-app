@@ -164,7 +164,7 @@ test("statsig: initialize payload has the full legal shape and the official gate
     assert.deepEqual(body.feature_gates[name].secondary_exposures, []);
   }
   const dyn = body.dynamic_configs["statsig_default_enable_features"].value;
-  assert.deepEqual(dyn, { "3903742690": true, "505458": true, artifacts: true, "4039078146": true });
+  assert.deepEqual(dyn, { "3903742690": true, "505458": true, artifacts: true, "4039078146": true, "1052186321": true, "580984490": true, "3528415127": true, "4157559322": true, "817118786": true, "3698563163": true, "2108304519": true });
   // i18n layer 72216192.
   assert.deepEqual(body.layer_configs["72216192"].value, { enable_i18n: true, locale_source: "IDE" });
   assert.deepEqual(body.param_stores, {});

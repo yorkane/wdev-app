@@ -249,7 +249,23 @@
       result.set("authorization", `Bearer ${token}`);
       result.set("x-codex-web-token", token);
     }
+    // 页面 origin 自报：authz simulate_local 与边缘改写会把 Host / Origin 变成回环地址，
+    // 只有浏览器知道用户地址栏里的主机名；gateway 据此派生 file 域（域名白名单在服务端）。
+    const originReport = clientOriginReport();
+    if (originReport) result.set("x-opencodex-client-origin", originReport);
     return result;
+  }
+
+  /** 归一化并自检页面 origin；不像合法 http(s) origin 就报空，由服务端逐级回退。 */
+  function clientOriginReport() {
+    try {
+      const raw = String((w.location && w.location.origin) || "").trim();
+      // sandbox iframe / file:// 页面的 origin 是字面量 null，没有信息量也不该上报。
+      if (!raw || raw === "null" || raw.length > 128) return "";
+      return /^https?:\/\//i.test(raw) ? raw : "";
+    } catch {
+      return "";
+    }
   }
 
   function gatewayWebSocketUrl() {
@@ -486,9 +502,19 @@
     // 官方新会话的“新工作树”入口由该门控制；Web 本地快照必须保留桌面端已有能力。
     "505458": true,
     artifacts: true,
-    // 官方侧栏「查看活动 / 关闭活动视图」入口由该门控制；缺失时侧栏活动入口整块不渲染。
+    // 官方侧栏“查看活动 / 关闭活动视图”入口由该门控制；缺失时侧栏活动入口整块不渲染。
     "4039078146": true,
-  };
+    // 2026-10-12 A 类前端门（依据 doc/hidden-features-by-conversion-20261012.md）：
+    // 1052186321+580984490 对话内 HTML 卡片提问渲染；3528415127 侧栏固定页签/projectless；
+    // 4157559322/817118786 线程分享/表情；3698563163/2108304519 外部 Agent 配置导入。
+    "1052186321": true,
+    "580984490": true,
+    "3528415127": true,
+    "4157559322": true,
+    "817118786": true,
+    "3698563163": true,
+    "2108304519": true,
+};
   const clientId =
     w.__OpenCodexCurrentProviderScope?.clientId ||
     w.crypto?.randomUUID?.() ||
@@ -2768,7 +2794,14 @@
      * gateway 已以 args 作为权威入参；再附带 payload 会让消息、附件元数据等单参数对象在请求 JSON 中复制一遍。
      * 服务端仍保留 payload-only 解析用于兼容旧页面，但当前页面只发送一份，避免额外序列化与网络流量。
      */
-    const body = stringifyForIpc({ channel, args: ipcArgs, clientId });
+    // clientOrigin 随每个 IPC 上报：HTTP 落在 POST body 顶层，WS 因为整段 body 被嵌进
+    // message.request，同一份字段自动出现在 WS 帧里。gateway 靠它派生 file 域并校验白名单。
+    const body = stringifyForIpc({
+      channel,
+      args: ipcArgs,
+      clientId,
+      clientOrigin: clientOriginReport(),
+    });
     const retryDelays = shouldRetryGatewayInvoke(channel, payload) ? [0, 80, 250] : [0];
     let res = null;
     let json = null;
@@ -2971,9 +3004,33 @@
     return enqueueTerminalInvoke(sessionId, payload);
   }
 
+  /** open-url 能力由 remote-file-actions provider 提供；bridge 可能先加载，必须延迟读取。 */
+  function openUrlBridge() {
+    const mod = w.__codexWebOpenUrl;
+    return mod && typeof mod.openExternalUrl === "function" ? mod : null;
+  }
+
+  /**
+   * 把「在 Default app / Filemanager 中打开」交给 open-url 通道（file 域 / link 新标签）。
+   * 返回 false 表示通道不可用或不认识这个目标，调用方退回原来的裸 window.open。
+   */
+  function routeExternalOpen(url) {
+    const mod = openUrlBridge();
+    if (!mod) return false;
+    try {
+      return mod.openExternalUrl(url) === true;
+    } catch (error) {
+      console.warn("[codex-web] open-url channel unavailable, falling back to window.open", error);
+      return false;
+    }
+  }
+
   /** Electron shell.openExternal 的浏览器实现。 */
   function openExternal(url) {
     modificationEffects?.externalOpen?.emit();
+    // 浏览器里没有 Default app / Filemanager：http/https 与本机路径统一交给 open-url 通道，
+    // 由它做协议校验、file 域改写与新标签打开；通道缺席时才退回裸 window.open。
+    if (routeExternalOpen(url)) return true;
     const newWindow = w.open(url, "_blank", "noopener,noreferrer");
     if (newWindow) return true;
     return true;
