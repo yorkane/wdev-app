@@ -1508,3 +1508,92 @@ test("launcher restore preserves either scan setting and skips only its restart"
     assert.equal(context.skipNextOfficialScan, false);
   }
 });
+test("runtime optimizer patches the 26.1007 notch-guarded restore and positive mac-push layout", async (t) => {
+  const bundleDir = temporaryDirectory(t);
+  const mainPath = path.join(bundleDir, ".vite", "build", "main-26-1007.js");
+  writeFile(
+    mainPath,
+    "var Overlay=class{logger=f.i(`avatar-overlay`);supportsInputShape=b.isInputShapeSupported();" +
+      "async restoreOpenState(e){(this.isNotchEnabled||this.visibilityMode!==`on-demand`&&this.globalState.get(`electron-avatar-overlay-open`)===!0)&&await this.open(e)}" +
+      "async prewarm(e){if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;await this.ensureWindow(e)}" +
+      "async ensureWindow(e){if(this.isAppQuitting)return null;return this.createWindow(e)}}" +
+      "const register=()=>{process.platform===`darwin`&&C===p.t.Prod&&nue({appServerClient:_e}).catch(e=>f.n().warning(`Failed to register macOS push notifications`,{sensitive:{error:e}}))};"
+  );
+  const compatibilityService = createCompatibilityService();
+  const optimizer = new OfficialRuntimeOptimizer({
+    fileSystem: new OfficialBundleFileSystem(),
+    compatibilityService,
+  });
+  try {
+    // 26.1007 的 restore 带 notch 守卫并整体括号化，mac-push 守卫极性翻转为正向 && 链；两个点都必须识别并打上隐藏运行时守卫。
+    assert.deepEqual(optimizer.optimize(bundleDir), {
+      nativePetComposition: "gateway-css-fallback",
+      nativePetPrewarm: "gateway-lazy",
+      macPushRegistration: "gateway-disabled",
+      patchedFileCount: 1,
+      unsupportedFiles: [],
+    });
+    const optimized = fs.readFileSync(mainPath, "utf8");
+    assert.match(
+      optimized,
+      /async restoreOpenState\(e\)\{process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&\(this\.isNotchEnabled\|\|this\.visibilityMode!==`on-demand`&&this\.globalState\.get\(`electron-avatar-overlay-open`\)===!0\)&&await this\.open\(e\)\}/
+    );
+    assert.match(
+      optimized,
+      /process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&process\.platform===`darwin`&&C===p\.t\.Prod&&nue\(\{appServerClient:_e\}\)/
+    );
+    for (const pointId of [
+      "static.cache.main.native-pet.factory",
+      "static.cache.main.native-pet.prewarm",
+      "static.cache.main.native-pet.restore",
+      staticMainPoints.macosPushRegistration.id,
+    ]) {
+      assert.equal(compatibilityService.registry.point(pointId).status, "healthy");
+    }
+    // 运行语义：隐藏运行时不恢复宠物、不注册推送；正常运行时保持官方行为。
+    const method = optimized.slice(optimized.indexOf("async restoreOpenState"), optimized.indexOf("async prewarm"));
+    const runRestore = (hidden, notchEnabled, visibility, globalOpen) => {
+      let opened = 0;
+      const self = {
+        isNotchEnabled: notchEnabled,
+        visibilityMode: visibility,
+        globalState: { get: () => globalOpen },
+        open: async () => { opened += 1; },
+      };
+      const fn = new Function("process", `return {${method}}.restoreOpenState;`)({
+        env: { OPENCODEX_GATEWAY_HIDDEN_RUNTIME: hidden },
+      });
+      return fn.call(self, 0).then(() => opened);
+    };
+    assert.equal(await runRestore("1", true, "always", true), 0);
+    assert.equal(await runRestore("0", true, "always", false), 1);
+    assert.equal(await runRestore("0", false, "on-demand", true), 0);
+    assert.equal(await runRestore("0", false, "always", false), 0);
+    const pushStart = optimized.indexOf("const register=");
+    const pushSource = optimized.slice(pushStart, optimized.indexOf("};", pushStart) + 2);
+    const runPush = (platform, hidden, flavor) => {
+      let calls = 0;
+      const register = new Function("process", "C", "p", "nue", "_e", `${pushSource};return register;`)(
+        { platform, env: { OPENCODEX_GATEWAY_HIDDEN_RUNTIME: hidden } },
+        flavor,
+        { t: { Prod: "prod" } },
+        () => { calls += 1; return Promise.resolve(); },
+        {},
+      );
+      register();
+      return calls;
+    };
+    assert.equal(runPush("darwin", "1", "prod"), 0);
+    assert.equal(runPush("darwin", "0", "prod"), 1);
+    assert.equal(runPush("linux", "0", "prod"), 0);
+    assert.equal(runPush("darwin", "0", "dev"), 0);
+    // 二次执行必须识别已优化结构，不能重复改写缓存文件。
+    const second = optimizer.optimize(bundleDir);
+    assert.equal(second.macPushRegistration, "gateway-disabled");
+    assert.equal(second.nativePetPrewarm, "gateway-lazy");
+    assert.equal(second.patchedFileCount, 0);
+    assert.equal(fs.readFileSync(mainPath, "utf8"), optimized);
+  } finally {
+    compatibilityService.dispose();
+  }
+});

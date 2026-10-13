@@ -35,11 +35,19 @@ const OPTIMIZED_NATIVE_PET_PREWARM_PATTERN =
   /async prewarm\([A-Za-z_$][\w$]*\)\{if\(process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME===`1`\|\|this\.window!=null\|\|this\.openingWindowPromise!=null\|\|this\.isAppQuitting\)return;/g;
 const OPTIMIZED_NATIVE_PET_RESTORE_PATTERN =
   /async restoreOpenState\(([A-Za-z_$][\w$]*)\)\{process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&this\.globalState\.get\(`electron-avatar-overlay-open`\)===!0&&await this\.open\(\1\)\}/g;
+const NATIVE_PET_RESTORE_POSITIVE_PATTERN =
+  /async restoreOpenState\(([A-Za-z_$][\w$]*)\)\{\(([^{}]{1,240}?`electron-avatar-overlay-open`\)===!0[^{}]{0,40}?)\)&&await this\.open\(\1\)\}/g;
+const OPTIMIZED_NATIVE_PET_RESTORE_POSITIVE_PATTERN =
+  /async restoreOpenState\(([A-Za-z_$][\w$]*)\)\{process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&\(([^{}]{1,240}?`electron-avatar-overlay-open`\)===!0[^{}]{0,40}?)\)&&await this\.open\(\1\)\}/g;
 // 压缩后的枚举导出名会随官方构建变化，使用平台、Prod 和注册参数共同约束定位。
 const MAC_PUSH_REGISTRATION_PATTERN =
   /process\.platform!==`darwin`\|\|([A-Za-z_$][\w$]*)!==([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*\.Prod\|\|([A-Za-z_$][\w$]*)\(\{appServerClient:/g;
 const OPTIMIZED_MAC_PUSH_REGISTRATION_PATTERN =
   /process\.platform!==`darwin`\|\|process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME===`1`\|\|([A-Za-z_$][\w$]*)!==([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*\.Prod\|\|([A-Za-z_$][\w$]*)\(\{appServerClient:/g;
+const MAC_PUSH_REGISTRATION_POSITIVE_PATTERN =
+  /(?<!process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&)process\.platform===`darwin`&&([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*\.Prod&&([A-Za-z_$][\w$]*)\(\{appServerClient:/g;
+const OPTIMIZED_MAC_PUSH_REGISTRATION_POSITIVE_PATTERN =
+  /process\.env\.OPENCODEX_GATEWAY_HIDDEN_RUNTIME!==`1`&&process\.platform===`darwin`&&([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*\.Prod&&([A-Za-z_$][\w$]*)\(\{appServerClient:/g;
 const GIT_ORIGIN_RESOLVER_PATTERN =
   /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=await \3\.getStableMetadata\(\2,\4\);if\(\5==null\)return null;let ([A-Za-z_$][\w$]*)=\3\.getWorktreeRepositoryForRoot\(\5\.root,\4\),([A-Za-z_$][\w$]*)=await \3\.getRepoRepository\(\2,\4\);return \7==null\?null:\{dir:\2,root:\6\.root,originUrl:await \7\.getOriginUrl\(\),commonDir:\7\.getCommonDir\(\)\}\}/g;
 const GIT_LOCAL_PREFILTER_PATTERN =
@@ -114,7 +122,9 @@ class OfficialRuntimeOptimizer {
         nativePetRestoreMarkerCount += restoreMarkerCount;
         const recognizedRestoreCount =
           matchCount(source, NATIVE_PET_RESTORE_PATTERN) +
-          matchCount(source, OPTIMIZED_NATIVE_PET_RESTORE_PATTERN);
+          matchCount(source, OPTIMIZED_NATIVE_PET_RESTORE_PATTERN) +
+          matchCount(source, NATIVE_PET_RESTORE_POSITIVE_PATTERN) +
+          matchCount(source, OPTIMIZED_NATIVE_PET_RESTORE_POSITIVE_PATTERN);
         // 一个 chunk 可能同时打包多份 Native pet 实现；只识别其中一份时仍必须报告布局不完整。
         const factorySupported = recognizedFactoryCount >= markerCount;
         const prewarmSupported = recognizedPrewarmCount >= markerCount;
@@ -160,12 +170,16 @@ class OfficialRuntimeOptimizer {
         const markerCount = source.split(MAC_PUSH_LOG_MARKER).length - 1;
         const recognizedCount =
           matchCount(source, MAC_PUSH_REGISTRATION_PATTERN) +
-          matchCount(source, OPTIMIZED_MAC_PUSH_REGISTRATION_PATTERN);
+          matchCount(source, OPTIMIZED_MAC_PUSH_REGISTRATION_PATTERN) +
+          matchCount(source, MAC_PUSH_REGISTRATION_POSITIVE_PATTERN) +
+          matchCount(source, OPTIMIZED_MAC_PUSH_REGISTRATION_POSITIVE_PATTERN);
         // 候选必须与标记一一对应；额外候选同样属于歧义，不能改写无法确认的入口。
         const patchedPush = this.patchMacPushRegistration(optimized);
         const supported = recognizedCount === markerCount &&
-          matchCount(patchedPush, OPTIMIZED_MAC_PUSH_REGISTRATION_PATTERN) === markerCount &&
-          matchCount(patchedPush, MAC_PUSH_REGISTRATION_PATTERN) === 0;
+          matchCount(patchedPush, OPTIMIZED_MAC_PUSH_REGISTRATION_PATTERN) +
+            matchCount(patchedPush, OPTIMIZED_MAC_PUSH_REGISTRATION_POSITIVE_PATTERN) === markerCount &&
+          matchCount(patchedPush, MAC_PUSH_REGISTRATION_PATTERN) +
+            matchCount(patchedPush, MAC_PUSH_REGISTRATION_POSITIVE_PATTERN) === 0;
         if (supported) macPushReadyFileCount += 1;
         else unsupportedParts.push("mac-push");
         optimized = this.runPatchPoint({
@@ -412,22 +426,35 @@ class OfficialRuntimeOptimizer {
   }
 
   private patchNativePetRestore(source: string): string {
-    return source.replace(NATIVE_PET_RESTORE_PATTERN, (match) =>
+    const patched = source.replace(NATIVE_PET_RESTORE_PATTERN, (match) =>
       match.replace(
         "this.globalState.get(`electron-avatar-overlay-open`)===!0&&",
         // 隐藏 profile 可能继承上次“宠物已打开”的持久状态；启动阶段不得因此创建第二个不可见 renderer。
         `process.env.${GATEWAY_RUNTIME_ENV}!==\`1\`&&this.globalState.get(\`electron-avatar-overlay-open\`)===!0&&`
       )
     );
+    // 26.1007 起 restore 条件带 notch 守卫并被括号包裹：守卫加在整组括号之前，保持短路语义。
+    return patched.replace(NATIVE_PET_RESTORE_POSITIVE_PATTERN, (match, argName, condition) =>
+      `async restoreOpenState(${argName}){process.env.${GATEWAY_RUNTIME_ENV}!==\`1\`&&(${condition})&&await this.open(${argName})}`
+    );
   }
 
   private patchMacPushRegistration(source: string): string {
-    return source.replace(MAC_PUSH_REGISTRATION_PATTERN, (match) =>
+    const patched = source.replace(MAC_PUSH_REGISTRATION_PATTERN, (match) =>
       match.replace(
         "process.platform!==`darwin`||",
         // 隐藏 runner 没有官方签名 entitlement，注册必然失败；浏览器通知继续走已有 WS 通知桥。
         `process.platform!==\`darwin\`||process.env.${GATEWAY_RUNTIME_ENV}===\`1\`||`
       )
+    );
+    // 26.1007 起守卫极性翻转为正向 && 链：等价地前置 env 守卫，隐藏运行时跳过注册。
+    return patched.replace(
+      MAC_PUSH_REGISTRATION_POSITIVE_PATTERN,
+      (match) =>
+        match.replace(
+          "process.platform===`darwin`&&",
+          `process.env.${GATEWAY_RUNTIME_ENV}!==\`1\`&&process.platform===\`darwin\`&&`
+        )
     );
   }
 
