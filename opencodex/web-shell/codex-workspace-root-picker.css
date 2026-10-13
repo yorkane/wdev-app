@@ -1,19 +1,50 @@
-/* 远端路径弹窗叠在官方 renderer 上方，层级需要高于菜单和 toast 外的大多数浮层。 */
-.codex-web-workspace-root-backdrop {
+/* 目录选择弹窗由原生 <dialog>.showModal() 承载：元素本身是铺满视口的居中层，
+   遮罩暗度交给 ::backdrop。它在浏览器 top layer 里，官方「新建项目」模态内再叠这一层
+   不会被 focus trap 吃掉点击；点遮罩空白处关闭由 JS 按 target 判定。
+   老 WebView 没有 showModal 时退化为非模态，暗度由元素自身背景提供。 */
+dialog.codex-web-workspace-root-backdrop,
+dialog.codex-web-workspace-root-dialog {
   position: fixed;
   inset: 0;
   z-index: 2147483646;
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   justify-content: center;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
   padding: 12px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.24);
+  pointer-events: auto;
+}
+
+/* 模态时遮罩由 ::backdrop 负责，元素自身必须透明，否则和上面的兜底背景叠成两层暗度。 */
+dialog.codex-web-workspace-root-backdrop:modal,
+dialog.codex-web-workspace-root-dialog:modal {
+  background: transparent;
+}
+
+dialog.codex-web-workspace-root-backdrop::backdrop,
+dialog.codex-web-workspace-root-dialog::backdrop {
   background: rgba(0, 0, 0, 0.24);
 }
 
-/* 尺寸按官方 compact dialog 收敛，避免按截图物理像素写导致 Web 端视觉放大。 */
+/* 卡片样式只作用于 form 面板。外层 dialog 是透明铺满层，
+   不能再套这套卡片视觉，否则原生 dialog 自身被画成小卡片、居中失效。 */
 .codex-web-workspace-root-panel {
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
   width: min(390px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
   color: var(--text-primary, #202123);
   background: var(--main-surface-primary, #fff);
   border: 1px solid var(--border-light, rgba(0, 0, 0, 0.08));
@@ -160,6 +191,7 @@
 @media (max-width: 640px) {
   .codex-web-workspace-root-panel {
     width: min(390px, calc(100vw - 24px));
+    max-height: calc(100vh - 24px);
     border-radius: 18px;
     padding: 20px;
   }
@@ -191,5 +223,257 @@
     height: 32px;
     font-size: 14px;
     padding: 0 14px;
+  }
+}
+
+/* ===== 目录浏览模式 =====
+   工具条 + 面包屑 + 目录列表叠在 compact 弹窗内；列表限高滚动，
+   保证移动端不出现整页滚动。颜色全部走官方变量，深色随主题自动反转。 */
+.codex-web-workspace-root-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -6px 0 10px;
+}
+
+.codex-web-workspace-root-tool {
+  appearance: none;
+  flex: 0 0 auto;
+  min-width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.1));
+  border-radius: 8px;
+  color: var(--text-secondary, #6f6f6f);
+  background: var(--main-surface-primary, #fff);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 26px;
+  padding: 0 8px;
+}
+
+.codex-web-workspace-root-tool:enabled:hover {
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.06));
+  color: var(--text-primary, #202123);
+}
+
+.codex-web-workspace-root-tool:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+/* 面包屑占满剩余宽度并省略号收尾，长路径不撑破弹窗。 */
+.codex-web-workspace-root-breadcrumb {
+  display: flex;
+  align-items: center;
+  /* 空间不足时从左侧祖先开始省略，当前目录名必须完整可见。 */
+  justify-content: flex-end;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.codex-web-workspace-root-breadcrumb-item {
+  appearance: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-secondary, #6f6f6f);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 3px 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-web-workspace-root-breadcrumb-item:hover {
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.06));
+}
+
+/* 当前层级只作展示，不再可点；不允许被左侧祖先挤掉。 */
+.codex-web-workspace-root-breadcrumb-current {
+  flex: 0 0 auto;
+  max-width: 100%;
+  color: var(--text-primary, #202123);
+  cursor: default;
+}
+
+.codex-web-workspace-root-breadcrumb-separator {
+  flex: 0 0 auto;
+  color: var(--text-secondary, #9a9a9a);
+}
+
+.codex-web-workspace-root-content {
+  box-sizing: border-box;
+  /* 面板是纵向 flex：列表可收缩并在自身内部滚动，短视口下按钮区不会被顶出弹窗。 */
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(320px, 45vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.1));
+  border-radius: 12px;
+  background: var(--main-surface-primary, #fff);
+}
+
+.codex-web-workspace-root-list {
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+}
+
+.codex-web-workspace-root-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  min-height: 30px;
+  border-radius: 8px;
+  color: var(--text-primary, #202123);
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.codex-web-workspace-root-row:hover {
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.06));
+}
+
+.codex-web-workspace-root-row-label {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 文件条目只为上下文展示，不可选。 */
+.codex-web-workspace-root-row-file {
+  color: var(--text-secondary, #9a9a9a);
+  cursor: default;
+}
+
+.codex-web-workspace-root-row-file:hover {
+  background: transparent;
+}
+
+.codex-web-workspace-root-select {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--token-foreground, #202123);
+}
+
+.codex-web-workspace-root-browse-status,
+.codex-web-workspace-root-browse-empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--text-secondary, #8e8e8e);
+  font-size: 13px;
+  text-align: center;
+}
+
+.codex-web-workspace-root-browse-truncated {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--text-secondary, #8e8e8e);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* 多选已选清单：路径 chip 可单条移除。 */
+.codex-web-workspace-root-selections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.codex-web-workspace-root-selections:empty {
+  display: none;
+}
+
+.codex-web-workspace-root-selection {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  background: var(--button-secondary-hover-background, rgba(0, 0, 0, 0.05));
+  padding: 2px 4px 2px 10px;
+}
+
+.codex-web-workspace-root-selection-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary, #202123);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-web-workspace-root-selection-remove {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--text-secondary, #6f6f6f);
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 18px;
+  padding: 0;
+}
+
+.codex-web-workspace-root-selection-remove:hover {
+  background: var(--button-secondary-active-background, rgba(0, 0, 0, 0.1));
+  color: var(--text-primary, #202123);
+}
+
+@media (prefers-color-scheme: dark) {
+  /* 官方页没有 data-theme，暗色信号按现状判定：系统暗色且未被 .electron-light 显式点亮。 */
+  :root:not(.electron-light) dialog.codex-web-workspace-root-backdrop,
+  :root:not(.electron-light) dialog.codex-web-workspace-root-dialog {
+    background: rgba(0, 0, 0, 0.55);
+  }
+
+  :root:not(.electron-light) dialog.codex-web-workspace-root-backdrop:modal,
+  :root:not(.electron-light) dialog.codex-web-workspace-root-dialog:modal {
+    background: transparent;
+  }
+
+  :root:not(.electron-light) dialog.codex-web-workspace-root-backdrop::backdrop,
+  :root:not(.electron-light) dialog.codex-web-workspace-root-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.55);
+  }
+
+  :root:not(.electron-light) .codex-web-workspace-root-tool,
+  :root:not(.electron-light) .codex-web-workspace-root-breadcrumb-item {
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+
+  :root:not(.electron-light) .codex-web-workspace-root-tool:enabled:hover,
+  :root:not(.electron-light) .codex-web-workspace-root-row:hover,
+  :root:not(.electron-light) .codex-web-workspace-root-breadcrumb-item:hover,
+  :root:not(.electron-light) .codex-web-workspace-root-selection {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  :root:not(.electron-light) .codex-web-workspace-root-content {
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+
+  :root:not(.electron-light) .codex-web-workspace-root-selection-remove:hover {
+    background: rgba(255, 255, 255, 0.14);
   }
 }

@@ -136,5 +136,16 @@
   "web.workspaceRoot.error.notDirectory": "该路径不是文件夹。",
   "web.workspaceRoot.error.noAccess": "没有权限访问该路径。",
   "web.workspaceRoot.error.unavailable": "无法使用该文件夹路径。",
-  "web.workspaceRoot.error.addFailed": "添加文件夹失败：{error}"
+  "web.workspaceRoot.error.addFailed": "添加文件夹失败：{error}",
+  "web.workspaceRoot.error.browseFailed": "无法读取该目录，请改为手动输入路径。",
+  "web.workspaceRoot.dialog.browseRoot": "本机",
+  "web.workspaceRoot.dialog.up": "上一级",
+  "web.workspaceRoot.dialog.showHidden": "显示隐藏目录",
+  "web.workspaceRoot.dialog.pathMode": "手动输入路径",
+  "web.workspaceRoot.dialog.browseMode": "浏览目录",
+  "web.workspaceRoot.dialog.selectFolder": "选择该文件夹",
+  "web.workspaceRoot.dialog.removeSelection": "移除该选择",
+  "web.workspaceRoot.dialog.empty": "该目录为空。",
+  "web.workspaceRoot.dialog.loading": "正在读取目录…",
+  "web.workspaceRoot.dialog.truncated": "目录条目过多，清单已截断；请输入更具体的路径。"
 }

@@ -136,5 +136,16 @@
   "web.workspaceRoot.error.notDirectory": "That path is not a folder.",
   "web.workspaceRoot.error.noAccess": "You do not have permission to access that path.",
   "web.workspaceRoot.error.unavailable": "That folder path cannot be used.",
-  "web.workspaceRoot.error.addFailed": "Failed to add folder: {error}"
+  "web.workspaceRoot.error.addFailed": "Failed to add folder: {error}",
+  "web.workspaceRoot.error.browseFailed": "This folder could not be listed. Enter a path manually instead.",
+  "web.workspaceRoot.dialog.browseRoot": "This computer",
+  "web.workspaceRoot.dialog.up": "Go up one level",
+  "web.workspaceRoot.dialog.showHidden": "Show hidden folders",
+  "web.workspaceRoot.dialog.pathMode": "Enter a path manually",
+  "web.workspaceRoot.dialog.browseMode": "Browse folders",
+  "web.workspaceRoot.dialog.selectFolder": "Select this folder",
+  "web.workspaceRoot.dialog.removeSelection": "Remove this selection",
+  "web.workspaceRoot.dialog.empty": "This folder is empty.",
+  "web.workspaceRoot.dialog.loading": "Loading folder…",
+  "web.workspaceRoot.dialog.truncated": "Too many entries to list; enter a more specific path."
 }
