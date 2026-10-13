@@ -251,3 +251,56 @@ sudo dpkg -P codex-desktop
 - **界面里的终端（terminal）打不开、也没报错**：运行账户的登录 shell 是 `/usr/sbin/nologin`（包内默认 `codex-desktop` 就是这样），按 §2.3 换成 `aigc` 或 `usermod -s /bin/bash`。
 - **日志出现 `spawn gh ENOENT`**：未装 `gh`，按 §1.1 安装。
 - **页面能打开但拿不到模型**：检查 `CODEX_HOME/config.toml` 的 `openai_base_url` 是否指向可用的模型服务。
+
+## 9. 机群目录规范与 skill 部署
+
+机群里运行 wdev 网关的机器统一采用以下目录布局：运维数据集中在数据盘，
+CODEX_HOME 有唯一真身，旧路径以软链兼容，升级与迁移都不破坏 systemd 单元里的既有引用。
+
+### 9.1 固定布局
+
+| 角色 | 真身路径 | 内容 |
+|---|---|---|
+| 运维/项目目录 | `/data/wdev` | ocxhome、codex-app、desktop-home、运维脚本、deb 备份等全部收在其下 |
+| 配置目录（CODEX_HOME） | `/data/.codex` | config.toml、auth.json、sessions、skills |
+| 兼容软链 | `~/.codex` → `/data/.codex` | 让按 HOME 下路径找配置的组件（含 codex CLI 本身）无感 |
+| 兼容软链 | 旧运维路径 → `/data/wdev` | 例：170 的 `/home/aigc/w170` → `/data/wdev`，unit/脚本旧引用不断链 |
+
+迁移方法：把真目录 `mv` 到新址后在原位建软链，再同步修改所有直接引用旧路径的
+systemd 单元（如 ocx 代理 unit 的 `Environment=` / `ExecStartPost=`）与脚本里的硬编码路径。
+
+### 9.2 gateway.env 对应写法
+
+```ini
+CODEX_HOME=/data/.codex
+CODEX_WEB_RUNTIME_DIR=/data/wdev/desktop-home/runtime
+CODEX_WEB_REPORTS_DIR=/data/wdev/desktop-home/reports
+CODEX_WEB_OFFICIAL_BUNDLE_DIR=/data/wdev/desktop-home/official-bundle
+CODEX_WEB_OFFICIAL_USER_DATA_DIR=/data/wdev/desktop-home/official-user-data
+```
+
+改完 `/etc/codex-desktop/gateway.env` 后照常 `codex-desktop-gateway restart` 生效，并按 §4 复核。
+
+### 9.3 skill 白名单分发
+
+- 网关会话枚举 skill 的目录固定为 `$CODEX_HOME/skills/`（本布局下即 `/data/.codex/skills/`）。
+- 仓库 `skills/` 目录是**分发白名单**，目前只收录两个：`aq-orchestrator`、`hf-download`。
+- **机器本地运维 skill 一律不入库、不分发**（如 docker-acr 等依赖特定机群环境的 skill），
+  只保留在单机 `$CODEX_HOME/skills/` 下。
+- 安装（单个 skill 的通用形式）：
+
+```bash
+cp -a skills/<name> "$CODEX_HOME/skills/"
+```
+
+  复制完成后**新开一个会话即可生效，无需重启网关**。
+
+### 9.4 按此布局机器的升级要点
+
+- 升级命令沿用 §7：`--force-confold` 保留本机 conffile（含 Xvfb 显示号等本机改动）。
+- 升级后跑 §4 验证三件套：`systemctl is-active` 为 active、`NRestarts` 为 0、
+  `curl http://127.0.0.1:3737/healthz` 返回 200。
+- official-bundle 无需手工处理：网关检测到新 asar 后自动重物化到
+  `CODEX_WEB_OFFICIAL_BUNDLE_DIR` 指向的 `/data/wdev/desktop-home/official-bundle`。
+
+> 参考实例：170.t 已于 2026-10-13 按本节布局完成迁移，全部验证点通过。
