@@ -60,6 +60,11 @@ function serializable(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
+function matchesAttributeSelector(element, selector) {
+  const conditions = [...String(selector).matchAll(/\[([a-zA-Z-]+)="([^"]*)"\]/g)];
+  return conditions.length > 0 && conditions.every(([, name, value]) => String(element.attributes?.[name] ?? "") === value);
+}
+
 function createFakeElement(tagName, elements) {
   // 测试只实现 picker 实际使用的 DOM 子集：类名、属性、子节点和按类型注册的监听器。
   const element = {
@@ -87,6 +92,14 @@ function createFakeElement(tagName, elements) {
       this.open = false;
       const handler = this.listeners.get("close");
       if (handler) handler({});
+    },
+    closest(selector) {
+      let node = this;
+      while (node) {
+        if (matchesAttributeSelector(node, selector)) return node;
+        node = node.parentNode;
+      }
+      return null;
     },
     focus() {
       this.focused = true;
@@ -196,8 +209,12 @@ function createPickerHarness(options = {}) {
   const body = createFakeElement("body", elements);
   const document = {
     body,
+    activeElement: null,
     createElement(tagName) {
       return createFakeElement(tagName, elements);
+    },
+    querySelector(selector) {
+      return elements.find((element) => !element.removed && matchesAttributeSelector(element, selector)) || null;
     },
   };
   const dispatchWindowMessage = (data) => {
@@ -305,6 +322,7 @@ function createPickerHarness(options = {}) {
   return {
     api: window.OpenCodexWorkspaceRootPicker,
     body,
+    document,
     delivered,
     elements,
     invokes,
@@ -343,6 +361,26 @@ function fire(element, type, event = {}) {
   const handler = element.listeners.get(type);
   assert.equal(typeof handler, "function", `missing ${type} handler on ${element.tagName} ${element.className}`);
   return handler({ preventDefault() {}, stopPropagation() {}, target: element, ...event });
+}
+
+function makeTrackedEvent(extra = {}) {
+  // fire() 会把事件对象并入一个新对象，所以标记必须写在闭包变量上而不是 `this`。
+  const state = { defaultPrevented: false, propagationStopped: false };
+  return {
+    ...extra,
+    get defaultPrevented() {
+      return state.defaultPrevented;
+    },
+    get propagationStopped() {
+      return state.propagationStopped;
+    },
+    preventDefault() {
+      state.defaultPrevented = true;
+    },
+    stopPropagation() {
+      state.propagationStopped = true;
+    },
+  };
 }
 
 function dialog(harness) {
@@ -423,6 +461,21 @@ async function submitForm(harness, value) {
   input.value = value;
   await fire(form(harness), "submit");
   await settle();
+}
+
+function mountParentDialog(harness, options = {}) {
+  // 模拟官方「新建项目」的 Radix 对话框：picker 必须挂进它内部，并在取消时原样返回。
+  const parent = createFakeElement("div", harness.elements);
+  parent.className = "codex-official-project-dialog";
+  parent.setAttribute("role", "dialog");
+  parent.setAttribute("data-state", "open");
+  const trigger = createFakeElement("button", harness.elements);
+  trigger.textContent = "Browse";
+  parent.appendChild(trigger);
+  harness.body.appendChild(parent);
+  harness.window.__CODEX_WEB_CONFIG__.nativeFolderPicker = options.nativeFolderPicker === true;
+  harness.document.activeElement = trigger;
+  return { parent, trigger };
 }
 
 test("workspace root picker intercepts both official protocols only in the web page", () => {
@@ -860,4 +913,85 @@ test("cancel settles the promise and ignores a late mcp response", async () => {
   const listener = harness.windowListeners.get("message");
   assert.equal(listener, undefined, "关闭时消息监听已注销");
   assert.deepEqual(harness.delivered, []);
+});
+
+test("dialog is mounted inside the triggering parent dialog so it is not an outside interaction", async () => {
+  const root = createTree();
+  const harness = createPickerHarness({ browseRoot: root });
+  const { parent, trigger } = mountParentDialog(harness);
+  await openAndSettle(harness, { type: PICK_MESSAGE, path: root });
+
+  const panel = dialog(harness);
+  assert.equal(panel.parentNode, parent, "目录弹窗必须挂进触发它的官方对话框");
+  assert.equal(byClass(harness, DIALOG_CLASS)[0], panel);
+  assert.ok(
+    !harness.body.children.includes(panel),
+    "不能落到 body：官方模态层会把 body 子节点判成 outside interaction 后关掉创建表单"
+  );
+  assert.equal(parent.attributes["data-state"], "open", "父对话框在目录选择期间保持打开");
+  assert.equal(trigger.focused, undefined, "打开期间焦点留在目录弹窗，不提前还给触发按钮");
+});
+
+test("native cancel closes the picker and leaves the parent dialog open", async () => {
+  const root = createTree();
+  const harness = createPickerHarness({ browseRoot: root });
+  const { parent, trigger } = mountParentDialog(harness);
+  const handled = harness.api.handleMessage({ type: PICK_MESSAGE, path: root });
+  await settle();
+  const panel = dialog(harness);
+
+  // 原生 <dialog> 的 Esc 走 cancel 事件，不会经过 window keydown 的兜底路径。
+  const cancelEvent = makeTrackedEvent();
+  fire(panel, "cancel", cancelEvent);
+  await handled;
+
+  assert.equal(cancelEvent.defaultPrevented, true, "cancel 必须 preventDefault，否则父层可能跟着关");
+  assert.equal(dialog(harness), undefined, "目录弹窗已关闭");
+  assert.equal(panel.removed, true);
+  assert.ok(!parent.children.includes(panel), "目录弹窗从父对话框子树里摘干净");
+  assert.equal(parent.attributes["data-state"], "open", "父对话框状态不受取消影响");
+  assert.equal(parent.removed, false, "父对话框不能被一起关掉");
+  assert.deepEqual(harness.delivered, [], "取消不产生任何投递");
+
+  await settle();
+  assert.equal(trigger.focused, true, "关闭后焦点交还触发按钮");
+});
+
+test("submit stops propagating so the parent form does not create a project", async () => {
+  const root = createTree();
+  const harness = createPickerHarness({ browseRoot: root });
+  const { parent, trigger } = mountParentDialog(harness);
+  let parentSubmitted = 0;
+  parent.addEventListener("submit", (event) => {
+    parentSubmitted += 1;
+  });
+  await openAndSettle(harness, { type: PICK_MESSAGE, path: root });
+
+  const event = makeTrackedEvent({ target: form(harness) });
+  await fire(form(harness), "submit", event);
+  await harness.handled;
+
+  assert.equal(event.defaultPrevented, true, "目录表单不能触发原生跳转");
+  assert.equal(event.propagationStopped, true, "内层 submit 不能冒泡到官方父表单");
+  assert.equal(parentSubmitted, 0, "选择目录不能被当成点击「创建项目」");
+  assert.deepEqual(harness.delivered, [{ channel: PICKED_MESSAGE, payload: { root } }]);
+  assert.equal(dialog(harness), undefined, "选择成功后目录弹窗关闭");
+  assert.equal(parent.attributes["data-state"], "open", "官方对话框保持打开");
+  assert.equal(parent.removed, false);
+  assert.ok(harness.body.children.includes(parent), "父对话框仍在 body 的原有位置");
+  assert.equal(trigger.parentNode, parent);
+});
+
+test("a parent dialog without a focused trigger is found by its open state", async () => {
+  const root = createTree();
+  const harness = createPickerHarness({ browseRoot: root });
+  const parent = createFakeElement("div", harness.elements);
+  parent.setAttribute("role", "dialog");
+  parent.setAttribute("data-state", "open");
+  harness.body.appendChild(parent);
+  // 触发按钮失焦（例如用户点了弹窗空白处）时，仍要按打开状态定位宿主对话框。
+  harness.document.activeElement = harness.body;
+  await openAndSettle(harness, { type: PICK_MESSAGE, path: root });
+
+  assert.equal(dialog(harness).parentNode, parent);
 });

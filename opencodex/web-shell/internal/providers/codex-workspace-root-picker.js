@@ -413,6 +413,15 @@
       return dialogState.promise;
     }
 
+    // 原生 top-layer 只改变绘制层级，并不会把 DOM 事件归入官方 Radix 对话框。
+    // 挂在触发它的对话框内，避免目录选择被父层误当成 outside interaction 后关闭创建表单。
+    const trigger = document.activeElement;
+    let ownerDialog = typeof trigger?.closest === "function" ? trigger.closest('[role="dialog"]') : null;
+    if (!ownerDialog && typeof document.querySelector === "function") {
+      ownerDialog = document.querySelector('[role="dialog"][data-state="open"]');
+    }
+    const mount = ownerDialog || document.body;
+
     const state = {
       allowMultiple,
       mode: "browse",
@@ -570,6 +579,9 @@
         try {
           backdrop.remove();
         } catch {}
+        if (trigger && trigger.isConnected !== false && typeof trigger.focus === "function") {
+          scheduler.requestAnimationFrame(() => trigger.focus());
+        }
         resolve(result);
       }
 
@@ -580,6 +592,7 @@
       function onKeyDown(event) {
         if (event.key === "Escape") {
           event.preventDefault();
+          event.stopPropagation?.();
           cancel();
         }
       }
@@ -824,6 +837,8 @@
 
       panel.addEventListener("submit", async (event) => {
         event.preventDefault();
+        // 只确认目录，不把内层 submit 传给官方父表单的“创建项目”处理器。
+        event.stopPropagation?.();
         setBusy(true);
         try {
           // 路径选择结果成功交给官方 Renderer/Main 后才关闭；失败只吐司并保留输入内容。
@@ -887,7 +902,7 @@
       });
 
       backdrop.appendChild(panel);
-      document.body.appendChild(backdrop);
+      mount.appendChild(backdrop);
       try {
         backdrop.showModal();
       } catch {
